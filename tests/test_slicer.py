@@ -225,3 +225,36 @@ def read_temp() -> float:
     result = slice_mcu_bound(source)
 
     assert result.exported_names == frozenset({"read_temp"})
+
+
+def test_recognizes_async_mcu_export_function():
+    # Async @mcu.export is a real, required case - MCU code that needs to
+    # call back into a @pc.export stub (chunk 4) must itself be async to
+    # await it (DESIGN.md § Call semantics).
+    source = """
+from tether import mcu
+
+@mcu.export
+async def read_scaled() -> int:
+    return 42
+"""
+    result = slice_mcu_bound(source)
+
+    assert "async def read_scaled() -> int:" in result.source
+    assert result.exported_names == frozenset({"read_scaled"})
+
+
+def test_pulls_in_referenced_async_helper_function():
+    source = """
+from tether import mcu
+
+async def _slow_read() -> int:
+    return 42
+
+@mcu.export
+async def read_scaled() -> int:
+    return await _slow_read()
+"""
+    result = slice_mcu_bound(source)
+
+    assert "async def _slow_read() -> int:" in result.source

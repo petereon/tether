@@ -197,11 +197,63 @@ works.
   backpressure must do it symmetrically for both sides, not independently
   invent different schemes per side.
 
-- [ ] **8. Mock transport**
+- [x] **8. Mock transport** — done 2026-07-24
   `transports/mock.py` — in-process fake MCU: runs the real sliced code path
   (chunks 3, 4, 6) against a second thread, no hardware required. This
   unblocks hardware-free testing for everything downstream. Depends on:
   3, 4, 6, 7.
+  `MockTransport(source, base_dir=None).start()` imports chunk 6's actual
+  `tether_runtime/dispatch.py` unmodified and runs it under CPython in a
+  background thread, via a `uasyncio` -> `asyncio` compatibility shim +
+  a `sys.print_exception` shim (MicroPython-only, used by chunk 6's
+  traceback capture) — not a reimplementation of dispatch logic, matching
+  DESIGN.md § Testing's explicit intent. Bridges to a real chunk 7
+  `Dispatcher` over `asyncio.Queue` (fed via `call_soon_threadsafe` from
+  the foreign PC thread) one direction and plain `queue.Queue` the other,
+  since the two dispatchers have different reader/writer contracts
+  (async `readexactly`/`drain` vs. sync `read`/`write`). 4 tests: basic
+  call/response, reverse-call through a generated `@pc.export` stub,
+  remote exception propagation, `@mcu.loop` periodic execution.
+  Two real bugs surfaced while building this (not by review — by actually
+  running the full path end-to-end for the first time):
+  - Chunks 3 and 4's AST filtering (`slice_mcu_bound`'s exported-function
+    detection, `_top_level_decorated_functions`, and `_bound_names`) only
+    recognized `ast.FunctionDef`, never `ast.AsyncFunctionDef` — so `@mcu.export
+    async def` was silently invisible to the slicer. This is a real,
+    required case (chunk 4's own docstring requires MCU code calling a
+    `@pc.export` stub to be async), not an edge case — fixed in
+    `src/tether/slicer/__init__.py` with regression tests added to
+    `tests/test_slicer.py`.
+  - `sys.print_exception` (used by chunk 6's `_format_exception`) is a
+    MicroPython-only extension with no CPython equivalent — fixed via a
+    shim in this chunk, not a chunk 6 bug (chunk 6 is correct for its real
+    target).
+  `MICROPYPATH` note from chunk 6 doesn't apply here (that's the real
+  MicroPython interpreter's env var); this chunk instead learned that
+  `asyncio.to_thread()` wrapping an unbounded blocking `queue.Queue.get()`
+  prevents the Python process from exiting (the default executor's
+  `atexit` handler waits for it) — discovered when an early prototype hung
+  the test process indefinitely. Fixed by using `asyncio.Queue` +
+  `call_soon_threadsafe` instead of bridging through a blocking thread pool
+  call.
+  Reviewed (4-angle + manual security pass): no reuse findings (the
+  cross-runtime bridge classes are a genuinely different problem from
+  chunk 6/7's own same-runtime test pipes, confirmed not duplicative).
+  Simplification: replaced a stringly-keyed `_shared` dict (two fixed
+  fields, no static typing) with typed instance attributes; narrowed a
+  function param from an entire module reference down to the one constant
+  it actually used. Efficiency: no findings (correctly treated as
+  non-hot-path test infrastructure, matching chunk 3's precedent).
+  Altitude/security: documented (not fixed — reasonable scope boundary for
+  a walking-skeleton testing utility) that the shim installs are one-way
+  process-global mutations with no teardown, that `exec()` runs whatever
+  `source` is passed (trust boundary: test-author-owned fixtures only,
+  same as running any code directly), that the slicer's preserved external
+  imports (e.g. `from machine import Pin`) will fail under CPython here
+  since the mock can't emulate hardware-only modules, and that
+  `MockTransport` has no `.stop()` (background thread runs forever, daemon
+  so it won't block process exit, but accumulates across a very large test
+  suite).
 
 - [ ] **9. Serial transport**
   `transports/serial.py` — USB VID/PID auto-discovery (`"serial:auto"`),

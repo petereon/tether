@@ -91,7 +91,7 @@ def _is_pc_only_tether_module(module: str) -> bool:
 
 def _bound_names(node: ast.stmt) -> list[str]:
     """Names this top-level statement binds, for building the dependency index."""
-    if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         return [node.name]
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return [node.target.id]
@@ -252,16 +252,16 @@ def _top_level_decorated_functions(
     tree: ast.Module,
     aliases: dict[str, str],
     predicate: Callable[[ast.expr, dict[str, str]], bool],
-) -> list[ast.FunctionDef]:
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     return [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and any(predicate(dec, aliases) for dec in node.decorator_list)
     ]
 
 
-def _build_stub(func_def: ast.FunctionDef) -> ast.AsyncFunctionDef:
+def _build_stub(func_def: ast.FunctionDef | ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
     args = func_def.args
     if args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs:
         # decorators.py's _validate_signature already rejects these at
