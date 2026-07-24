@@ -11,11 +11,16 @@ works.
 
 ---
 
-- [ ] **1. Type contract & decorator validation**
+- [x] **1. Type contract & decorator validation** — done 2026-07-24
   `decorators.py::_validate_signature` — inspect type hints against the v1
   set (`int/float/bool/str/bytes/list/dict`, recursive), raise `TypeError`
   naming the offending param/return at decoration time. Unit tests in
-  `tests/test_decorators.py`.
+  `tests/test_decorators.py`. Reviewed (simplify + security passes): no
+  actionable findings — one simplify-agent claim (dead `annotation is None`
+  branch) was checked empirically and found to be a false positive (nested
+  generic args, e.g. `dict[str, None]`, are not normalized to `type(None)`
+  the way top-level `get_type_hints()` return values are); kept the branch
+  and added a regression test for it instead.
 
 - [ ] **2. Marshalling (PC side)**
   `marshalling/` — length-prefixed msgpack framing (`[4-byte length][msg-type][msgpack body]`)
@@ -85,6 +90,18 @@ works.
   A real single-file example (e.g. blink/read-sensor over serial) in
   `examples/`, README walkthrough verified against actual hardware. Depends
   on: 9, 10.
+
+- [ ] **16. CI: lint workflow**
+  GitHub Actions workflow running `ruff check` + `ruff format --check` (via
+  `uv`) on push/PR. No hardware/token dependency — safe to build anytime.
+  Not started; queued per explicit user request, do not start until told.
+
+- [ ] **17. CI: PyPI release workflow**
+  GitHub Actions workflow that builds and publishes to PyPI on release (via
+  `uv build` / `uv publish`). Needs a PyPI token supplied by the user as a
+  repo secret before this can run for real. **Do not start this chunk until
+  the user explicitly says to** — flagged that they'll provide the token
+  when ready.
 
 ---
 

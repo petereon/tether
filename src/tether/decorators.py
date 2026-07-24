@@ -8,8 +8,11 @@ design constraint.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar
+import inspect
+import typing
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -70,16 +73,54 @@ class _PcNamespace:
         return decorate(func) if func is not None else decorate
 
 
+_SCALAR_TYPES = (int, float, bool, str, bytes)
+_CONTAINER_ORIGINS = (list, dict)
+
+
+def _is_supported_type(annotation: Any) -> bool:
+    """Recursively check an annotation against the v1 wire type set.
+
+    See DESIGN.md § Wire protocol: int, float, bool, str, bytes, list, dict,
+    recursively, plus None for functions with no return value.
+    """
+    if annotation is None or annotation is type(None):
+        return True
+    if annotation in _SCALAR_TYPES:
+        return True
+    origin = typing.get_origin(annotation)
+    if annotation in _CONTAINER_ORIGINS or origin in _CONTAINER_ORIGINS:
+        args = typing.get_args(annotation)
+        return all(_is_supported_type(a) for a in args)
+    return False
+
+
 def _validate_signature(fn: Callable[..., Any]) -> None:
     """Reject unsupported param/return types at decoration time.
 
     Supported types (DESIGN.md § Wire protocol): int, float, bool, str,
     bytes, list, dict (recursively, msgpack-safe values only). Registry hook
     for custom types is a placeholder in v1 — always empty.
-
-    TODO: inspect fn's type hints, raise TypeError naming the offending
-    param/return annotation if it falls outside the supported set.
     """
+    sig = inspect.signature(fn)
+    hints = typing.get_type_hints(fn)
+
+    for name, param in sig.parameters.items():
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            raise TypeError(
+                f"{fn.__qualname__}: variadic parameter {name!r} is not supported "
+                "(fixed arity only)"
+            )
+        if name not in hints:
+            raise TypeError(f"{fn.__qualname__}: parameter {name!r} has no type hint")
+        if not _is_supported_type(hints[name]):
+            raise TypeError(
+                f"{fn.__qualname__}: parameter {name!r} has unsupported type {hints[name]!r}"
+            )
+
+    if "return" not in hints:
+        raise TypeError(f"{fn.__qualname__}: missing return type hint")
+    if not _is_supported_type(hints["return"]):
+        raise TypeError(f"{fn.__qualname__}: unsupported return type {hints['return']!r}")
 
 
 mcu = _McuNamespace()

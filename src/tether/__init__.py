@@ -13,11 +13,11 @@ from tether.errors import (
 )
 
 __all__ = [
+    "MCUDisconnectedError",
+    "MCUTimeoutError",
+    "ProtocolVersionError",
+    "RemoteError",
+    "TetherError",
     "mcu",
     "pc",
-    "TetherError",
-    "RemoteError",
-    "MCUTimeoutError",
-    "MCUDisconnectedError",
-    "ProtocolVersionError",
 ]

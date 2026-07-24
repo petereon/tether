@@ -50,3 +50,12 @@ explicitly (note what changed and why) rather than silently drifting from it.
 
 Use the mock transport (chunk 8) for all cross-boundary behavior tests —
 don't gate PR-worthy test coverage on physical hardware being attached.
+
+## Toolchain
+
+- **`uv`** for dependency management, environment, build, and distribution.
+  Don't use raw `pip`/`venv` — `uv venv`, `uv pip install -e ".[dev]"`,
+  `uv lock`, `uv build`. Commit `uv.lock`.
+- **`ruff`** for both linting and formatting (`ruff check`, `ruff format`).
+  Run `ruff check --fix` before considering a chunk's diff clean.
+- Run tests with `.venv/bin/pytest` (or `uv run pytest`).
