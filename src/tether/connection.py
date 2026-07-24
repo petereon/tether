@@ -156,6 +156,27 @@ def _hash_bundle(bootstrap: str) -> str:
     return hashlib.sha256(bootstrap.encode()).hexdigest()
 
 
+def _start_and_handshake(stream: Any, *, timeout: float, mismatch_hint: str) -> Dispatcher:
+    """Start a Dispatcher over an already-connected stream and perform the
+    protocol-version handshake - shared by every transport's dial() closure
+    once it has a live stream, so the version-check logic exists in exactly
+    one place. `mismatch_hint` is the transport-specific remediation text
+    appended to a version-mismatch error (e.g. serial can suggest clearing
+    the on-device hash sentinel to force a re-upload; wifi/BLE can't, since
+    they never upload).
+    """
+    dispatcher = Dispatcher(stream, stream)
+    dispatcher.start()
+
+    version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
+    if version != PROTOCOL_VERSION:
+        raise ProtocolVersionError(
+            f"on-device runtime speaks protocol version {version}, "
+            f"this library expects {PROTOCOL_VERSION} - {mismatch_hint}"
+        )
+    return dispatcher
+
+
 def _connect_mock(source: str, base_dir: Path, export_specs: dict[str, Any]) -> BoardHandle:
     from tether.transports.mock import MockTransport
 
@@ -289,16 +310,11 @@ def _connect_serial(
 
             ser.timeout = None
             stream = serial_transport.SerialStream(ser)
-            dispatcher = Dispatcher(stream, stream)
-            dispatcher.start()
-
-            version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
-            if version != PROTOCOL_VERSION:
-                raise ProtocolVersionError(
-                    f"on-device runtime speaks protocol version {version}, "
-                    f"this library expects {PROTOCOL_VERSION} - re-upload by clearing "
-                    f"/.tether_hash on the device, or update tether"
-                )
+            dispatcher = _start_and_handshake(
+                stream,
+                timeout=timeout,
+                mismatch_hint="re-upload by clearing /.tether_hash on the device, or update tether",
+            )
         except BaseException:
             # No Dispatcher.stop() exists yet (chunk 7's known limitation) -
             # if the reader thread already started, it stays blocked on ser
@@ -312,6 +328,35 @@ def _connect_serial(
             raise
 
         return dispatcher
+
+    return BoardHandle(dial(), export_specs, dial=dial)
+
+
+def _connect_wifi(rest: str, export_specs: dict[str, Any], *, timeout: float) -> BoardHandle:
+    """Connect to an already-running on-device runtime over TCP. No slicing,
+    bundling, or upload here (DESIGN.md § Transports: tether never pushes
+    code over wifi) - export_specs (from the caller's already-executed
+    @mcu.export functions, same as every other scheme) is all this needs to
+    build a working BoardHandle.
+    """
+    from tether.transports import wifi as wifi_transport
+
+    host, _, port_str = rest.partition(":")
+    port = int(port_str) if port_str else wifi_transport.DEFAULT_PORT
+
+    def dial() -> Dispatcher:
+        stream = wifi_transport.connect(host, port, timeout=timeout)
+        try:
+            return _start_and_handshake(
+                stream, timeout=timeout, mismatch_hint="update tether or the on-device runtime"
+            )
+        except BaseException:
+            # Matches _connect_serial's dial(): a failed handshake (wrong
+            # protocol version, no response) must not leak the socket - see
+            # that closure's own comment for why the reader thread itself
+            # (if already started) can't be cleanly stopped regardless.
+            stream.close()
+            raise
 
     return BoardHandle(dial(), export_specs, dial=dial)
 
@@ -340,5 +385,8 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
         return _connect_serial(
             port_spec, bootstrap, export_specs, sliced.exported_names, timeout=timeout
         )
+
+    if scheme == "wifi":
+        return _connect_wifi(rest, export_specs, timeout=timeout)
 
     raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")

@@ -1,10 +1,14 @@
+import socket
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
 from tether import mcu, pc
 from tether.connection import PROTOCOL_VERSION, connect, generate_bootstrap
+from tether.dispatch import Dispatcher
+from tether.transports.wifi import WifiStream
 
 sys.path.insert(0, str(Path(__file__).parent))
 from mpy_runner import requires_micropython, run_micropython
@@ -204,3 +208,42 @@ asyncio.run(_run_test())
 
     assert f"handshake: {PROTOCOL_VERSION}" in out
     assert "read_temp: 21.5" in out
+
+
+def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int) -> None:
+    """Stand-in for an already-running on-device runtime, reachable over a
+    real TCP socket: exactly what DESIGN.md's "board must already be
+    running a bootstrapped runtime" precondition assumes for the wifi
+    transport (chunk 12's actual scope - see transports/wifi.py's module
+    docstring for why this chunk doesn't build the device side of that).
+    Runs a real tether.dispatch.Dispatcher server-side, registered with a
+    handshake handler and one export, over a real accepted connection.
+    """
+    conn, _addr = sock.accept()
+
+    stream = WifiStream(conn)  # reuse the real transport class on the fake device side too
+    dispatcher = Dispatcher(stream, stream)
+    dispatcher.register("__tether_handshake__", lambda: handshake_version)
+    # Matches the module-level `_mock_read_temp` @mcu.export function
+    # already defined above in this file - _capture_caller() picks it up
+    # from module globals regardless of which transport scheme connect()
+    # is asked to use, so the resulting BoardHandle exposes it here too.
+    dispatcher.register("_mock_read_temp", lambda: 21.5)
+    dispatcher.start()
+
+
+def test_connect_wifi_reaches_an_already_running_device_over_a_real_tcp_socket():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    threading.Thread(
+        target=_serve_one_device_connection,
+        args=(listener,),
+        kwargs={"handshake_version": PROTOCOL_VERSION},
+        daemon=True,
+    ).start()
+
+    board = connect(f"wifi:127.0.0.1:{port}", timeout=2.0)
+
+    assert board._mock_read_temp() == 21.5

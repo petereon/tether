@@ -528,9 +528,98 @@ works.
   reconnect-produces-a-working-fresh-dispatcher; +2 dispatch-level:
   fail-fast-after-disconnect, close()-shuts-down-the-worker-pool).
 
-- [ ] **12. Wifi transport**
+- [x] **12. Wifi transport** — done 2026-07-24
   `transports/wifi.py` — pure stdlib `socket`. Requires target board already
   running a bootstrapped runtime (no code push over wifi). Depends on: 10.
+
+  Scope decision made before writing code: DESIGN.md says wifi requires
+  the board "already running a bootstrapped runtime" and that `tether`
+  never pushes code over wifi, but nowhere specifies how the device gets
+  there in the first place - there's no wifi-credential API, no on-device
+  socket-server bootstrap variant, no port/handshake convention for it
+  anywhere in the design. Rather than inventing new unrequested API surface
+  to fill that gap (new `connect()` kwargs, a wifi-flavored
+  `generate_bootstrap()` variant, etc.), scoped this chunk exactly to what
+  CHUNKS.md's own line actually says: the PC-side pure-`socket` client only.
+  The on-device-listener story is left as an explicit, documented gap - the
+  same treatment this project has given real-hardware validation throughout
+  (flagged prominently, not silently pretended away), not an oversight.
+
+  What was built:
+  - `WifiStream` (`transports/wifi.py`): duplex wrapper around a connected
+    TCP socket, matching the same plain `read()`/`write()`/`close()`
+    contract `SerialStream` provides. `read()` is a single `recv()` -
+    already blocks for real data and returns `b""` on peer-close exactly
+    matching `Dispatcher._run_reader`'s "empty read means disconnected"
+    contract, no chunking dance needed (TCP sockets give clean blocking
+    semantics directly, unlike serial's `in_waiting` drain).
+  - `connect(host, port=DEFAULT_PORT, *, timeout)`: opens the TCP
+    connection via `socket.create_connection`, sets `TCP_NODELAY` (see
+    efficiency finding below), then hands off from the connect-phase
+    timeout to blocking reads for the ongoing dispatch phase - same
+    two-phase timeout handoff pattern as `serial.py`'s `ser.timeout = None`.
+  - `connection.py`: new `wifi:<ip>[:<port>]` scheme wired into `connect()`.
+    `_connect_wifi()` does no slicing/bundling/upload (nothing to push) -
+    just builds a `dial()` closure that opens a fresh `WifiStream` and
+    performs the handshake, following the same `dial`/`BoardHandle(...,
+    dial=dial)` pattern chunk 11 established for mock/serial. Multi-board
+    and `reconnect()` therefore work for wifi boards for free, with no
+    wifi-specific code needed beyond `dial()` itself.
+  - `_start_and_handshake()` (new, `connection.py`): extracted from what
+    was originally near-duplicate `dispatcher.start()` +
+    `call_mcu(_HANDSHAKE_NAME)` + version-check logic independently
+    written for both `_connect_serial` and `_connect_wifi` - see reuse/
+    simplification findings below.
+
+  Review (4 parallel cleanup agents + manual security pass, `/security-review`
+  again unable to bootstrap - no git remote, same as every prior chunk):
+  - Reuse + Simplification (both independently found the same issue,
+    applied): the handshake/version-check block was duplicated near-verbatim
+    between `_connect_serial`'s and `_connect_wifi`'s `dial()` closures,
+    differing only in the remediation hint text. Extracted
+    `_start_and_handshake(stream, *, timeout, mismatch_hint)`, called from
+    both. Simplification also flagged a test hand-rolling its own
+    socket-wrapper class (`_ConnStream` in `test_connection.py`) duplicating
+    `WifiStream` - fixed to import and reuse `WifiStream` directly on the
+    fake-device side of the test too.
+  - Efficiency (1 finding, applied): missing `TCP_NODELAY` - this is a
+    synchronous request/response RPC protocol sending small msgpack frames
+    one at a time; without it, Nagle's algorithm interacting with the
+    peer's delayed-ACK timer classically stalls ~40ms per call. Set
+    `socket.IPPROTO_TCP, socket.TCP_NODELAY` right after connecting. Also
+    bumped `_RECV_CHUNK` from 4096 to 65536 (minor - fewer syscalls on
+    large `bytes` payloads; `FrameDecoder` already buffers/reassembles
+    correctly regardless of chunk size, so this was never a correctness
+    issue, just avoidable syscall overhead).
+  - Altitude (1 finding, applied): `_connect_wifi`'s `dial()` had no
+    failure-path cleanup, unlike `_connect_serial`'s `except BaseException:
+    ser.close(); raise` - a failed handshake (wrong protocol version, no
+    response) would leak the TCP socket and its blocked reader thread with
+    no way to close it, since `WifiStream` didn't even expose a `close()`.
+    Added `WifiStream.close()` and wrapped `_connect_wifi`'s `dial()` body
+    in the same `try/except BaseException: stream.close(); raise` pattern.
+    Also confirmed `BoardHandle.reconnect()` (chunk 11) works correctly for
+    wifi boards with no wifi-specific code - `dial()` redials a genuinely
+    fresh socket each call, no stale closure-variable capture.
+  - Security: no findings requiring a code change, but one real property of
+    this chunk worth recording explicitly rather than leaving implicit: the
+    wifi transport is a plaintext, unauthenticated TCP socket - anyone who
+    can reach the device's IP can issue or intercept RPC calls, and this
+    was already inherent to the wire protocol as locked in chunk 6 (no
+    auth/encryption framing exists at the DESIGN.md level), not something
+    newly introduced here. Serial's physical-proximity requirement and the
+    in-process mock transport never surfaced this; wifi is the first
+    transport that exposes it over a real network. Adding auth/TLS would be
+    a DESIGN.md-level architecture decision (what scheme, PSK vs cert,
+    bundle-size cost) well beyond a client-transport chunk's scope, so
+    flagged here rather than silently fixed or silently ignored.
+
+  145 tests passing (was 140; +4 transport-level in new
+  `test_transport_wifi.py`: write/read round-trip over a real
+  `socket.socketpair()`, empty-read-on-peer-close, real TCP connect via a
+  background-thread listener, connection-refused-when-nothing-listens;
+  +1 connection-level end-to-end test using a real TCP socket with a real
+  `tether.dispatch.Dispatcher` standing in for the already-running device).
 
 - [ ] **13. BLE transport**
   `transports/ble.py` — `bleak`-backed, custom GATT service (write +
