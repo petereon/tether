@@ -154,29 +154,46 @@ def push_raw_repl(
     serial_obj: Any, code: bytes, *, timeout: float = 10.0, wait: bool = True
 ) -> None:
     """Upload and execute `code` on the connected MicroPython board via the
-    raw REPL protocol, then return to the friendly REPL.
+    raw REPL protocol.
 
-    `wait=True` (default) blocks until `code` finishes executing and raises
-    RawReplError if it raised on-device (non-empty stderr) - appropriate
-    for code that's expected to return, like a file-write helper.
+    `wait=True` (default) blocks until `code` finishes executing, raises
+    RawReplError if it raised on-device (non-empty stderr), and returns to
+    the friendly REPL afterward (ctrl-B) - appropriate for code that's
+    expected to return, like a file-write helper.
 
     `wait=False` returns as soon as the device acks receiving the code (it
-    has started running), without waiting for it to finish. Required for
-    code that runs forever - e.g. starting chunk 6's dispatch loop, which
-    never returns. `wait=True` against such code would block until
-    `timeout` and then raise a spurious RawReplError, even though the code
-    is running successfully; exiting raw REPL (ctrl-B) does not interrupt
-    it. Chunk 10 is expected to use wait=False for that call and is
+    has started running), without waiting for it to finish, and does NOT
+    send the raw-REPL exit sequence. Required for code that runs forever -
+    e.g. starting chunk 6's dispatch loop, which never returns. `wait=True`
+    against such code would block until `timeout` and then raise a
+    spurious RawReplError, even though the code is running successfully.
+
+    Found against real ESP32 hardware (not reproducible against the
+    scripted fakes chunk 9 was originally verified with, which can't model
+    real UART timing): sending the ctrl-B exit sequence after wait=False
+    races the just-started program's takeover of stdio. A forever-running
+    program (like the dispatch loop) starts reading its own stdin directly
+    once running, but there is a real timing window, right after the "OK"
+    exec ack, where the interpreter is still transitioning from the raw-REPL
+    protocol handler to the user script - ctrl-B landing in that window
+    gets handled as a raw-REPL command instead of passing through, and the
+    resulting REPL/prompt noise corrupts the very first bytes the program
+    (here, the dispatch loop's frame decoder) reads. There is no raw-REPL
+    session left to cleanly exit back to once a forever-running program has
+    taken over anyway, so for wait=False this is skipped entirely rather
+    than raced. Chunk 10 is expected to use wait=False for that call and is
     responsible for confirming the dispatch loop actually came up (e.g. via
     the protocol-version handshake), not this function.
     """
     _enter_raw_repl(serial_obj, timeout=timeout)
+    if not wait:
+        _exec_raw_start(serial_obj, code, timeout=timeout)
+        return
     try:
         _exec_raw_start(serial_obj, code, timeout=timeout)
-        if wait:
-            _stdout, stderr = _follow_exec(serial_obj, timeout=timeout)
-            if stderr:
-                raise RawReplError(f"code raised on device: {stderr.decode(errors='replace')}")
+        _stdout, stderr = _follow_exec(serial_obj, timeout=timeout)
+        if stderr:
+            raise RawReplError(f"code raised on device: {stderr.decode(errors='replace')}")
     finally:
         _exit_raw_repl(serial_obj)
 

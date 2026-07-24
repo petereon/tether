@@ -825,16 +825,15 @@ works.
   153 tests passing (was 152; +1 pinning the multi-name-import stripping
   behavior itself, +1 pinning the try/except-unused-import survival case).
 
-- [ ] **15. End-to-end example + docs** — feature-complete 2026-07-24,
-  **not checked off: the chunk's own definition of done requires the README
-  walkthrough to be verified against actual hardware, and no physical
-  ESP32/MicroPython board has been available at any point in this
-  project's development.** Per CHUNKS.md's own stated protocol ("don't
-  mark a chunk done based on scaffolding/stubs alone"), that requirement
-  isn't satisfied by anything short of running it on a real board — so
-  this stays unchecked until someone does. Everything short of that has
-  been built and verified as rigorously as possible without hardware; see
-  below for exactly what and how.
+- [x] **15. End-to-end example + docs** — feature-complete 2026-07-24,
+  **hardware-verified 2026-07-24** on a real ESP32-WROOM-32D (CH340
+  USB-serial bridge). The example ran end-to-end for real: connected over
+  `serial:auto`, uploaded and started the bundle, blinked the onboard LED 5
+  times (visually confirmed), and logged progress back from MCU to PC after
+  each blink. This is the first real-hardware validation anywhere in this
+  project's history - see the dedicated section below for the four real
+  bugs it found (none of which any prior test, mock or otherwise, could
+  have caught) and how each was fixed.
   A real single-file example (e.g. blink/read-sensor over serial) in
   `examples/`, README walkthrough verified against actual hardware. Depends
   on: 9, 10.
@@ -903,6 +902,133 @@ works.
     ground more rigorously.)
 
   157 tests passing (was 153; +4 in new `tests/test_examples.py`).
+
+  ---
+
+  ## Real hardware validation (2026-07-24)
+
+  A real ESP32-WROOM-32D became available. Flashed with the current stable
+  MicroPython (v1.28.0, `ESP32_GENERIC` build, via `esptool`). Getting to
+  the point of running anything required installing WCH's CH340 VCP driver
+  on macOS (the board's onboard USB-serial bridge chip, VID `0x1a86`/PID
+  `0x7523` - already in `discover()`'s known-device list from chunk 9) and
+  approving it as a system extension - not a `tether` concern, but the
+  reason no earlier session could have done this without a human present
+  for the driver's GUI approval step.
+
+  Every one of the four bugs below was invisible to every prior test in
+  this project - mock transport, real MicroPython unix-port interpreter,
+  scripted raw-REPL fakes, real TCP sockets - because none of them can
+  model real UART timing, real MicroPython's actual (as opposed to
+  assumed) keyboard-interrupt behavior, or exercise the literal code path
+  a real end user's `mcu.connect(...)` call goes through. This is exactly
+  why this chunk's own definition of done required real hardware and
+  wasn't satisfiable by "verified as thoroughly as possible without it" -
+  the gap between those two turned out to be four real, load-bearing bugs.
+
+  **1. `mcu.connect(...)` didn't exist - `connect` was never wired onto the
+  `mcu` namespace object.** `docs/DESIGN.md`'s own locked architecture (and
+  every example, README snippet, and this very chunk's example) has always
+  shown `mcu.connect("serial:auto")`. The actual chunk 10 implementation
+  put `connect()` as a bare function in `connection.py` and every test
+  imported it directly (`from tether.connection import connect`), so this
+  divergence from the locked API was never exercised by anything until the
+  first line of real usage: `mcu.connect(...)` raised
+  `AttributeError: '_McuNamespace' object has no attribute 'connect'`.
+  Fixed in `tether/__init__.py`: `mcu.connect = connect` - assigning the
+  SAME function object as a plain instance attribute (not defined in
+  `_McuNamespace`'s class body) means Python's descriptor protocol never
+  binds `self`, so `mcu.connect(...)` invokes `connect()` with no `self`
+  injected and no extra stack frame - `_capture_caller()`'s frame-counting
+  needed zero changes. Regression test:
+  `test_mcu_connect_is_the_public_api_design_md_documents`.
+
+  **2. `push_raw_repl(..., wait=False)` corrupted the dispatch loop's first
+  frame by unconditionally sending the raw-REPL exit sequence into a
+  program that had already taken over stdio.** First symptom: `connect()`
+  over real serial failed with `MCUDisconnectedError: transport read
+  failed: frame too large: declared 72643169 bytes` - a garbage length
+  prefix. Decoding those 4 bytes revealed `\x04Tra` - the start of
+  "Traceback", meaning the device had actually crashed. `push_raw_repl`'s
+  `finally: _exit_raw_repl(serial_obj)` sent `\r\x02` (ctrl-B) regardless
+  of `wait=True` or `wait=False` - for `wait=False` (used to start the
+  forever-running dispatch loop, chunk 9's own design), this happens
+  immediately after the "OK" exec ack, racing the interpreter's transition
+  from the raw-REPL protocol handler to the user script's own stdio
+  consumption. On real hardware those 2 bytes can land while raw-REPL's
+  handler is still in control, producing REPL/prompt noise that corrupts
+  the first bytes the dispatch loop's `FrameDecoder` reads. Fixed:
+  `wait=False` no longer sends the exit sequence at all - there's no raw-REPL
+  session left to cleanly exit back to once a forever-running program has
+  taken over stdio anyway, so it's skipped rather than raced. Updated
+  `test_push_raw_repl_wait_false_returns_without_waiting_for_completion`
+  (previously asserted the buggy behavior - `endswith(b"\r\x02")` - now
+  asserts `\x02` is never sent for `wait=False`).
+
+  **3. MicroPython intercepts a raw `0x03` byte as Ctrl-C even when it's
+  just a data byte inside a running program's own stdin stream - directly
+  contradicting chunk 10's own prior finding.** Second symptom, after
+  fixing #2: the handshake succeeded, but the very next real call
+  (`add(2, 3)`) crashed the device the same way. Full traceback this time:
+  `KeyboardInterrupt` inside `asyncio.core.wait_io_event`. msgpack encodes
+  small integers as their own literal byte value, so the argument `3`
+  becomes a literal `0x03` byte inside the frame - MicroPython's UART
+  driver intercepted it as Ctrl-C and killed the dispatch loop from the
+  inside. Chunk 10's own investigation (see its CHUNKS.md entry) concluded
+  this was purely a *host-side PTY line-discipline artifact* under CPython
+  and not a real MicroPython/hardware behavior, based on a PTY-based test
+  under CPython - that conclusion is now known to be wrong for real
+  firmware on real hardware; the PTY test only ever proved something about
+  the *host's* terminal handling, never about MicroPython's own UART
+  driver. Fixed: `generate_bootstrap()` now emits `import micropython as
+  _tether_micropython` and calls `_tether_micropython.kbd_intr(-1)` before
+  anything else runs - a real, documented MicroPython API that exists
+  specifically to disable the built-in keyboard-interrupt character so a
+  UART can carry a raw binary protocol safely. Verified directly against
+  hardware before implementing (manual raw-REPL script sending
+  `micropython.kbd_intr(-1)` then the same calls that previously crashed -
+  `add(2, 3) = 5`, `add(10, 20) = 30`, no corruption) and then via the real
+  fix: `test_generate_bootstrap_disables_the_ctrl_c_keyboard_interrupt`.
+
+  **4. `@pc.export` functions were never registered as PC-side dispatch
+  handlers, for any transport - the "MCU calls PC" half of the pitch was
+  never actually wired up in `connect()`, and no test anywhere had ever
+  exercised it end-to-end, including under the mock transport.** Third
+  symptom, after fixing #2 and #3: `add()` and `greet()` (plain MCU calls)
+  both worked correctly over real hardware, but the example's reverse call
+  (MCU calling back into a `@pc.export` PC function) failed with
+  `RemoteError: no handler named 'log_from_mcu'`. Root cause:
+  `_capture_caller()` only ever collected `side == "mcu"` specs into
+  `export_specs`; nothing anywhere in `_connect_mock`/`_connect_serial`/
+  `_connect_wifi`/`_connect_ble` ever called `dispatcher.register(name,
+  fn)` for a `@pc.export` function. This gap existed since chunk 10 and
+  survived chunks 11-15 undetected because the one test that could have
+  caught it - `test_connection.py`'s `_mock_read_scaled` (defined in chunk
+  10 specifically to test the *slicer's* handling of async MCU functions
+  calling PC stubs) - was never actually *called* by any test; it only
+  needed to exist and slice correctly for its original purpose. Fixed:
+  `_capture_caller()` now also collects `side == "pc"` callables into a new
+  `pc_handlers` dict, threaded through every `_connect_*`/`dial()` path and
+  registered on each dispatcher (via the shared `_start_and_handshake()`
+  for serial/wifi/ble, and directly in `_connect_mock`'s `dial()`) before
+  `dispatcher.start()`. Regression test (mock, not hardware-dependent -
+  this bug was 100% reproducible under mock once actually exercised):
+  `test_connect_mock_mcu_can_call_back_into_a_registered_pc_export_function`,
+  asserting `board._mock_read_scaled() == 42`.
+
+  Self-reviewed (manual, not via parallel agents, following chunk 14's
+  precedent after that session's spend-limit interruption - each fix above
+  was TDD'd individually with a RED test against the actual bug before
+  changing implementation, then confirmed GREEN against both the fake test
+  suite and, for #2-#4, real hardware directly). No further findings.
+  Security: no new surface - `micropython.kbd_intr(-1)` only affects which
+  byte the interpreter treats as an interrupt signal, doesn't change what
+  data the wire protocol carries or who can send it.
+
+  160 tests passing (was 157; +1 `mcu.connect` identity test, +1 reverse
+  pc-handler-registration test via mock, `push_raw_repl`'s existing
+  wait=False test updated in place rather than added to since it pins the
+  same behavior corrected, not new behavior).
 
 - [x] **16. CI: lint workflow** — done 2026-07-24
   GitHub Actions workflow running `ruff check` + `ruff format --check` (via

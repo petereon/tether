@@ -56,28 +56,28 @@ The example hardcodes `Pin(2, Pin.OUT)` — pin 2 is the common onboard LED
 pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
-**This walkthrough has not been run against a real board.** No physical
-ESP32 or other MicroPython-capable hardware has been available at any point
-during this project's development (stated here for the same reason it's
-stated throughout `docs/CHUNKS.md`: every chunk touching serial/wifi/BLE has
-been verified as thoroughly as possible without hardware — the real
-`micropython` unix-port interpreter, scripted fakes matching MicroPython's
-own documented raw-REPL protocol, real TCP sockets, real `pyserial`
-`loop://` ports — but none of that is a substitute for a real device). What
-*has* been verified: the example's source slices correctly, the generated
-on-device bundle is syntactically valid, and its registration/dispatch
-wiring runs correctly under the real MicroPython interpreter with only
-`machine.Pin` faked out (see `tests/test_examples.py`). If you try this on
-real hardware and something in this walkthrough is wrong, that's the
-expected failure mode this note exists to warn about — please open an
-issue.
+**This walkthrough has been run against a real board** (ESP32-WROOM-32D,
+2026-07-24) — connected over `serial:auto`, uploaded and started, blinked
+the onboard LED 5 times, and logged progress back from MCU to PC after
+each blink, exactly as shown above. That first real-hardware run also
+found and fixed four real bugs that no amount of testing without hardware
+had caught (a missing `mcu.connect` API wiring, a raw-REPL protocol race,
+a MicroPython Ctrl-C interception issue, and a missing PC-side handler
+registration for `@pc.export` functions) — see `docs/CHUNKS.md`'s chunk 15
+entry for the full account of each. Serial is the one transport verified
+this way so far; wifi and BLE are still verified only as thoroughly as
+possible without hardware (real TCP sockets / a hand-written fake matching
+bleak's API, respectively) — the same category of gap this note used to
+describe for all three.
 
 ## Status
 
-Chunks 1–14 of `docs/CHUNKS.md`'s roadmap are implemented and tested
+All 17 chunks of `docs/CHUNKS.md`'s roadmap are implemented and tested
 (slicing, marshalling, dispatch, all three transports, connection
-orchestration, multi-board/reconnect handling). Chunk 15 (this walkthrough)
-is feature-complete but hardware-unverified, per above. CI and a PyPI
-release workflow (chunks 16–17) are not yet built. See `docs/DESIGN.md` for
+orchestration, multi-board/reconnect handling, a real-hardware-verified
+example, CI lint, and a PyPI release workflow). See `docs/DESIGN.md` for
 the full locked architecture and `docs/CHUNKS.md` for exactly what's been
-built, what's been found and fixed along the way, and what's still open.
+built, what's been found and fixed along the way (including the real
+hardware findings above), and what's still open (wifi/BLE hardware
+verification; the PyPI release workflow's actual upload step, pending a
+real token).

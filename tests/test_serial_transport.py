@@ -116,7 +116,16 @@ def test_push_raw_repl_wait_false_returns_without_waiting_for_completion():
     never_finishing = _NeverFinishingSerial()
     push_raw_repl(never_finishing, b"run_forever()", wait=False, timeout=0.3)
 
-    assert bytes(never_finishing.written).endswith(b"\r\x02")  # still exits raw repl cleanly
+    # Found against real ESP32 hardware: the started program (a
+    # forever-running dispatch loop, in real use) takes over stdio
+    # directly once running - there is no "raw REPL session" left to
+    # cleanly exit back to, and sending the ctrl-B exit sequence anyway
+    # races the program's takeover of stdin on real hardware, corrupting
+    # the first bytes it reads. wait=False must NOT send the raw-REPL exit
+    # sequence at all - it only makes sense (and is only safe) for wait=True,
+    # where the code has already finished and control has genuinely
+    # returned to the raw-REPL handler.
+    assert b"\x02" not in bytes(never_finishing.written)
 
 
 def test_push_raw_repl_raises_on_device_side_exception():

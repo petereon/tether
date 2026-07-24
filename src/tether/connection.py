@@ -24,20 +24,35 @@ _HANDSHAKE_NAME = "__tether_handshake__"
 
 def generate_bootstrap(sliced_source: str, stubs_source: str) -> str:
     """Assemble the final on-device script: imports the runtime shim +
-    dispatch loop, defines the sliced @mcu.export/@mcu.loop functions and
-    the generated @pc.export proxy stubs, wires a Dispatcher over
-    sys.stdin/stdout (wrapped as uasyncio streams - verified against a real
-    MicroPython interpreter that this is safe: raw bytes including 0x03
-    reach the running script's own reads correctly once the environment
-    isn't a cooked-mode terminal, which real UART hardware never is),
-    registers every @mcu.export/@mcu.loop function plus the protocol
-    handshake handler, and runs the dispatch loop forever.
+    dispatch loop, disables MicroPython's Ctrl-C keyboard interrupt on the
+    UART (see the module-level comment on `import micropython` below),
+    defines the sliced @mcu.export/@mcu.loop functions and the generated
+    @pc.export proxy stubs, wires a Dispatcher over sys.stdin/stdout
+    (wrapped as uasyncio streams), registers every @mcu.export/@mcu.loop
+    function plus the protocol handshake handler, and runs the dispatch
+    loop forever.
     """
     return f"""\
 from mcu_decorators import mcu, pc, registered_mcu_functions
 import dispatch as _tether_dispatch
 import uasyncio as _tether_asyncio
 import sys as _tether_sys
+import micropython as _tether_micropython
+
+# Found against real ESP32 hardware (not reproducible against the PTY
+# simulation this was originally checked with under CPython, which only
+# established that the interception it saw was a *host-side* PTY line
+# discipline artifact - it never proved anything about what real
+# MicroPython firmware does with a raw 0x03 byte on a real UART, and that
+# turned out to be different): msgpack routinely encodes small integers as
+# their own literal byte value, so a call argument that happens to produce
+# a raw 0x03 byte anywhere in its frame (e.g. int 3) gets intercepted by
+# MicroPython's UART driver as Ctrl-C and raises KeyboardInterrupt *inside
+# the running dispatch loop*, killing it. kbd_intr(-1) disables that
+# built-in interception so the UART can carry the wire protocol's raw
+# binary frames safely - must run before the dispatch loop starts reading
+# any real protocol bytes.
+_tether_micropython.kbd_intr(-1)
 
 {sliced_source}
 
@@ -125,12 +140,12 @@ class BoardHandle:
         return call
 
 
-def _capture_caller() -> tuple[str, Path, dict[str, Any]]:
+def _capture_caller() -> tuple[str, Path, dict[str, Any], dict[str, Callable[..., Any]]]:
     """Read the calling file's source (for slicing) and its already-executed
-    module globals (for @mcu.export metadata) - NOT by re-executing the
-    source (the caller's module is already running; connect() is being
-    called from within it), which would double any of its side effects
-    (prints, connections opened at import time, etc).
+    module globals (for @mcu.export metadata, and @pc.export callables) -
+    NOT by re-executing the source (the caller's module is already running;
+    connect() is being called from within it), which would double any of
+    its side effects (prints, connections opened at import time, etc).
     """
     # inspect.stack()[2]: [0]=this frame, [1]=connect()'s frame, [2]=the
     # real caller - more robust to a future extra layer of indirection here
@@ -145,18 +160,34 @@ def _capture_caller() -> tuple[str, Path, dict[str, Any]]:
         )
 
     export_specs = {}
+    pc_handlers: dict[str, Callable[..., Any]] = {}
     for name, obj in caller_frame.f_globals.items():
         spec = getattr(obj, "__tether_export__", None)
-        if spec is not None and spec.side == "mcu":
+        if spec is None:
+            continue
+        if spec.side == "mcu":
             export_specs[name] = spec
-    return path.read_text(), path.parent, export_specs
+        elif spec.side == "pc":
+            # The @pc.export function itself (not just its ExportSpec) -
+            # registered as a real Dispatcher handler below so an incoming
+            # call from the MCU (via its generated proxy stub) actually
+            # reaches this live callable, not just a name the slicer/stub
+            # generator knew about at bundle-build time.
+            pc_handlers[name] = obj
+    return path.read_text(), path.parent, export_specs, pc_handlers
 
 
 def _hash_bundle(bootstrap: str) -> str:
     return hashlib.sha256(bootstrap.encode()).hexdigest()
 
 
-def _start_and_handshake(stream: Any, *, timeout: float, mismatch_hint: str) -> Dispatcher:
+def _start_and_handshake(
+    stream: Any,
+    *,
+    timeout: float,
+    mismatch_hint: str,
+    pc_handlers: dict[str, Callable[..., Any]],
+) -> Dispatcher:
     """Start a Dispatcher over an already-connected stream and perform the
     protocol-version handshake - shared by every transport's dial() closure
     once it has a live stream, so the version-check logic exists in exactly
@@ -164,8 +195,16 @@ def _start_and_handshake(stream: Any, *, timeout: float, mismatch_hint: str) -> 
     appended to a version-mismatch error (e.g. serial can suggest clearing
     the on-device hash sentinel to force a re-upload; wifi/BLE can't, since
     they never upload).
+
+    `pc_handlers` (@pc.export functions, from _capture_caller()) are
+    registered before start() - registration only touches a plain dict, no
+    race with the reader thread either way, but doing it first keeps the
+    "fully ready before this dispatcher does anything" ordering simple to
+    reason about.
     """
     dispatcher = Dispatcher(stream, stream)
+    for name, handler in pc_handlers.items():
+        dispatcher.register(name, handler)
     dispatcher.start()
 
     version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
@@ -177,7 +216,12 @@ def _start_and_handshake(stream: Any, *, timeout: float, mismatch_hint: str) -> 
     return dispatcher
 
 
-def _connect_mock(source: str, base_dir: Path, export_specs: dict[str, Any]) -> BoardHandle:
+def _connect_mock(
+    source: str,
+    base_dir: Path,
+    export_specs: dict[str, Any],
+    pc_handlers: dict[str, Callable[..., Any]],
+) -> BoardHandle:
     from tether.transports.mock import MockTransport
 
     def dial() -> Dispatcher:
@@ -188,6 +232,8 @@ def _connect_mock(source: str, base_dir: Path, export_specs: dict[str, Any]) -> 
         transport = MockTransport(source, base_dir=base_dir)
         reader, writer = transport.start()
         dispatcher = Dispatcher(reader, writer)
+        for name, handler in pc_handlers.items():
+            dispatcher.register(name, handler)
         dispatcher.start()
         return dispatcher
 
@@ -239,6 +285,7 @@ def _connect_serial(
     bootstrap: str,
     export_specs: dict[str, Any],
     exported_names: frozenset[str],
+    pc_handlers: dict[str, Callable[..., Any]],
     *,
     timeout: float = 10.0,
 ) -> BoardHandle:
@@ -314,6 +361,7 @@ def _connect_serial(
                 stream,
                 timeout=timeout,
                 mismatch_hint="re-upload by clearing /.tether_hash on the device, or update tether",
+                pc_handlers=pc_handlers,
             )
         except BaseException:
             # No Dispatcher.stop() exists yet (chunk 7's known limitation) -
@@ -332,7 +380,13 @@ def _connect_serial(
     return BoardHandle(dial(), export_specs, dial=dial)
 
 
-def _connect_wifi(rest: str, export_specs: dict[str, Any], *, timeout: float) -> BoardHandle:
+def _connect_wifi(
+    rest: str,
+    export_specs: dict[str, Any],
+    pc_handlers: dict[str, Callable[..., Any]],
+    *,
+    timeout: float,
+) -> BoardHandle:
     """Connect to an already-running on-device runtime over TCP. No slicing,
     bundling, or upload here (DESIGN.md § Transports: tether never pushes
     code over wifi) - export_specs (from the caller's already-executed
@@ -348,7 +402,10 @@ def _connect_wifi(rest: str, export_specs: dict[str, Any], *, timeout: float) ->
         stream = wifi_transport.connect(host, port, timeout=timeout)
         try:
             return _start_and_handshake(
-                stream, timeout=timeout, mismatch_hint="update tether or the on-device runtime"
+                stream,
+                timeout=timeout,
+                mismatch_hint="update tether or the on-device runtime",
+                pc_handlers=pc_handlers,
             )
         except BaseException:
             # Matches _connect_serial's dial(): a failed handshake (wrong
@@ -361,7 +418,13 @@ def _connect_wifi(rest: str, export_specs: dict[str, Any], *, timeout: float) ->
     return BoardHandle(dial(), export_specs, dial=dial)
 
 
-def _connect_ble(rest: str, export_specs: dict[str, Any], *, timeout: float) -> BoardHandle:
+def _connect_ble(
+    rest: str,
+    export_specs: dict[str, Any],
+    pc_handlers: dict[str, Callable[..., Any]],
+    *,
+    timeout: float,
+) -> BoardHandle:
     """Connect to an already-running on-device runtime over BLE. Same shape
     as _connect_wifi (no slicing/bundling/upload - DESIGN.md gives BLE "the
     same bootstrap requirement as wifi").
@@ -372,7 +435,10 @@ def _connect_ble(rest: str, export_specs: dict[str, Any], *, timeout: float) -> 
         stream = ble_transport.connect(rest, timeout=timeout)
         try:
             return _start_and_handshake(
-                stream, timeout=timeout, mismatch_hint="update tether or the on-device runtime"
+                stream,
+                timeout=timeout,
+                mismatch_hint="update tether or the on-device runtime",
+                pc_handlers=pc_handlers,
             )
         except BaseException:
             # Matches _connect_serial/_connect_wifi's dial(): a failed
@@ -394,10 +460,10 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
     source to connect() explicitly.
     """
     scheme, _, rest = address.partition(":")
-    source, base_dir, export_specs = _capture_caller()
+    source, base_dir, export_specs, pc_handlers = _capture_caller()
 
     if scheme == "mock":
-        return _connect_mock(source, base_dir, export_specs)
+        return _connect_mock(source, base_dir, export_specs, pc_handlers)
 
     if scheme == "serial":
         sliced = slice_mcu_bound(source, base_dir=base_dir)
@@ -405,13 +471,18 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
         bootstrap = generate_bootstrap(sliced.source, stubs.source)
         port_spec = rest.removeprefix("//")
         return _connect_serial(
-            port_spec, bootstrap, export_specs, sliced.exported_names, timeout=timeout
+            port_spec,
+            bootstrap,
+            export_specs,
+            sliced.exported_names,
+            pc_handlers,
+            timeout=timeout,
         )
 
     if scheme == "wifi":
-        return _connect_wifi(rest, export_specs, timeout=timeout)
+        return _connect_wifi(rest, export_specs, pc_handlers, timeout=timeout)
 
     if scheme == "ble":
-        return _connect_ble(rest, export_specs, timeout=timeout)
+        return _connect_ble(rest, export_specs, pc_handlers, timeout=timeout)
 
     raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")

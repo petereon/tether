@@ -38,6 +38,31 @@ def test_generate_bootstrap_wires_streams_from_stdin_stdout():
     assert "sys.stdout.buffer" in script
 
 
+def test_generate_bootstrap_disables_the_ctrl_c_keyboard_interrupt():
+    # Found against real ESP32 hardware, not reproducible against the PTY
+    # simulation chunk 10 originally verified this with (which only proved
+    # the interception was a *host-side* PTY line-discipline artifact under
+    # CPython - it never established what real MicroPython firmware does
+    # with a raw 0x03 byte arriving mid-stream on a real UART, and it turns
+    # out to be different): msgpack routinely encodes small integers as
+    # their own literal byte value, so any call argument that happens to
+    # produce a raw 0x03 byte anywhere in its frame (e.g. add(2, 3) - 3
+    # encodes as byte 0x03) gets intercepted by MicroPython's UART driver
+    # as Ctrl-C and raises KeyboardInterrupt *inside the running dispatch
+    # loop*, killing it and corrupting the stream for the PC side too.
+    # `micropython.kbd_intr(-1)` (a real, documented MicroPython API for
+    # exactly this: disabling the built-in keyboard-interrupt character so
+    # a UART can carry raw binary protocols) must run before the dispatch
+    # loop starts reading real protocol bytes.
+    script = generate_bootstrap("", "")
+    assert "import micropython" in script
+    assert "kbd_intr(-1)" in script
+    # Must happen before the dispatch loop starts, not after - the whole
+    # point is to disable interception before any real protocol byte
+    # (which could contain 0x03) is ever read.
+    assert script.index("kbd_intr(-1)") < script.index("_dispatcher.run()")
+
+
 def test_generate_bootstrap_registers_the_handshake_handler():
     script = generate_bootstrap("", "")
     assert "__tether_handshake__" in script
@@ -64,8 +89,34 @@ async def _mock_read_scaled() -> int:
     return await _mock_double(21)
 
 
+def test_connect_mock_mcu_can_call_back_into_a_registered_pc_export_function():
+    # Found against REAL hardware, not caught by any existing test: nothing
+    # in connect() ever registered @pc.export functions as PC-side dispatch
+    # handlers, for any transport, including mock - _mock_read_scaled was
+    # defined all the way back in chunk 10 to test the *slicer's* handling
+    # of async MCU functions calling PC stubs, but nothing ever actually
+    # CALLED it, so the runtime reverse-call path (MCU -> call_pc() -> PC
+    # dispatcher -> a real registered Python handler) was never exercised
+    # end-to-end anywhere until real hardware caught it.
+    board = connect("mock://")
+    assert board._mock_read_scaled() == 42
+
+
 def test_connect_mock_reaches_a_registered_mcu_export_function():
     board = connect("mock://")
+    assert board._mock_read_temp() == 21.5
+
+
+def test_mcu_connect_is_the_public_api_design_md_documents():
+    # DESIGN.md's own architecture doc (and every example/README snippet)
+    # shows `mcu.connect(...)`, never a bare top-level `connect(...)` -
+    # `connect` must be reachable as an attribute of the `mcu` namespace
+    # object, not just importable from tether.connection. Assigning the
+    # SAME function object (not a wrapper) is what makes this work without
+    # adding a stack frame _capture_caller()'s frame-counting depends on -
+    # see tether/__init__.py's own comment on this.
+    assert mcu.connect is connect
+    board = mcu.connect("mock://")
     assert board._mock_read_temp() == 21.5
 
 
@@ -121,7 +172,7 @@ def test_connect_serial_raises_clearly_on_a_decorated_but_unsliced_function():
     ghost_spec = ExportSpec(func=lambda: None, side="mcu")
 
     with pytest.raises(RuntimeError, match="ghost_fn"):
-        _connect_serial("auto", "", {"ghost_fn": ghost_spec}, frozenset(), timeout=1.0)
+        _connect_serial("auto", "", {"ghost_fn": ghost_spec}, frozenset(), {}, timeout=1.0)
 
 
 @requires_micropython
