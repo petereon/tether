@@ -69,9 +69,33 @@ works.
   Extracted a shared `_top_level_decorated_functions` helper (was
   duplicated between `slice_mcu_bound` and `generate_pc_stubs`).
 
-- [ ] **5. MCU runtime — umsgpack**
-  `tether_runtime/umsgpack.py` — vendor a real MicroPython-compatible
-  msgpack port, wire-compatible with chunk 2's encode/decode. Depends on: 2.
+- [x] **5. MCU runtime — umsgpack** — done 2026-07-24
+  `tether_runtime/umsgpack/` — vendored `peterhinch/micropython-msgpack`
+  (MIT, commit `31d512d`), core `__init__.py`/`mp_dump.py`/`mp_load.py`
+  only (extension-type modules and the async stream loader weren't needed
+  for the v1 type set). Provenance + update instructions in
+  `umsgpack/VENDORED.md`; excluded from `ruff` formatting so it stays
+  byte-diffable against upstream. Depends on: 2.
+  Verification (not TDD in the usual sense — integration-testing a vendored
+  component, not designing new behavior): 39 round-trip tests in
+  `tests/test_umsgpack_compat.py` confirming wire compatibility both
+  directions with the PC-side `msgpack` package from chunk 2, including the
+  longer-form (str8/16, bin16, array16, map16) wire encodings a
+  small-values-only test would have missed — caught by review, fixed by
+  expanding the test data.
+  Reviewed (combined quality pass + manual security pass): no reuse/
+  simplification/altitude findings on our own code (vendored library
+  itself deliberately out of scope for critique — see VENDORED.md).
+  Security pass found a real forward-looking hazard: the vendored
+  `umsgpack.load(fp)` trusts a wire length field with no upper bound —
+  safe via `loads()` on an already-bounded `bytes` object, unsafe if ever
+  called directly on a live stream (would reintroduce, on far more
+  RAM-constrained hardware, the exact unbounded-memory DoS chunk 2's
+  `MAX_FRAME_SIZE` closed on the PC side). Not fixable in the vendored file
+  without breaking upstream-diffability, and the actual call site doesn't
+  exist yet — documented as a hard, explicit constraint on chunk 6 (see
+  its entry below) and in `VENDORED.md`, rather than left as scattered
+  awareness.
 
 - [ ] **6. MCU runtime — dispatch loop**
   `tether_runtime/dispatch.py` — `uasyncio`-based reentrant dispatch loop:
@@ -86,6 +110,20 @@ works.
   contract exists yet since chunk 6 doesn't exist to check against. If this
   signature needs to change, update chunk 4's stub generator and tests in
   the same change, don't let them drift apart.
+  **Security constraint owed by chunk 6 (from chunk 5's review):** the
+  vendored `umsgpack.load(fp)` reads a length field straight from the wire
+  with no upper bound (`_read_except` in `mp_load.py`) — safe when called as
+  `umsgpack.loads(body_bytes)` on an already-length-bounded, fully-received
+  frame body (which is what `loads()` effectively forces, since its input
+  is already a complete in-memory `bytes`/`bytearray`), **unsafe** if
+  `umsgpack.load()` is ever called directly on a live UART/socket stream —
+  that would reintroduce, on the MCU (far more RAM-constrained than the PC),
+  the exact unbounded-memory DoS chunk 2's `MAX_FRAME_SIZE` guard closed on
+  the PC side. Chunk 6 must always: read the outer `[length][msg-type]`
+  header first, validate `length` against a bound (mirror chunk 2's
+  `MAX_FRAME_SIZE`), read exactly that many bytes, THEN call
+  `umsgpack.loads()` on the resulting bounded `bytes` — never
+  `umsgpack.load()` on the raw stream.
 
 - [ ] **7. PC-side dispatch**
   `dispatch/` — background reader thread + queue; blocking calls filter by

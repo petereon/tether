@@ -23,6 +23,9 @@ packages = ["src/tether", "src/tether_runtime"]
 
 [tool.ruff]
 line-length = 100
+# Vendored third-party code (see src/tether_runtime/umsgpack/VENDORED.md) -
+# kept byte-for-byte diffable against upstream, not reformatted to our style.
+extend-exclude = ["src/tether_runtime/umsgpack"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
