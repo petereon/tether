@@ -35,10 +35,23 @@ works.
   `MAX_FRAME_SIZE` (1 MiB) bound on the wire length prefix to close an
   unbounded-memory DoS vector on corrupted/hostile input. 22 tests.
 
-- [ ] **3. AST slicer — MCU-bound extraction**
+- [x] **3. AST slicer — MCU-bound extraction** — done 2026-07-24
   `slicer/` — walk `@mcu.export`/`@mcu.loop` functions, transitively pull in
   referenced module-level assignments, class defs, helper functions, and
   local imports (DESIGN.md § Architecture overview step 1). Depends on: 1.
+  Scoped deliberately: extracts source subset + preserves decorator syntax
+  as-is; making decorators resolve on-device and `@pc.export` stub
+  generation are chunk 4/6/10's job, not this one's. 13 tests, TDD'd.
+  Reviewed (4-angle simplify + manual security pass): fixed a real bug
+  where the PC-only `from tether import mcu` import leaked into MCU-bound
+  output (would fail on-device — `tether` isn't installed there), fixed a
+  cross-file ordering bug where dependency-of-a-dependency could render
+  after its dependent (topological sort, not discovery order, now used),
+  and fixed decorator recognition to resolve through import aliasing
+  (`from tether import mcu as m`) instead of a hardcoded literal name.
+  Known, documented limitation carried forward (not fixed — judged
+  disproportionate for now): tuple/list-unpacking assignment targets
+  (`x, y = ...`) at module level aren't tracked as dependencies.
 
 - [ ] **4. AST slicer — reverse stub generation**
   `slicer/` — for every `@pc.export` function, generate a MicroPython proxy
