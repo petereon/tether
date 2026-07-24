@@ -82,7 +82,10 @@ works.
   directions with the PC-side `msgpack` package from chunk 2, including the
   longer-form (str8/16, bin16, array16, map16) wire encodings a
   small-values-only test would have missed — caught by review, fixed by
-  expanding the test data.
+  expanding the test data. Retroactively also confirmed against a real
+  MicroPython interpreter (`brew install micropython`, unix port, installed
+  while starting chunk 6) — round-trips correctly under the actual target
+  runtime, not just under CPython.
   Reviewed (combined quality pass + manual security pass): no reuse/
   simplification/altitude findings on our own code (vendored library
   itself deliberately out of scope for critique — see VENDORED.md).
@@ -97,39 +100,70 @@ works.
   its entry below) and in `VENDORED.md`, rather than left as scattered
   awareness.
 
-- [ ] **6. MCU runtime — dispatch loop**
+- [x] **6. MCU runtime — dispatch loop** — done 2026-07-24
   `tether_runtime/dispatch.py` — `uasyncio`-based reentrant dispatch loop:
   request-ID tagged frames, `@mcu.loop` periodic task scheduling, heartbeat
   emission on natural `await` yield points. Depends on: 5.
-  **Contract owed to chunk 4:** must export an `async def call_pc(name: str,
-  *args)` matching exactly what chunk 4's generated `@pc.export` stubs
-  already call (`return await call_pc("<function name>", <positional args,
-  in original param order>)` — see `_build_stub` in `src/tether/slicer/__init__.py`).
-  Positional-only forwarding; no kwargs. This is currently only enforced by
-  chunk 4's tests asserting the generated call shape — no `Protocol`/typed
-  contract exists yet since chunk 6 doesn't exist to check against. If this
-  signature needs to change, update chunk 4's stub generator and tests in
-  the same change, don't let them drift apart.
-  **Security constraint owed by chunk 6 (from chunk 5's review):** the
-  vendored `umsgpack.load(fp)` reads a length field straight from the wire
-  with no upper bound (`_read_except` in `mp_load.py`) — safe when called as
-  `umsgpack.loads(body_bytes)` on an already-length-bounded, fully-received
-  frame body (which is what `loads()` effectively forces, since its input
-  is already a complete in-memory `bytes`/`bytearray`), **unsafe** if
-  `umsgpack.load()` is ever called directly on a live UART/socket stream —
-  that would reintroduce, on the MCU (far more RAM-constrained than the PC),
-  the exact unbounded-memory DoS chunk 2's `MAX_FRAME_SIZE` guard closed on
-  the PC side. Chunk 6 must always: read the outer `[length][msg-type]`
-  header first, validate `length` against a bound (mirror chunk 2's
-  `MAX_FRAME_SIZE`), read exactly that many bytes, THEN call
-  `umsgpack.loads()` on the resulting bounded `bytes` — never
-  `umsgpack.load()` on the raw stream.
+  `Dispatcher(reader, writer)` with `register(name, handler,
+  heartbeat_interval_ms=1000)`, `register_loop(fn, interval_ms)`, `call_pc
+  (name, *args)`, `run()`. Satisfies both contracts pinned above: `call_pc`
+  matches chunk 4's generated stubs exactly, and frame reading always
+  bounds `length` (mirrors chunk 2's `MAX_FRAME_SIZE`) before ever calling
+  `umsgpack.loads()` on the resulting bytes.
+  Installed a real MicroPython interpreter (`brew install micropython`,
+  unix port) since this module is inherently `uasyncio`-specific and can't
+  be meaningfully exercised under CPython — 13 tests in
+  `tests/test_dispatch_mcu.py` run against the actual interpreter via a
+  subprocess harness (`tests/mpy_runner.py`, skips gracefully if
+  micropython isn't installed), covering frame roundtrip, oversized-length
+  rejection, call/response, error propagation (incl. traceback), async
+  handlers, bidirectional reentrancy (a handler calling back into its own
+  caller while that caller is still waiting — the core DESIGN.md guarantee),
+  periodic loops, and heartbeat emission/non-interference with the final
+  response.
+  Two real bugs caught mid-build by the harness itself (not by review):
+  `from tether_runtime import umsgpack` failed under real MicroPython
+  because the on-device bundle deploys flat (no package wrapper) — fixed to
+  `import umsgpack`; and `MICROPYPATH` replaces `sys.path` entirely rather
+  than extending it, dropping the frozen stdlib — fixed the test harness to
+  include the default search paths alongside the project path.
+  Reviewed (4-angle + manual security pass): fixed a real bug (altitude
+  finding) where a CALL frame for an unregistered handler name raised an
+  uncaught `KeyError` inside a fire-and-forget task, permanently hanging
+  the caller with no response ever sent — now returns a proper `MSG_ERROR`
+  (`LookupError`). Applied a `_Pending` value class (was an ad-hoc dict with
+  implicit mutual-exclusion rules — simplification + efficiency agents both
+  flagged this independently), a single-allocation `_encode_frame`
+  (efficiency), `try/finally` heartbeat-task cleanup (simplification), and
+  a shared `_maybe_await` helper (reuse — was duplicated between
+  `_handle_call` and `_run_loop`). Security pass found a real gap against
+  DESIGN.md's own locked contract: `RemoteError` was only carrying
+  type+message, not the traceback DESIGN.md § Wire protocol specifies —
+  fixed using `sys.print_exception`/`io.StringIO` (both available on
+  MicroPython). Also found and documented (not fixed — needs a symmetric
+  decision with chunk 7, not yet made) that `run()` spawns an unbounded
+  task per incoming CALL frame with no concurrency cap or backpressure;
+  noted as a constraint on chunk 7 below rather than left as scattered
+  awareness.
+  (Both contracts previously pinned here — the `call_pc` shape owed to
+  chunk 4, and the length-bound-before-`loads()` security constraint owed
+  by chunk 5's review — are now satisfied; see the summary above.)
 
 - [ ] **7. PC-side dispatch**
   `dispatch/` — background reader thread + queue; blocking calls filter by
   request-ID while pumping other in-flight requests to a thread pool
   (reentrant/reverse-call support); per-call timeout + heartbeat-driven
   idle-reset; wraps remote exceptions as `RemoteError`. Depends on: 2.
+  **Contract owed to chunk 6 (from chunk 6's review):** chunk 6's MCU-side
+  `run()` spawns an unbounded `asyncio.create_task` per incoming CALL frame
+  with no concurrency cap or backpressure — a hostile peer or corrupted
+  stream sending CALL frames rapidly could exhaust task/memory resources on
+  the MCU. Partially mitigated for v1 by the physical throughput ceiling of
+  the serial/BLE/wifi transports themselves (chunks 9/12/13), but not a
+  real fix. When designing this chunk's own concurrency handling, decide a
+  symmetric max-in-flight-calls policy for both sides together — don't
+  let the PC and MCU sides independently invent different backpressure
+  schemes.
 
 - [ ] **8. Mock transport**
   `transports/mock.py` — in-process fake MCU: runs the real sliced code path
