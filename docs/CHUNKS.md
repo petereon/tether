@@ -744,9 +744,86 @@ works.
   simulated case); +1 in `test_connection.py` confirming the `ble:` scheme
   routes correctly and preserves a colon-containing MAC address).
 
-- [ ] **14. ruff cleanup pass**
+- [x] **14. ruff cleanup pass** — done 2026-07-24
   `slicer/` — post-slice unused-import stripping via `ruff`, applied to the
   bundle before upload. Depends on: 3.
+
+  Confirmed this addresses a real, existing gap (not a hypothetical): the
+  AST dependency walk (`_bound_names`/`_collect_bindings`) can only
+  include/exclude a whole `import`/`from...import` *statement* at a time,
+  since every name a multi-name import binds maps to the SAME AST node in
+  `bindings`. `from time import monotonic, sleep` where only `sleep` is
+  referenced by included code still renders both names into the bundle
+  pushed to the device - wasted bytes, and on-device an `ImportError` risk
+  if the unused name doesn't even exist on MicroPython. Verified by reading
+  the existing code (chunk 3) before writing anything, then pinned with a
+  regression test.
+
+  What was built:
+  - `_strip_unused_imports(source)` (new, `slicer/__init__.py`): invokes
+    the real `ruff` CLI as a subprocess (`ruff check --fix --exit-zero
+    --select=F401 --stdin-filename=... -`, source piped via stdin, fixed
+    source captured from stdout) - not linked as a library, since ruff has
+    no stable Python API for this (DESIGN.md § Dependencies, already
+    locked before this chunk started). `slice_mcu_bound()` now calls this
+    on its rendered output before returning `SliceResult`.
+  - Moved `ruff` from `pyproject.toml`'s `dev` extra into core
+    `dependencies` and re-ran `uv lock`: this is no longer just a lint
+    tool, it's invoked at `connect()` time by any scheme that slices
+    (currently only `serial:`) - DESIGN.md's own § Dependencies section
+    already listed it as a real dependency of the slicing pipeline, not an
+    optional dev convenience, so this wasn't a new decision, just applying
+    an existing one.
+
+  Real correctness finding, self-caught (not from a review agent - see
+  process note below): manually verified `ruff`'s actual exit-code
+  behavior via `bash` before trusting any flag combination. Without
+  `--exit-zero`, `ruff check --fix` exits non-zero whenever a REMAINING
+  violation exists after fixing - and ruff's F401 safety heuristics
+  deliberately never autofix an import inside a `try`/`except` (can't
+  prove removal is safe), which is a common MicroPython compatibility
+  idiom (`try: import ujson except ImportError: ...`). Combined with
+  `check=True` on `subprocess.run`, that would have made `slice_mcu_bound()`
+  raise `CalledProcessError` and crash the whole slice on a completely
+  ordinary, safe pattern - not a hypothetical, confirmed by literally
+  running that exact source through `ruff check --fix` without
+  `--exit-zero` and watching it exit 1. `--exit-zero` was already present
+  in the first implementation (written with this failure mode in mind),
+  but its reasoning wasn't documented and there was no test pinning it -
+  added both: an explicit comment on why `--exit-zero` + `check=True` are
+  combined deliberately (one absorbs "ruff still found something it
+  couldn't fix", the other still fires loud for a genuine subprocess
+  failure), and a regression test asserting `slice_mcu_bound()` doesn't
+  raise on exactly that try/except idiom.
+
+  Process note: the simplification review agent for this chunk failed
+  mid-run (`"You've hit your monthly spend limit"`), and the reuse agent's
+  own output carried a safety-classifier-unavailable warning asking for
+  extra verification of its claims (both re-checked manually before
+  trusting - the reuse finding of "no existing subprocess pattern to reuse"
+  was independently confirmed by grepping `src/tether/` myself). Given the
+  spend limit, efficiency and altitude were reviewed manually instead of
+  via further parallel agents - the try/except finding above came out of
+  that manual pass, specifically from actually running `ruff` against
+  several inputs in `bash` rather than reasoning about its CLI flags from
+  memory alone.
+  - Reuse (1 agent finding, confirmed, no action needed): no existing
+    subprocess/CLI-invocation pattern anywhere in `src/tether/` to reuse -
+    `_strip_unused_imports` is the first, appropriately scoped to this one
+    function.
+  - Simplification/Efficiency/Altitude (manual): no issues beyond the
+    exit-code finding above, which is really a correctness/altitude-level
+    finding surfaced while checking the simplification question ("is
+    `--exit-zero` + `check=True` redundant?") - answered definitively by
+    testing, not guessing, and documented + regression-tested rather than
+    left implicit.
+  - Security: no findings. `subprocess.run` is called with an argument
+    list (no `shell=True`), and `source` is passed via `input=` (stdin),
+    never interpolated into the command line - no injection surface.
+    `--stdin-filename` is a fixed constant, not user-controlled.
+
+  153 tests passing (was 152; +1 pinning the multi-name-import stripping
+  behavior itself, +1 pinning the try/except-unused-import survival case).
 
 - [ ] **15. End-to-end example + docs**
   A real single-file example (e.g. blink/read-sensor over serial) in

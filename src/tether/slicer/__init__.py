@@ -21,6 +21,7 @@ nothing and are silently excluded — not currently supported.
 from __future__ import annotations
 
 import ast
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -189,6 +190,47 @@ def _topological_order(
     return ordered
 
 
+def _strip_unused_imports(source: str) -> str:
+    """Post-slice cleanup pass (DESIGN.md § Dependencies): the dependency
+    walk above can only include or exclude a whole `import`/`from...import`
+    *statement* at a time (see _bound_names' own comment) - if included code
+    references only one name out of a multi-name import, every other name on
+    that line still renders, unused, into the bundle pushed to the device.
+    `ruff`'s F401 (unused-import) check is per-name, not per-statement, so it
+    can trim exactly the names the AST walk couldn't. Invoked via subprocess
+    (not linked as a library): ruff has no stable Python API for this,
+    consistent with how the `ruff` CLI itself is always invoked as a
+    subprocess/binary, never imported.
+
+    `--exit-zero` + `check=True` together, deliberately: ruff's F401 safety
+    heuristics never autofix an import inside a try/except (a common
+    MicroPython compat idiom - `try: import ujson except ImportError: ...`
+    - ruff can't prove removing it is safe), which leaves a REMAINING
+    violation and makes plain `ruff check --fix` exit non-zero even though
+    nothing went wrong. `--exit-zero` absorbs that ("still found something
+    it couldn't fix" is not this function's problem - best-effort cleanup,
+    not a hard gate), so `check=True` is left to fire only for a genuine
+    subprocess failure (ruff missing/crashing), which should still crash
+    loud rather than silently produce garbage output.
+    """
+    result = subprocess.run(
+        [
+            "ruff",
+            "check",
+            "--fix",
+            "--exit-zero",
+            "--select=F401",
+            "--stdin-filename=tether_sliced_bundle.py",
+            "-",
+        ],
+        input=source,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
 def slice_mcu_bound(source: str, *, base_dir: Path | None = None) -> SliceResult:
     tree = ast.parse(source)
     # ast.AST nodes have no custom __eq__/__hash__, so they're already
@@ -227,7 +269,7 @@ def slice_mcu_bound(source: str, *, base_dir: Path | None = None) -> SliceResult
 
     rendered = "\n\n".join(ast.unparse(node) for node in ordered)
     return SliceResult(
-        source=rendered,
+        source=_strip_unused_imports(rendered),
         exported_names=frozenset(node.name for node in exported),
     )
 

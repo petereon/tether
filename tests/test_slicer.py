@@ -90,6 +90,54 @@ def blink() -> None:
     assert "import time" not in result.source
 
 
+def test_strips_an_unused_name_from_a_multi_name_import_the_dependency_walk_had_to_keep_whole():
+    # _bound_names/_collect_bindings map every name in one `from X import a,
+    # b` statement to the SAME node - if the included code only references
+    # `sleep`, the dependency walk still has to pull in the whole statement
+    # (it can't partially include an AST node), which is exactly the gap
+    # chunk 14's post-slice ruff cleanup pass exists to close: `monotonic`
+    # renders in the slice's raw AST-unparse output but is never referenced
+    # by anything the slice actually keeps.
+    source = """
+from tether import mcu
+from time import monotonic, sleep
+
+@mcu.export
+def wait_a_bit() -> None:
+    sleep(0.1)
+"""
+    result = slice_mcu_bound(source)
+
+    assert "sleep" in result.source
+    assert "monotonic" not in result.source
+
+
+def test_survives_an_unused_import_ruff_cannot_safely_autofix():
+    # A common MicroPython compat idiom - `try: import ujson except
+    # ImportError: ...` - ruff's F401 safety heuristics never autofix an
+    # import inside a try/except (can't prove it's safe to remove), so this
+    # always leaves a REMAINING violation after --fix, which makes plain
+    # `ruff check --fix` (no --exit-zero) exit non-zero. Pins that
+    # _strip_unused_imports's `--exit-zero` + `check=True` combination means
+    # exactly what its comment says: check=True should only ever fire for a
+    # genuine subprocess failure, never "ruff still found something it
+    # couldn't fix" - this must not crash slicing on a real, common pattern.
+    source = """
+from tether import mcu
+
+@mcu.export
+def read_config() -> str:
+    try:
+        import ujson as json
+    except ImportError:
+        pass
+    return "ok"
+"""
+    result = slice_mcu_bound(source)  # must not raise
+
+    assert "def read_config" in result.source
+
+
 def test_never_includes_the_pc_side_tether_import():
     # `from tether import mcu` is a PC-only import — `tether` isn't
     # installed on the MCU (only `tether_runtime` is). The decorator's own

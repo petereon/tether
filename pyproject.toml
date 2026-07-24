@@ -7,12 +7,17 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
     "msgpack>=1.0",
+    # Not just a dev/lint tool here - slicer/__init__.py invokes the `ruff`
+    # CLI as a subprocess at connect()-time (post-slice unused-import
+    # stripping, see DESIGN.md § Dependencies and CHUNKS.md chunk 14). Any
+    # code path that slices (serial's connect()) needs it installed.
+    "ruff>=0.6",
 ]
 
 [project.optional-dependencies]
 serial = ["pyserial>=3.5"]
 ble = ["bleak>=0.21"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0"]
 
 [build-system]
 requires = ["hatchling"]

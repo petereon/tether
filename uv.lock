@@ -349,6 +349,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "msgpack" },
+    { name = "ruff" },
 ]
 
 [package.optional-dependencies]
@@ -357,7 +358,6 @@ ble = [
 ]
 dev = [
     { name = "pytest" },
-    { name = "ruff" },
 ]
 serial = [
     { name = "pyserial" },
@@ -369,7 +369,7 @@ requires-dist = [
     { name = "msgpack", specifier = ">=1.0" },
     { name = "pyserial", marker = "extra == 'serial'", specifier = ">=3.5" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
+    { name = "ruff", specifier = ">=0.6" },
 ]
 provides-extras = ["serial", "ble", "dev"]
 
