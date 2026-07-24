@@ -67,6 +67,26 @@ def test_mcu_export_rejects_var_keyword_args():
             return 0.0
 
 
+def test_mcu_export_rejects_keyword_only_args():
+    # Fixed positional-or-keyword arity only: the wire protocol has no
+    # concept of keyword-vs-positional, and the slicer's @pc.export stub
+    # generator forwards args purely positionally (src/tether/slicer) - a
+    # keyword-only param would silently never reach the wire.
+    with pytest.raises(TypeError, match="y"):
+
+        @mcu.export
+        def read_temp(x: int, *, y: int) -> float:
+            return 0.0
+
+
+def test_mcu_export_rejects_positional_only_args():
+    with pytest.raises(TypeError, match="x"):
+
+        @mcu.export
+        def read_temp(x: int, /) -> float:
+            return 0.0
+
+
 def test_mcu_export_accepts_nested_generic_containers():
     @mcu.export
     def read_samples(labels: list[str]) -> dict[str, int]:

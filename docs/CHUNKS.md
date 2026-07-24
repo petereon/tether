@@ -53,10 +53,21 @@ works.
   disproportionate for now): tuple/list-unpacking assignment targets
   (`x, y = ...`) at module level aren't tracked as dependencies.
 
-- [ ] **4. AST slicer — reverse stub generation**
+- [x] **4. AST slicer — reverse stub generation** — done 2026-07-24
   `slicer/` — for every `@pc.export` function, generate a MicroPython proxy
   stub (same name/signature) whose body sends an RPC frame and awaits the
-  reply (DESIGN.md step 2). Depends on: 1, 3.
+  reply (DESIGN.md step 2). Depends on: 1, 3. `generate_pc_stubs()`, stubs
+  are `async def` forwarding args positionally to a forward-declared
+  `call_pc(name, *args)` runtime hook — see chunk 6's contract note above.
+  7 tests, TDD'd. Reviewed (4-angle simplify + manual security pass): fixed
+  a real bug where keyword-only/positional-only params were silently
+  dropped from the forwarded call (never sent over RPC, no error) — closed
+  it in two places: rejected at decoration time (chunk 1's
+  `_validate_signature`, matching the existing `*args`/`**kwargs`
+  rejection) AND defensively in the slicer itself, since `generate_pc_stubs`
+  parses raw source text with no guarantee decoration ever ran first.
+  Extracted a shared `_top_level_decorated_functions` helper (was
+  duplicated between `slice_mcu_bound` and `generate_pc_stubs`).
 
 - [ ] **5. MCU runtime — umsgpack**
   `tether_runtime/umsgpack.py` — vendor a real MicroPython-compatible
@@ -66,6 +77,15 @@ works.
   `tether_runtime/dispatch.py` — `uasyncio`-based reentrant dispatch loop:
   request-ID tagged frames, `@mcu.loop` periodic task scheduling, heartbeat
   emission on natural `await` yield points. Depends on: 5.
+  **Contract owed to chunk 4:** must export an `async def call_pc(name: str,
+  *args)` matching exactly what chunk 4's generated `@pc.export` stubs
+  already call (`return await call_pc("<function name>", <positional args,
+  in original param order>)` — see `_build_stub` in `src/tether/slicer/__init__.py`).
+  Positional-only forwarding; no kwargs. This is currently only enforced by
+  chunk 4's tests asserting the generated call shape — no `Protocol`/typed
+  contract exists yet since chunk 6 doesn't exist to check against. If this
+  signature needs to change, update chunk 4's stub generator and tests in
+  the same change, don't let them drift apart.
 
 - [ ] **7. PC-side dispatch**
   `dispatch/` — background reader thread + queue; blocking calls filter by

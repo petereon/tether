@@ -21,11 +21,9 @@ nothing and are silently excluded — not currently supported.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-
-_MCU_DECORATOR_ATTRS = {"export", "loop"}
-_MCU_NAMESPACE = "mcu"
 
 
 @dataclass(frozen=True)
@@ -54,16 +52,30 @@ def _tether_import_aliases(tree: ast.Module) -> dict[str, str]:
     return aliases
 
 
-def _is_mcu_decorator(decorator: ast.expr, aliases: dict[str, str]) -> bool:
-    # Matches both bare `@mcu.export` and called `@mcu.loop(interval_ms=100)`,
-    # resolved through whatever local name `mcu` was imported/aliased as.
+_DECORATOR_ATTRS_BY_NAMESPACE = {"mcu": {"export", "loop"}, "pc": {"export"}}
+
+
+def _decorator_canonical_namespace(decorator: ast.expr, aliases: dict[str, str]) -> str | None:
+    """Resolve a decorator to 'mcu', 'pc', or None, through whatever local
+    name that namespace was imported/aliased as (e.g. `from tether import
+    mcu as m` -> `@m.export` still resolves to 'mcu'). Matches both bare
+    `@mcu.export` and called `@mcu.loop(interval_ms=100)` forms.
+    """
     node = decorator.func if isinstance(decorator, ast.Call) else decorator
-    return (
-        isinstance(node, ast.Attribute)
-        and node.attr in _MCU_DECORATOR_ATTRS
-        and isinstance(node.value, ast.Name)
-        and aliases.get(node.value.id) == _MCU_NAMESPACE
-    )
+    if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)):
+        return None
+    canonical = aliases.get(node.value.id)
+    if canonical is None or node.attr not in _DECORATOR_ATTRS_BY_NAMESPACE.get(canonical, ()):
+        return None
+    return canonical
+
+
+def _is_mcu_decorator(decorator: ast.expr, aliases: dict[str, str]) -> bool:
+    return _decorator_canonical_namespace(decorator, aliases) == "mcu"
+
+
+def _is_pc_decorator(decorator: ast.expr, aliases: dict[str, str]) -> bool:
+    return _decorator_canonical_namespace(decorator, aliases) == "pc"
 
 
 def _referenced_names(node: ast.AST) -> set[str]:
@@ -187,12 +199,7 @@ def slice_mcu_bound(source: str, *, base_dir: Path | None = None) -> SliceResult
     _collect_bindings(tree, base_dir, bindings, visited_files=set())
 
     aliases = _tether_import_aliases(tree)
-    exported: list[ast.FunctionDef] = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and any(_is_mcu_decorator(dec, aliases) for dec in node.decorator_list)
-    ]
+    exported = _top_level_decorated_functions(tree, aliases, _is_mcu_decorator)
 
     included: dict[ast.stmt, None] = {}  # dict-as-ordered-set, dedupe across files
     pending = list(exported)
@@ -222,4 +229,79 @@ def slice_mcu_bound(source: str, *, base_dir: Path | None = None) -> SliceResult
     return SliceResult(
         source=rendered,
         exported_names=frozenset(node.name for node in exported),
+    )
+
+
+@dataclass(frozen=True)
+class StubResult:
+    """MicroPython-side proxy stubs for every `@pc.export` function.
+
+    Each stub has the same name and signature as the original PC function;
+    its body sends an RPC frame and awaits the reply, via a `call_pc`
+    runtime hook (`tether_runtime.dispatch.call_pc`, chunk 6's job to
+    implement). Stubs are `async def` — MCU-side dispatch is uasyncio-based
+    (DESIGN.md § Call semantics), so a blocking call isn't an option; MCU
+    code calling a `@pc.export` function must itself be async and `await` it.
+    """
+
+    source: str
+    stubbed_names: frozenset[str]
+
+
+def _top_level_decorated_functions(
+    tree: ast.Module,
+    aliases: dict[str, str],
+    predicate: Callable[[ast.expr, dict[str, str]], bool],
+) -> list[ast.FunctionDef]:
+    return [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(predicate(dec, aliases) for dec in node.decorator_list)
+    ]
+
+
+def _build_stub(func_def: ast.FunctionDef) -> ast.AsyncFunctionDef:
+    args = func_def.args
+    if args.vararg or args.kwarg or args.kwonlyargs or args.posonlyargs:
+        # decorators.py's _validate_signature already rejects these at
+        # decoration time - but this function parses raw source text and
+        # has no guarantee that ever ran (e.g. called directly, or before
+        # the module's been imported). Fail loudly rather than generate a
+        # stub whose call_pc(...) body silently drops the offending params.
+        extra = [a.arg for a in (*args.posonlyargs, *args.kwonlyargs)]
+        extra += [args.vararg.arg] if args.vararg else []
+        extra += [args.kwarg.arg] if args.kwarg else []
+        raise ValueError(
+            f"{func_def.name}: parameter(s) {extra!r} have unsupported kind "
+            "(fixed positional-or-keyword arity only)"
+        )
+    call_args = [ast.Name(id=arg.arg, ctx=ast.Load()) for arg in args.args]
+    call = ast.Call(
+        func=ast.Name(id="call_pc", ctx=ast.Load()),
+        args=[ast.Constant(value=func_def.name), *call_args],
+        keywords=[],
+    )
+    stub = ast.AsyncFunctionDef(
+        name=func_def.name,
+        args=func_def.args,
+        body=[ast.Return(value=ast.Await(value=call))],
+        decorator_list=[],
+        returns=func_def.returns,
+        lineno=1,
+        col_offset=0,
+    )
+    return ast.fix_missing_locations(stub)
+
+
+def generate_pc_stubs(source: str) -> StubResult:
+    tree = ast.parse(source)
+    aliases = _tether_import_aliases(tree)
+    pc_functions = _top_level_decorated_functions(tree, aliases, _is_pc_decorator)
+
+    stubs = [_build_stub(func) for func in pc_functions]
+    rendered = "\n\n".join(ast.unparse(stub) for stub in stubs)
+    return StubResult(
+        source=rendered,
+        stubbed_names=frozenset(func.name for func in pc_functions),
     )

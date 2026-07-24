@@ -104,11 +104,17 @@ def _validate_signature(fn: Callable[..., Any]) -> None:
     sig = inspect.signature(fn)
     hints = typing.get_type_hints(fn)
 
+    _UNSUPPORTED_PARAM_KINDS = (
+        inspect.Parameter.VAR_POSITIONAL,
+        inspect.Parameter.VAR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.POSITIONAL_ONLY,
+    )
     for name, param in sig.parameters.items():
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+        if param.kind in _UNSUPPORTED_PARAM_KINDS:
             raise TypeError(
-                f"{fn.__qualname__}: variadic parameter {name!r} is not supported "
-                "(fixed arity only)"
+                f"{fn.__qualname__}: parameter {name!r} has unsupported kind "
+                f"{param.kind.name} (fixed positional-or-keyword arity only)"
             )
         if name not in hints:
             raise TypeError(f"{fn.__qualname__}: parameter {name!r} has no type hint")
