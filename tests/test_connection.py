@@ -11,7 +11,7 @@ from tether.dispatch import Dispatcher
 from tether.transports.wifi import WifiStream
 
 sys.path.insert(0, str(Path(__file__).parent))
-from mpy_runner import requires_micropython, run_micropython
+from mpy_runner import PIPE_HARNESS, requires_micropython, run_micropython
 
 
 def test_generate_bootstrap_embeds_sliced_and_stub_source():
@@ -155,39 +155,7 @@ def test_generated_bootstrap_actually_works_end_to_end():
     ).replace("\n_tether_asyncio.run(_tether_main())\n", "\n")
 
     out = run_micropython(
-        """
-import uasyncio as asyncio
-
-class Pipe:
-    def __init__(self):
-        self.buf = b""
-        self.event = asyncio.Event()
-
-    def write(self, data):
-        self.buf += data
-        if not self.event.is_set():
-            self.event.set()
-
-    async def drain(self):
-        pass
-
-    async def readexactly(self, n):
-        while len(self.buf) < n:
-            self.event.clear()
-            await self.event.wait()
-        chunk = self.buf[:n]
-        self.buf = self.buf[n:]
-        return chunk
-
-
-def make_pair():
-    a_to_b = Pipe()
-    b_to_a = Pipe()
-    return (b_to_a, a_to_b), (a_to_b, b_to_a)
-
-(reader_a, writer_a), (_reader, _writer) = make_pair()
-
-"""
+        PIPE_HARNESS
         + patched
         + """
 

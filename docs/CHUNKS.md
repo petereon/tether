@@ -825,10 +825,84 @@ works.
   153 tests passing (was 152; +1 pinning the multi-name-import stripping
   behavior itself, +1 pinning the try/except-unused-import survival case).
 
-- [ ] **15. End-to-end example + docs**
+- [ ] **15. End-to-end example + docs** — feature-complete 2026-07-24,
+  **not checked off: the chunk's own definition of done requires the README
+  walkthrough to be verified against actual hardware, and no physical
+  ESP32/MicroPython board has been available at any point in this
+  project's development.** Per CHUNKS.md's own stated protocol ("don't
+  mark a chunk done based on scaffolding/stubs alone"), that requirement
+  isn't satisfied by anything short of running it on a real board — so
+  this stays unchecked until someone does. Everything short of that has
+  been built and verified as rigorously as possible without hardware; see
+  below for exactly what and how.
   A real single-file example (e.g. blink/read-sensor over serial) in
   `examples/`, README walkthrough verified against actual hardware. Depends
   on: 9, 10.
+
+  What was built:
+  - `examples/blink_and_log/blink_and_log.py`: a real, complete,
+    directly-runnable single file. `@mcu.export async def blink(times)`
+    blinks an onboard LED and calls back `@pc.export def
+    log_progress(blink_number, total)` after each blink; a plain
+    `if __name__ == "__main__":` block at the bottom drives it via
+    `mcu.connect("serial:auto")`, exactly the "single file, run it
+    directly" pitch from `docs/DESIGN.md`'s own opening paragraph.
+  - README.md rewritten: fixed the original snippet (which referenced an
+    undefined `adc` with no import shown - always illustrative pseudocode,
+    never actually runnable), added a full walkthrough section pointing at
+    the real example, documented expected output, and added an explicit
+    "not run against real hardware" note in the same place a reader would
+    look for confirmation it works - not buried in CHUNKS.md where a
+    library user would never see it.
+
+  Real design gap found and fixed, by actually trying to write a genuinely
+  runnable example rather than another illustrative snippet - exactly the
+  kind of thing this chunk exists to catch: `docs/DESIGN.md`'s own § slice
+  step uses `led = Pin(2, Pin.OUT)` at *module level* as its illustrative
+  example of what the AST slicer captures. That line is true on its own
+  (the slicer does capture it) - but a module-level `from machine import
+  Pin` / `led = Pin(2, Pin.OUT)` executes under CPython too, the moment the
+  single file is run directly as a PC script (that's the whole "single
+  file" pitch), and `machine` doesn't exist there - confirmed by actually
+  running it and watching it crash with `ModuleNotFoundError`, not by
+  inspection alone. This would have made *any* example following
+  DESIGN.md's own illustrated pattern literally unrunnable on a PC.
+  Fixed by writing the example with hardware objects constructed lazily
+  *inside* the `@mcu.export` function body instead (a `_get_led()` helper,
+  called from `blink()`) - that code path only ever executes on the MCU,
+  never on the PC, so the PC-side run of the file never touches `machine`
+  at all. Documented this as a correction directly in `docs/DESIGN.md`'s §
+  Architecture overview (dated, explains what changed and why, per
+  CLAUDE.md's instruction to amend DESIGN.md explicitly rather than
+  silently drift from a decision that turned out to need fixing) - the
+  slicer's own capture behavior is unchanged and still correct, only the
+  illustrative pattern needed correcting.
+
+  Verified without hardware (`tests/test_examples.py`, 4 tests):
+  - The example file parses and slices correctly: exactly `blink` is
+    exported, `_get_led`/`_led` (its dependencies) are pulled in, and
+    PC-only driver code (`mcu.connect`, the `__main__` guard) is never
+    sliced onto the device.
+  - `generate_bootstrap()`'s output for the real sliced+stub source is
+    syntactically valid Python (`ast.parse` doesn't raise).
+  - The generated on-device bundle's registration and dispatch wiring
+    actually runs correctly under the real `micropython` unix-port
+    interpreter (same rigor as chunk 10's own end-to-end bootstrap test) -
+    `machine.Pin` faked out (no real GPIO under the unix port; everything
+    else in the generated script is exactly what would be uploaded to a
+    real board), driving a real `blink(2)` call through a real `Dispatcher`
+    on both sides and asserting the fake LED toggled and progress was
+    logged back in the right order.
+  - (One test was written and then removed as a design mistake, not a
+    product bug: attempted to call `connect("mock://")` from a *different*
+    test module than the one defining `blink` - `_capture_caller()`'s
+    frame-based caller detection can only ever see decorated functions in
+    the module that actually calls `connect()`, so this could never have
+    worked regardless of implementation. Removed rather than worked
+    around, since the real-MicroPython test above already covers the same
+    ground more rigorously.)
+
+  157 tests passing (was 153; +4 in new `tests/test_examples.py`).
 
 - [ ] **16. CI: lint workflow**
   GitHub Actions workflow running `ruff check` + `ruff format --check` (via

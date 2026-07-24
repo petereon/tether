@@ -37,6 +37,50 @@ requires_micropython = pytest.mark.skipif(
     reason="micropython interpreter not installed (brew install micropython)",
 )
 
+# In-memory duplex Pipe pair for driving a generated bootstrap's
+# _tether_main() as a task inside a single micropython process, standing in
+# for real stdin/stdout wiring (already verified separately that
+# uasyncio.StreamReader/Writer over real piped stdio works - these tests are
+# about the registration/dispatch wiring, not the stream plumbing itself).
+# Defines module-level `reader_a`/`writer_a` (driver-side) and `_reader`/
+# `_writer` (the names a bootstrap's stdio-wiring lines get patched to
+# reference instead). Shared across every "drive a real generated bootstrap
+# end-to-end" test (test_connection.py, test_examples.py) rather than
+# duplicated per test file - a bug fix here would otherwise need applying
+# in each copy independently.
+PIPE_HARNESS = """
+import uasyncio as asyncio
+
+class Pipe:
+    def __init__(self):
+        self.buf = b""
+        self.event = asyncio.Event()
+
+    def write(self, data):
+        self.buf += data
+        if not self.event.is_set():
+            self.event.set()
+
+    async def drain(self):
+        pass
+
+    async def readexactly(self, n):
+        while len(self.buf) < n:
+            self.event.clear()
+            await self.event.wait()
+        chunk = self.buf[:n]
+        self.buf = self.buf[n:]
+        return chunk
+
+
+def make_pair():
+    a_to_b = Pipe()
+    b_to_a = Pipe()
+    return (b_to_a, a_to_b), (a_to_b, b_to_a)
+
+(reader_a, writer_a), (_reader, _writer) = make_pair()
+"""
+
 
 def run_micropython(script: str, timeout: float = 5.0) -> str:
     """Run `script` under `micropython`, with tether_runtime/ importable.

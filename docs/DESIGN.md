@@ -45,6 +45,23 @@ At `connect()` time:
    Follow referenced names into module-level assignments, class defs, and
    helper functions so peripheral setup (`led = Pin(2, Pin.OUT)`) is captured
    automatically — no separate annotation needed.
+
+   **Correction (found building chunk 15's example, 2026-07-24):** the
+   slicer genuinely does capture module-level peripheral setup like
+   `led = Pin(2, Pin.OUT)` as shown above — but that pattern only works if
+   the entry file is never executed directly by the PC. Since the whole
+   pitch is a single file runnable as a normal PC script too, a *top-level*
+   `from machine import Pin` / `led = Pin(2, Pin.OUT)` executes under
+   CPython as well (where `machine` doesn't exist) and crashes before
+   `connect()` is ever reached — confirmed by actually running it, not by
+   inspection. The example in `examples/blink_and_log/` shows the pattern
+   that actually works instead: construct hardware objects *inside* the
+   `@mcu.export` function body (lazily, on first call) so that code path
+   never executes on the PC side. Module-level assignments are still
+   captured and useful for MCU-only constants/config that don't touch
+   hardware modules — the caution is specifically about anything importing
+   or constructing from a hardware-only module (`machine`, etc.) at module
+   scope.
 2. **Stub.** For every `@pc.export` function, generate a matching MCU-side
    proxy stub (same name, same signature) whose body sends an RPC frame and
    awaits the reply. From MCU code, calling a PC function looks identical to
