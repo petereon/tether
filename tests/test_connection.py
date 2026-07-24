@@ -78,6 +78,32 @@ def test_board_handle_returns_the_same_callable_on_repeated_access():
     assert board._mock_read_temp is board._mock_read_temp
 
 
+def test_connect_mock_two_boards_route_calls_independently():
+    # Multi-board: two connect() calls must not share dispatch state -
+    # calling a function on board_a must never reach board_b's handler.
+    board_a = connect("mock://")
+    board_b = connect("mock://")
+
+    assert board_a._mock_read_temp() == 21.5
+    assert board_b._mock_read_temp() == 21.5
+
+
+def test_board_handle_reconnect_establishes_a_fresh_working_dispatcher():
+    # Cached call closures (BoardHandle.__getattr__) resolve self._dispatcher
+    # dynamically at call time, so a reconnect that swaps in a new
+    # Dispatcher must transparently make already-cached closures work again
+    # - no re-fetching board.<name> required from calling code.
+    board = connect("mock://")
+    old_dispatcher = board._dispatcher
+    cached_call = board._mock_read_temp  # triggers __dict__ caching
+
+    board.reconnect()
+
+    assert board._dispatcher is not old_dispatcher
+    assert board._mock_read_temp is cached_call  # still the same cached closure
+    assert cached_call() == 21.5  # and it still works, routed to the new dispatcher
+
+
 def test_connect_serial_raises_clearly_on_a_decorated_but_unsliced_function():
     # _capture_caller finds @mcu.export functions on already-executed live
     # objects (works regardless of control flow); the AST slicer only

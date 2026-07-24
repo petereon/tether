@@ -151,3 +151,42 @@ def test_reader_thread_death_fails_pending_calls_instead_of_hanging_forever():
 
     with pytest.raises(MCUDisconnectedError):
         a.call_mcu("anything", timeout=None)
+
+
+def test_call_mcu_after_disconnect_fails_fast_instead_of_writing_into_a_dead_transport():
+    # Once the dispatcher already knows the transport died, a *new* call_mcu
+    # must not write into it and then wait out a full timeout for a response
+    # that can never arrive - it should raise immediately.
+    class _DyingReader:
+        def __init__(self):
+            self._read_once = False
+
+        def read(self):
+            if not self._read_once:
+                self._read_once = True
+                raise ConnectionError("device unplugged")
+            raise AssertionError("should not be called again after dying")
+
+    a = Dispatcher(_DyingReader(), writer=_Pipe())
+    a.start()
+
+    with pytest.raises(MCUDisconnectedError):
+        a.call_mcu("first", timeout=None)
+
+    start = time.monotonic()
+    with pytest.raises(MCUDisconnectedError):
+        a.call_mcu("second", timeout=5.0)
+    assert time.monotonic() - start < 1.0
+
+
+def test_close_shuts_down_the_incoming_call_worker_pool():
+    # close() is what BoardHandle.reconnect() calls on the abandoned
+    # dispatcher so a reconnect doesn't leak a fresh 4-thread pool per call.
+    # Once shut down, the executor must refuse further submissions.
+    a, _b = _make_pair()
+    dispatcher = Dispatcher(*a)
+
+    dispatcher.close()
+
+    with pytest.raises(RuntimeError, match="shutdown"):
+        dispatcher._executor.submit(lambda: None)

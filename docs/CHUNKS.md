@@ -436,10 +436,97 @@ works.
   async exported function for the first time. Fixed in
   `src/tether/slicer/__init__.py` with regression tests.
 
-- [ ] **11. Multi-board + disconnect handling**
+- [x] **11. Multi-board + disconnect handling** — done 2026-07-24
   `connection.py` / `dispatch/` — concurrent `BoardHandle`s, per-board method
-  routing (`board.read_temp()`), `MCUDisconnectedError` on transport loss
-  (fail loud, no silent retry), explicit `.reconnect()`. Depends on: 10.
+  routing, `MCUDisconnectedError` on transport loss (fail loud, no silent
+  retry), explicit `.reconnect()`. Depends on: 10.
+
+  What was built:
+  - Multi-board turned out to already be correct by construction from
+    chunk 10's design (each `connect()` call produces its own `BoardHandle`
+    closing over its own `Dispatcher`/transport, no shared registry) -
+    confirmed with a new test connecting two independent `mock://` boards
+    and calling both. No production code change needed for this part.
+  - `Dispatcher.call_mcu()` (`dispatch/__init__.py`) now fails immediately
+    with `MCUDisconnectedError` if the dispatcher already knows the
+    transport is dead, instead of writing into a dead transport and
+    hanging out a full timeout waiting for a response that can never
+    arrive.
+  - `BoardHandle.reconnect()` (`connection.py`) is implemented: both
+    `_connect_mock` and `_connect_serial` now build a `dial: Callable[[],
+    Dispatcher]` closure (re-running the full transport-specific
+    connect flow - for serial: rediscover port if "auto", upload-if-needed,
+    restart the on-device app fresh, re-handshake) passed into
+    `BoardHandle`. `reconnect()` re-invokes it and swaps in the new
+    `Dispatcher`. Cached call closures (`__getattr__`'s `self.__dict__`
+    caching from chunk 10) resolve `self._dispatcher` dynamically at call
+    time, so already-cached `board.read_temp` etc. keep working
+    transparently after a reconnect with no need to re-fetch the attribute.
+  - `Dispatcher.close()` (new): shuts down the incoming-call
+    `ThreadPoolExecutor` (non-blocking). Called on the *old* dispatcher by
+    `reconnect()` before returning, so a reconnect doesn't leak a fresh
+    4-worker thread pool on every call. Does not (cannot) stop the reader
+    thread - no way to unblock a thread mid blocking `read()` without the
+    transport's own `close()`, which `Dispatcher` doesn't own; this remains
+    the same accepted daemon-thread limitation from chunk 7/10, now just
+    also reachable via the reconnect success path, not only the
+    connect()-failure path.
+
+  Real bug found and fixed (via altitude review, not a failing test - see
+  below): the disconnected-flag check in `call_mcu()` was originally read
+  *outside* `self._pending_lock`, while `_fail_all_pending()` set the flag
+  and snapshotted `self._pending` *inside* it. A `call_mcu()` racing the
+  reader thread's death could read `self._disconnected` as `None`, then
+  insert its `_Pending` into `self._pending` *after* `_fail_all_pending`'s
+  snapshot was already taken - that pending call would never be resolved,
+  reproducing the exact hang this chunk exists to prevent. Fixed by moving
+  the check inside the same `with self._pending_lock:` block used to
+  insert the pending call, and moving the flag-set inside the same lock
+  `_fail_all_pending` already uses to snapshot - both sides now share one
+  critical section, closing the race entirely rather than narrowing it.
+
+  Review (4 parallel cleanup agents + manual security pass, `/security-review`
+  again unable to bootstrap - no git remote, same as every prior chunk):
+  - Reuse: no findings - no existing "is transport alive" flag or
+    reconnect/factory abstraction existed to reuse instead; `_dial_serial`
+    logic (later folded into `_connect_serial`'s `dial()` closure per the
+    simplification finding below) correctly delegates port rediscovery to
+    the existing `serial_transport.discover()` rather than reimplementing
+    it.
+  - Simplification (2 findings, both applied): (1) the initial
+    implementation had `_dial_serial` as a free function with the same
+    5-arg signature as `_connect_serial`, which just forwarded into it by
+    name - folded into a `dial()` closure nested directly inside
+    `_connect_serial`, matching `_connect_mock`'s existing pattern (closes
+    over outer variables, no restated parameter list, no misleading
+    "shared by two closures" docstring for what's actually one closure
+    referenced twice). (2) `BoardHandle.dial` was typed
+    `Callable[...] | None = None` with a `NotImplementedError` guard in
+    `reconnect()` for a case that never occurs (both real construction
+    sites always pass `dial=`) - made it a required keyword-only param and
+    deleted the dead guard.
+  - Efficiency (1 finding, applied): `reconnect()` originally swapped in
+    the new dispatcher without any teardown of the old one - for the mock
+    transport in particular, each `dial()` spins up a brand-new
+    `MockTransport` with its own thread/event loop/queues, so a reconnect
+    (or retry loop) would leak one full thread-set per attempt, unbounded.
+    Added `Dispatcher.close()` (see above) and call it on the old
+    dispatcher from `reconnect()`.
+  - Altitude (2 findings): (1) the pending-lock race described above -
+    applied. (2) flagged that `reconnect()` abandons the old dispatcher
+    with no teardown at all - already independently caught and fixed via
+    the efficiency finding above by the time this landed, so no further
+    action needed beyond what's already documented as the accepted
+    reader-thread-specific limitation.
+  - Security: no findings - this chunk touches no security boundary (no
+    tokens, no `FileRef`, no WebView surface; N/A to this Python-only
+    project regardless, noted for process consistency with the
+    warp-vscode-integration CLAUDE.md's review cadence this project's own
+    workflow was modeled on).
+
+  140 tests passing (was 136; +2 connection-level: two-independent-boards,
+  reconnect-produces-a-working-fresh-dispatcher; +2 dispatch-level:
+  fail-fast-after-disconnect, close()-shuts-down-the-worker-pool).
 
 - [ ] **12. Wifi transport**
   `transports/wifi.py` — pure stdlib `socket`. Requires target board already

@@ -93,9 +93,26 @@ class Dispatcher:
         self._write_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._reader_thread = threading.Thread(target=self._run_reader, daemon=True)
+        # Set once the reader thread observes the transport is gone - lets
+        # any *subsequent* call_mcu() fail immediately instead of writing
+        # into a dead transport and waiting out a full timeout for a
+        # response that can never arrive. DESIGN.md § Disconnection: fail
+        # loud, no silent retry.
+        self._disconnected: MCUDisconnectedError | None = None
 
     def start(self) -> None:
         self._reader_thread.start()
+
+    def close(self) -> None:
+        """Shut down this dispatcher's incoming-call worker pool.
+
+        Does NOT stop the reader thread - there's no way to unblock a
+        thread mid blocking `reader.read()` without the underlying
+        transport's own close(), which this class doesn't own (see
+        `_run_reader`'s docstring and connection.py's reconnect()). Safe to
+        call on a dispatcher whose reader has already died.
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def register(
         self,
@@ -120,6 +137,15 @@ class Dispatcher:
         req_id = self._new_id()
         pending = _Pending()
         with self._pending_lock:
+            # Checked and inserted under the same lock _fail_all_pending
+            # uses to set self._disconnected and snapshot self._pending: a
+            # call racing the reader thread's death either inserts before
+            # the snapshot (and gets swept up and resolved below) or runs
+            # this check after self._disconnected is already set (and
+            # raises here, before ever being inserted) - no window where a
+            # pending call is registered after the sweep but never resolved.
+            if self._disconnected is not None:
+                raise self._disconnected
             self._pending[req_id] = pending
         try:
             self._send(MSG_CALL, {"id": req_id, "name": name, "args": list(args)})
@@ -172,10 +198,16 @@ class Dispatcher:
         self._fail_all_pending("transport closed")
 
     def _fail_all_pending(self, message: str) -> None:
+        # self._disconnected is set and self._pending is snapshotted under
+        # one critical section, matching call_mcu's own check-and-insert -
+        # see the comment there for why both sides need the same lock, not
+        # just this one.
+        error = MCUDisconnectedError(message)
         with self._pending_lock:
+            self._disconnected = error
             pending_calls = list(self._pending.values())
         for pending in pending_calls:
-            pending.resolve(MCUDisconnectedError(message))
+            pending.resolve(error)
 
     def _route_frame(self, msg_type: int, payload: dict[str, Any]) -> None:
         if msg_type == MSG_CALL:

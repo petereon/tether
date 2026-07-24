@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -72,13 +73,39 @@ class BoardHandle:
     multi-board routing).
     """
 
-    def __init__(self, dispatcher: Dispatcher, export_specs: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        dispatcher: Dispatcher,
+        export_specs: dict[str, Any],
+        *,
+        dial: Callable[[], Dispatcher],
+    ) -> None:
         self._dispatcher = dispatcher
         self._export_specs = export_specs
+        # Re-runs the same connect flow (transport-specific) to produce a
+        # fresh Dispatcher, for reconnect() below.
+        self._dial = dial
 
     def reconnect(self) -> None:
-        """Explicit re-attach after MCUDisconnectedError. Never automatic."""
-        raise NotImplementedError
+        """Explicit re-attach after MCUDisconnectedError. Never automatic
+        (DESIGN.md § Disconnection) - a reconnected board may be in an
+        unknown state, so this is always a deliberate call, never triggered
+        internally by a failed call_mcu().
+
+        Cached call closures (see __getattr__) resolve `self._dispatcher` at
+        call time, so swapping it here is transparent to already-cached
+        closures - no need to re-fetch `board.<name>` after reconnecting.
+        """
+        old_dispatcher = self._dispatcher
+        self._dispatcher = self._dial()
+        # The old dispatcher's reader thread has no way to be interrupted
+        # mid blocking-read (Dispatcher doesn't own the transport's own
+        # close()) - it stays blocked until the process exits, same
+        # already-documented daemon-thread limitation as chunk 7/10's
+        # connect()-failure cleanup. Its thread *pool*, however, is
+        # unambiguously abandonable right now - shut it down so a reconnect
+        # doesn't leak 4 more live threads per call.
+        old_dispatcher.close()
 
     def __getattr__(self, name: str) -> Any:
         # __getattr__ only runs when normal attribute lookup fails - caching
@@ -132,11 +159,18 @@ def _hash_bundle(bootstrap: str) -> str:
 def _connect_mock(source: str, base_dir: Path, export_specs: dict[str, Any]) -> BoardHandle:
     from tether.transports.mock import MockTransport
 
-    transport = MockTransport(source, base_dir=base_dir)
-    reader, writer = transport.start()
-    dispatcher = Dispatcher(reader, writer)
-    dispatcher.start()
-    return BoardHandle(dispatcher, export_specs)
+    def dial() -> Dispatcher:
+        # A fresh MockTransport per dial (including on reconnect) - each
+        # instance owns its own thread/event loop/queues (see mock.py), so
+        # boards never share dispatch state, and reconnecting one board
+        # never touches another's.
+        transport = MockTransport(source, base_dir=base_dir)
+        reader, writer = transport.start()
+        dispatcher = Dispatcher(reader, writer)
+        dispatcher.start()
+        return dispatcher
+
+    return BoardHandle(dial(), export_specs, dial=dial)
 
 
 def _upload_if_needed(
@@ -187,83 +221,99 @@ def _connect_serial(
     *,
     timeout: float = 10.0,
 ) -> BoardHandle:
-    import serial as pyserial
+    def dial() -> Dispatcher:
+        """One full connect-or-reconnect attempt: rediscover the port (if
+        "auto"), upload-if-needed, restart the app fresh, handshake. Called
+        both for the initial connect below and, later, from
+        BoardHandle.reconnect() - reconnecting re-runs exactly this, nothing
+        less (DESIGN.md § Disconnection: a reconnected board may be in an
+        unknown state, so "restart fresh" is the only safe assumption
+        either way).
+        """
+        import serial as pyserial
 
-    from tether.transports import serial as serial_transport
+        from tether.transports import serial as serial_transport
 
-    # Fail fast, at connect() time, on a decorated-but-never-sliced
-    # function: _capture_caller() finds @mcu.export functions by scanning
-    # already-executed live objects (works for any control flow, since it
-    # runs after the module has finished executing), while the AST slicer
-    # only recognizes plain top-level `def`/`async def` statements (matches
-    # DESIGN.md's statically-analyzable decorator API constraint). A
-    # function decorated inside `if`/`try`/etc would pass the former check
-    # but never get sliced or registered on-device - without this check,
-    # calling it would just hang until MCUTimeoutError, an unrelated-looking
-    # error far from the actual cause.
-    unsliced = export_specs.keys() - exported_names
-    if unsliced:
-        raise RuntimeError(
-            f"{sorted(unsliced)} are decorated with @mcu.export/@mcu.loop but weren't "
-            "found by static analysis of the source - decorated functions must be plain "
-            "top-level `def`/`async def` statements, not conditionally defined "
-            "(DESIGN.md § Standing design constraint)"
-        )
-
-    port = serial_transport.discover() if port_spec in ("", "auto") else port_spec
-    # Finite read timeout for the raw-REPL phase - `_read_until`'s deadline
-    # check only fires *between* reads, so a blocking (timeout=None) read
-    # would make every timeout= parameter downstream cosmetic if the device
-    # never responds (mid-boot, wrong baud, crashed). Switched to blocking
-    # (timeout=None) below, once the Dispatcher takes over: SerialStream's
-    # "empty read means disconnected" contract depends on reads that block
-    # for real data rather than waking on an idle timeout with nothing to
-    # report, which finite timeouts would otherwise trigger spuriously
-    # during any normal idle period with no in-flight calls.
-    ser = pyserial.Serial(port, baudrate=115200, timeout=1.0)
-    try:
-        # All raw-REPL work happens BEFORE the Dispatcher's reader thread
-        # ever starts - the two must never run concurrently against the
-        # same serial connection, or they'd race each other for bytes (the
-        # reader thread doesn't know about raw-REPL framing, and raw-REPL's
-        # own reads aren't coordinated with it). Once the app is confirmed
-        # started, raw-REPL is never touched again for this connection.
-        bundle_hash = _hash_bundle(bootstrap)
-        _upload_if_needed(ser, serial_transport, bootstrap, bundle_hash, timeout=timeout)
-
-        # Always (re)start fresh rather than trying to detect "is it
-        # already running" - that detection would itself need to read the
-        # connection, which is exactly the race this ordering avoids. A
-        # previously-running instance from an earlier connect() in this
-        # session gets interrupted and replaced; DESIGN.md's "fail loud, no
-        # silent retry" disconnect philosophy already treats device-side
-        # state as not something to preserve across reconnects.
-        serial_transport.push_raw_repl(ser, b"import tether_app\n", wait=False, timeout=timeout)
-
-        ser.timeout = None
-        stream = serial_transport.SerialStream(ser)
-        dispatcher = Dispatcher(stream, stream)
-        dispatcher.start()
-
-        version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
-        if version != PROTOCOL_VERSION:
-            raise ProtocolVersionError(
-                f"on-device runtime speaks protocol version {version}, "
-                f"this library expects {PROTOCOL_VERSION} - re-upload by clearing "
-                f"/.tether_hash on the device, or update tether"
+        # Fail fast, at connect() time, on a decorated-but-never-sliced
+        # function: _capture_caller() finds @mcu.export functions by
+        # scanning already-executed live objects (works for any control
+        # flow, since it runs after the module has finished executing),
+        # while the AST slicer only recognizes plain top-level
+        # `def`/`async def` statements (matches DESIGN.md's
+        # statically-analyzable decorator API constraint). A function
+        # decorated inside `if`/`try`/etc would pass the former check but
+        # never get sliced or registered on-device - without this check,
+        # calling it would just hang until MCUTimeoutError, an
+        # unrelated-looking error far from the actual cause.
+        unsliced = export_specs.keys() - exported_names
+        if unsliced:
+            raise RuntimeError(
+                f"{sorted(unsliced)} are decorated with @mcu.export/@mcu.loop but weren't "
+                "found by static analysis of the source - decorated functions must be plain "
+                "top-level `def`/`async def` statements, not conditionally defined "
+                "(DESIGN.md § Standing design constraint)"
             )
-    except BaseException:
-        # No Dispatcher.stop() exists yet (chunk 7's known limitation) - if
-        # the reader thread already started, it stays blocked on ser until
-        # the process exits (a daemon thread, so at least that doesn't hang
-        # the process). Closing ser here still matters: it releases the OS
-        # handle so an immediate connect() retry on the same port doesn't
-        # fail (exclusive access on some platforms) or race a second reader
-        # against the first on others.
-        ser.close()
-        raise
 
-    return BoardHandle(dispatcher, export_specs)
+        port = serial_transport.discover() if port_spec in ("", "auto") else port_spec
+        # Finite read timeout for the raw-REPL phase - `_read_until`'s
+        # deadline check only fires *between* reads, so a blocking
+        # (timeout=None) read would make every timeout= parameter downstream
+        # cosmetic if the device never responds (mid-boot, wrong baud,
+        # crashed). Switched to blocking (timeout=None) below, once the
+        # Dispatcher takes over: SerialStream's "empty read means
+        # disconnected" contract depends on reads that block for real data
+        # rather than waking on an idle timeout with nothing to report,
+        # which finite timeouts would otherwise trigger spuriously during
+        # any normal idle period with no in-flight calls.
+        ser = pyserial.Serial(port, baudrate=115200, timeout=1.0)
+        try:
+            # All raw-REPL work happens BEFORE the Dispatcher's reader
+            # thread ever starts - the two must never run concurrently
+            # against the same serial connection, or they'd race each other
+            # for bytes (the reader thread doesn't know about raw-REPL
+            # framing, and raw-REPL's own reads aren't coordinated with
+            # it). Once the app is confirmed started, raw-REPL is never
+            # touched again for this connection.
+            bundle_hash = _hash_bundle(bootstrap)
+            _upload_if_needed(ser, serial_transport, bootstrap, bundle_hash, timeout=timeout)
+
+            # Always (re)start fresh rather than trying to detect "is it
+            # already running" - that detection would itself need to read
+            # the connection, which is exactly the race this ordering
+            # avoids. A previously-running instance from an earlier
+            # connect()/reconnect() in this session gets interrupted and
+            # replaced; DESIGN.md's "fail loud, no silent retry" disconnect
+            # philosophy already treats device-side state as not something
+            # to preserve across reconnects.
+            serial_transport.push_raw_repl(ser, b"import tether_app\n", wait=False, timeout=timeout)
+
+            ser.timeout = None
+            stream = serial_transport.SerialStream(ser)
+            dispatcher = Dispatcher(stream, stream)
+            dispatcher.start()
+
+            version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
+            if version != PROTOCOL_VERSION:
+                raise ProtocolVersionError(
+                    f"on-device runtime speaks protocol version {version}, "
+                    f"this library expects {PROTOCOL_VERSION} - re-upload by clearing "
+                    f"/.tether_hash on the device, or update tether"
+                )
+        except BaseException:
+            # No Dispatcher.stop() exists yet (chunk 7's known limitation) -
+            # if the reader thread already started, it stays blocked on ser
+            # until the process exits (a daemon thread, so at least that
+            # doesn't hang the process). Closing ser here still matters: it
+            # releases the OS handle so an immediate connect()/reconnect()
+            # retry on the same port doesn't fail (exclusive access on some
+            # platforms) or race a second reader against the first on
+            # others.
+            ser.close()
+            raise
+
+        return dispatcher
+
+    return BoardHandle(dial(), export_specs, dial=dial)
 
 
 def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
