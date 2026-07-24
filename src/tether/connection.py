@@ -361,6 +361,28 @@ def _connect_wifi(rest: str, export_specs: dict[str, Any], *, timeout: float) ->
     return BoardHandle(dial(), export_specs, dial=dial)
 
 
+def _connect_ble(rest: str, export_specs: dict[str, Any], *, timeout: float) -> BoardHandle:
+    """Connect to an already-running on-device runtime over BLE. Same shape
+    as _connect_wifi (no slicing/bundling/upload - DESIGN.md gives BLE "the
+    same bootstrap requirement as wifi").
+    """
+    from tether.transports import ble as ble_transport
+
+    def dial() -> Dispatcher:
+        stream = ble_transport.connect(rest, timeout=timeout)
+        try:
+            return _start_and_handshake(
+                stream, timeout=timeout, mismatch_hint="update tether or the on-device runtime"
+            )
+        except BaseException:
+            # Matches _connect_serial/_connect_wifi's dial(): a failed
+            # handshake must not leak the connection.
+            stream.close()
+            raise
+
+    return BoardHandle(dial(), export_specs, dial=dial)
+
+
 def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
     """Slice -> stub -> bundle -> hash-check -> upload -> handshake -> ready.
 
@@ -388,5 +410,8 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
 
     if scheme == "wifi":
         return _connect_wifi(rest, export_specs, timeout=timeout)
+
+    if scheme == "ble":
+        return _connect_ble(rest, export_specs, timeout=timeout)
 
     raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")

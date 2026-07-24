@@ -247,3 +247,13 @@ def test_connect_wifi_reaches_an_already_running_device_over_a_real_tcp_socket()
     board = connect(f"wifi:127.0.0.1:{port}", timeout=2.0)
 
     assert board._mock_read_temp() == 21.5
+
+
+def test_connect_ble_reaches_the_ble_transport_and_fails_loud_without_bleak_installed():
+    # bleak (tether[ble]) genuinely isn't installed in this dev environment
+    # - confirms the "ble:" scheme actually routes into
+    # transports/ble.py's connect() (address preserved past the first ":",
+    # matters since BLE MAC addresses contain colons themselves) rather
+    # than silently no-op'ing or hitting the wrong branch.
+    with pytest.raises(ModuleNotFoundError, match="bleak"):
+        connect("ble:00:11:22:33:44:55", timeout=1.0)

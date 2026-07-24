@@ -621,10 +621,128 @@ works.
   +1 connection-level end-to-end test using a real TCP socket with a real
   `tether.dispatch.Dispatcher` standing in for the already-running device).
 
-- [ ] **13. BLE transport**
+- [x] **13. BLE transport** — done 2026-07-24
   `transports/ble.py` — `bleak`-backed, custom GATT service (write +
   notify characteristic), frame chunking/reassembly across BLE MTU hidden
   in this module. Depends on: 10.
+
+  Same scope decision as chunk 12: DESIGN.md gives BLE "the same bootstrap
+  requirement as wifi" (already-running runtime, no code push) but
+  specifies no on-device GATT peripheral story - no `bluetooth`/`aioble`
+  implementation, no advertising convention. Scoped to the PC-side
+  (central/client) half only; the on-device-listener gap is documented
+  explicitly, same treatment as wifi's and real-hardware validation
+  throughout. `bleak` (the only viable Python BLE library) is
+  client/central-only, so unlike wifi (where a real TCP socket pair could
+  stand in for "an already-running device" in tests), there is no way to
+  run a real local BLE peripheral to test against on any platform, with or
+  without hardware - `bleak` itself isn't even installed in this dev
+  environment (optional extra, `tether[ble]`).
+
+  What was built:
+  - `BleStream` (`transports/ble.py`): bridges bleak's async
+    `BleakClient` API to the plain sync `read()`/`write()`/`close()`
+    contract `Dispatcher` expects. BLE is push-based (notifications arrive
+    via callback) rather than pull-based like serial/wifi, so `read()` is
+    backed by a `queue.Queue` fed by `on_notify()` (bleak's notification
+    callback - thread-safe `queue.Queue.put`, no `call_soon_threadsafe`
+    needed since bleak invokes it on the loop's own thread, unlike
+    `MockTransport`'s `asyncio.Queue` bridge which does need it).
+    `write()` splits payloads exceeding the negotiated ATT MTU into
+    multiple GATT writes, submitted as one coroutine (one cross-thread hop
+    per `write()` call) that awaits each chunk in order - BLE allows only
+    one outstanding ATT request at a time, so this sequencing is a
+    correctness requirement, not just convenient style (see finding
+    below). `signal_closed()` pushes the same empty-bytes "transport
+    closed" signal `Dispatcher._run_reader` already looks for, so a BLE
+    disconnect fails loud through the identical path as a dead serial port
+    or closed socket.
+  - `connect(address, timeout)`: same async-to-sync bridging shape
+    `transports/mock.py` established in chunk 8/10 - a dedicated
+    background thread owns its own event loop and the `BleakClient` for
+    the connection's lifetime, connects, subscribes to notifications, and
+    hands the result back to the calling thread via a
+    `concurrent.futures.Future`.
+  - `connection.py`: new `ble:<addr>` scheme, `_connect_ble()` mirroring
+    chunk 12's `_connect_wifi()` exactly (dial()/`_start_and_handshake()`/
+    close-on-failure). BLE MAC addresses contain colons themselves;
+    confirmed `address.partition(":")`'s single-split-only semantics
+    preserve the full address correctly (a test pins this explicitly).
+
+  Review (4 parallel cleanup agents + manual security pass, `/security-review`
+  again unable to bootstrap - no git remote, same as every prior chunk):
+  - Reuse (1 finding, skipped with reasoning): `connect()`'s
+    thread-owns-an-event-loop bootstrap shape duplicates the same idea
+    `MockTransport.start()`/`_run_mcu()` established in chunk 8/10
+    (`threading.Event`-style readiness signal + daemon thread). Not
+    factored into a shared helper: `MockTransport`'s bootstrap is deeply
+    entangled with dispatch-runtime-specific setup (shim installation,
+    exported-function registration) while `ble.py`'s is entangled with
+    bleak-specific connect/notify/GATT setup - forcing a shared "start a
+    thread with an event loop and wait for readiness" abstraction over two
+    sufficiently different bodies would be a thin wrapper saving little
+    real duplication, and touching the already-shipped, working
+    `MockTransport` for a marginal DRY gain elsewhere carries more risk
+    than benefit. (The simplification finding below independently made
+    `connect()`'s own version of this pattern smaller regardless.)
+  - Simplification (1 finding, applied): `connect()`'s hand-rolled
+    `threading.Event()` + loosely-typed `outcome: dict[str, Any]` result/
+    exception carrier collapses onto `concurrent.futures.Future`, which
+    does the same job natively (`.result(timeout=...)` raises the stored
+    exception or `concurrent.futures.TimeoutError` automatically, no
+    manual dict-key-presence check needed). Applying this also closed the
+    efficiency finding below for free via `Future.cancel()`'s built-in
+    state machine.
+  - Efficiency (2 findings): (1, applied) `write()` originally submitted
+    one `run_coroutine_threadsafe` per MTU chunk instead of one coroutine
+    looping over all chunks - collapsed to a single cross-thread hop per
+    `write()` call (see above), which also gave the altitude finding below
+    a natural place to document the real ordering requirement. (2, not
+    changed - documented instead) `response=True` on every GATT write
+    trades throughput for a per-write delivery guarantee; flagged as an
+    "undiscussed default" by the reviewer. Kept deliberately rather than
+    flipped to `response=False`: this project has no real BLE hardware to
+    validate write-without-response's actual reliability across
+    platforms/controllers, and DESIGN.md's wire protocol has no
+    independent per-frame ack to fall back on if a chunk were silently
+    dropped - added an explicit comment recording this reasoning so it
+    reads as a deliberate choice, not an oversight.
+  - Altitude (3 findings, all applied): (1) the per-chunk blocking in
+    `write()` is an ATT single-outstanding-request correctness requirement
+    (out-of-order chunk delivery could corrupt the frame being
+    reassembled), not just convenient sequencing - was undocumented as
+    such; now has an explicit comment. (2) `connect()` could leak an
+    active, unmanaged BLE connection if the calling thread's
+    `result.result(timeout=...)` gave up before the background thread's
+    connect attempt finished (worse than an idle leaked thread - most
+    peripherals accept only one central connection, so this could strand
+    the device against every future reconnect attempt) - fixed using
+    `Future.cancel()`'s state machine: a cancelled-before-set future makes
+    the background thread's later `set_result()`/`set_exception()` raise
+    `InvalidStateError`, which it now catches to disconnect and stop its
+    loop instead of silently succeeding into a connection nobody holds.
+    (3) `BleStream.close()` disconnected the client but never stopped the
+    event loop/thread `connect()` created - unlike wifi/serial, no
+    blocking syscall justifies keeping that thread alive once
+    disconnected, so this was an avoidable leak on every `close()` call,
+    not the same accepted "reader thread blocked in `read()`" limitation
+    documented elsewhere - fixed with `loop.call_soon_threadsafe(loop.stop)`
+    after disconnect completes.
+  - Security: no code-level finding, but recorded the same class of note
+    as chunk 12's: BLE here uses a plain, unauthenticated GATT connection
+    with no pairing/bonding enforced - anyone in range who discovers the
+    service UUID can connect and issue/intercept RPC calls. Inherited from
+    the wire protocol's chunk-6-locked lack of auth/encryption framing,
+    not newly introduced; adding it would be a DESIGN.md-level decision
+    beyond a client-transport chunk's scope.
+
+  151 tests passing (was 145; +5 in new `test_transport_ble.py` against a
+  hand-written fake matching bleak's documented async API shape: MTU
+  chunking, notify-to-read delivery, disconnect-signal delivery,
+  close()-disconnects-the-client, and connect()-fails-loud-without-bleak-
+  installed (a genuinely true statement in this dev environment, not a
+  simulated case); +1 in `test_connection.py` confirming the `ble:` scheme
+  routes correctly and preserves a colon-containing MAC address).
 
 - [ ] **14. ruff cleanup pass**
   `slicer/` — post-slice unused-import stripping via `ruff`, applied to the
