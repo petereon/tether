@@ -149,21 +149,53 @@ works.
   chunk 4, and the length-bound-before-`loads()` security constraint owed
   by chunk 5's review — are now satisfied; see the summary above.)
 
-- [ ] **7. PC-side dispatch**
+- [x] **7. PC-side dispatch** — done 2026-07-24
   `dispatch/` — background reader thread + queue; blocking calls filter by
   request-ID while pumping other in-flight requests to a thread pool
   (reentrant/reverse-call support); per-call timeout + heartbeat-driven
   idle-reset; wraps remote exceptions as `RemoteError`. Depends on: 2.
-  **Contract owed to chunk 6 (from chunk 6's review):** chunk 6's MCU-side
-  `run()` spawns an unbounded `asyncio.create_task` per incoming CALL frame
-  with no concurrency cap or backpressure — a hostile peer or corrupted
-  stream sending CALL frames rapidly could exhaust task/memory resources on
-  the MCU. Partially mitigated for v1 by the physical throughput ceiling of
-  the serial/BLE/wifi transports themselves (chunks 9/12/13), but not a
-  real fix. When designing this chunk's own concurrency handling, decide a
-  symmetric max-in-flight-calls policy for both sides together — don't
-  let the PC and MCU sides independently invent different backpressure
-  schemes.
+  `Dispatcher(reader, writer, max_workers=4)` — threading mirror of chunk
+  6's asyncio `Dispatcher`: `register(name, handler, heartbeat_interval=1.0)`,
+  `call_mcu(name, *args, timeout=10.0)`, `start()`. Reuses chunk 2's
+  `FrameDecoder`/`encode_frame` directly (no PC-side reimplementation
+  needed) and the existing `tether.errors.RemoteError`/`MCUTimeoutError`/
+  `MCUDisconnectedError` from the original scaffold — their field shapes
+  already matched what chunk 6 sends over the wire without any changes.
+  Heartbeat emission for handled calls uses a cancellable ticker thread
+  (`Event.wait(timeout=...)` loop) rather than chunk 6's parallel-task
+  approach — ticks on a fixed timer regardless of what the handler thread
+  is doing (CPU-bound or not), a deliberate difference from chunk 6's
+  yield-point-based ticker, not an oversight (there's no equivalent of
+  asyncio yield points for a plain OS thread). 7 tests, TDD'd, covering
+  call/response, remote exceptions (with traceback), unregistered-handler
+  error, bidirectional reentrancy, timeout enforcement, heartbeat-driven
+  idle-reset, and reader-thread-death handling.
+  Reviewed (4-angle + manual security pass): no reuse findings (PC/MCU
+  structural similarity is intentional and can't be shared — confirmed no
+  accidental `tether_runtime` import). Simplification: collapsed `_Pending`'s
+  four parallel error fields into one `outcome` field holding either the
+  result or an `Exception` instance; extracted a `_send_error` helper and a
+  `_heartbeat_ticking` context manager for the paired start/stop/join
+  lifecycle. Efficiency: documented (not fixed here — belongs to the
+  transport adapter) that `reader.read()` must be chunked reasonably by
+  whichever adapter implements it, since a naive `pyserial` wrapper
+  defaults `.read()` to 1 byte — noted as a constraint on chunk 9 below.
+  Altitude/security (real bug, not just a finding): the reader thread
+  dying (transport error or clean EOF) left every in-flight `call_mcu()`
+  call hanging forever for `timeout=None` with zero signal — fixed to fail
+  all pending calls with `MCUDisconnectedError` immediately. This is a
+  chunk-7-layer fix (in-flight call bookkeeping), not chunk 11's full
+  reconnect/board-lifecycle scope. Fixing this surfaced a second latent
+  race: a call that resolved normally right before the transport died could
+  have its correct result clobbered by the disconnect sweep before the
+  caller thread woke up to clean up — fixed by making `_Pending.resolve()`
+  idempotent (first resolution wins). The unbounded-concurrent-calls
+  concern chunk 6's review flagged is confirmed present here too (partially
+  mitigated by the bounded 4-worker pool vs. chunk 6's fully unbounded task
+  spawn, but the executor's internal queue is still unbounded) — still an
+  open, deliberately deferred decision: whichever future chunk designs real
+  backpressure must do it symmetrically for both sides, not independently
+  invent different schemes per side.
 
 - [ ] **8. Mock transport**
   `transports/mock.py` — in-process fake MCU: runs the real sliced code path
@@ -174,6 +206,13 @@ works.
 - [ ] **9. Serial transport**
   `transports/serial.py` — USB VID/PID auto-discovery (`"serial:auto"`),
   raw-REPL code push, `pyserial`-backed byte stream. Depends on: 7.
+  **Contract owed to chunk 7 (from chunk 7's review):** `Dispatcher._run_reader`
+  calls `reader.read()` with no size argument and expects a reasonably-sized
+  chunk back, blocking until at least one byte arrives. `pyserial`'s
+  `Serial.read()` defaults to `size=1` — this adapter's `read()` must
+  explicitly request a real chunk size (e.g. `self._serial.read(4096)`
+  or similar), not pass through the naive default, or the reader loop
+  degrades to processing one byte at a time.
 
 - [ ] **10. Connection orchestration**
   `connection.py::connect()` — full wire→probe→use flow: slice, bundle,
