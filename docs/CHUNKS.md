@@ -904,17 +904,70 @@ works.
 
   157 tests passing (was 153; +4 in new `tests/test_examples.py`).
 
-- [ ] **16. CI: lint workflow**
+- [x] **16. CI: lint workflow** — done 2026-07-24
   GitHub Actions workflow running `ruff check` + `ruff format --check` (via
   `uv`) on push/PR. No hardware/token dependency — safe to build anytime.
-  Not started; queued per explicit user request, do not start until told.
 
-- [ ] **17. CI: PyPI release workflow**
+  `.github/workflows/lint.yml`: `actions/checkout@v7` +
+  `astral-sh/setup-uv@v9` (current major versions, checked via `gh api`
+  rather than guessed from memory), `uv sync --locked` (fails loud if
+  `uv.lock` has drifted from `pyproject.toml`, rather than silently
+  re-resolving - a real CI-correctness gap if omitted), `ruff check .`,
+  `ruff format --check .`. Triggers on push to `main` and on every PR.
+
+  Real bug found by actually running the exact commands locally before
+  trusting the workflow file, not by reading it: `ruff format --check .`
+  covers fenced Python code blocks inside `README.md` too (a newer ruff
+  behavior), and README's snippet had drifted out of format - this would
+  have made chunk 16's own first CI run fail immediately. Fixed by
+  running `ruff format` for real and cleaning up a comment it mangled
+  across an import line. Also discovered mid-verification: running the
+  lint workflow's exact `uv sync` (no extras) locally strips `pytest`/
+  `pyserial` out of the shared dev venv, since `dev`/`serial` are optional
+  extras, not core deps - restored via `uv sync --extra dev --extra
+  serial` afterward. Neither of these would have been caught by reading
+  the YAML alone.
+
+- [x] **17. CI: PyPI release workflow** — done 2026-07-24 (workflow itself
+  complete and locally verified end-to-end except the actual PyPI upload,
+  which needs the real `PYPI_API_TOKEN` secret the user is providing -
+  see below)
   GitHub Actions workflow that builds and publishes to PyPI on release (via
   `uv build` / `uv publish`). Needs a PyPI token supplied by the user as a
-  repo secret before this can run for real. **Do not start this chunk until
-  the user explicitly says to** — flagged that they'll provide the token
-  when ready.
+  repo secret before this can run for real.
+
+  `.github/workflows/publish.yml`: triggers on `release: types:
+  [published]` (not on every tag push - lets a release be drafted/reviewed
+  before anything uploads). Two jobs: `test` (full `ruff check` + `ruff
+  format --check` + `pytest`, deliberately gating `publish` via `needs:`)
+  then `publish` (`uv build` + `uv publish`, reading
+  `secrets.PYPI_API_TOKEN` into `UV_PUBLISH_TOKEN`). Expected secret name:
+  **`PYPI_API_TOKEN`** — a PyPI API token scoped to this project, added
+  under the repo's Settings > Secrets and variables > Actions.
+
+  Judgment call beyond this chunk's literal one-line spec, applied and
+  documented rather than silently added: publishing to PyPI is
+  irreversible (no unpublishing), so the workflow gates the `publish` job
+  behind a full test run rather than trusting that whatever's tagged for
+  release already passed CI earlier - a release built from an untested
+  commit, or a lockfile that had drifted, would otherwise ship straight to
+  PyPI. The `test` job deliberately does NOT install the `ble` extra:
+  `test_transport_ble.py` and `test_connection.py` each assert that
+  `connect()`/BLE `connect()` fail loud with `ModuleNotFoundError` when
+  `bleak` isn't installed - installing it in CI would make those
+  assertions false and break them, so this mirrors local dev (`dev` +
+  `serial` only) on purpose.
+
+  Locally verified everything short of the actual upload (no real PyPI
+  token exists yet to test the last step): `uv sync --locked --extra dev
+  --extra serial`, `ruff check .`, `ruff format --check .`, `pytest`
+  (157 passing), and `uv build` (produces `dist/tether-0.1.0.tar.gz` +
+  `dist/tether-0.1.0-py3-none-any.whl` successfully) all run clean,
+  matching exactly what the `test` and `publish` jobs' steps do. The
+  `uv publish` step itself is untested - `UV_PUBLISH_TOKEN` isn't set
+  locally and shouldn't be faked - once the real secret is added and a
+  release is published, this is the one thing left to confirm actually
+  works end-to-end.
 
 ---
 

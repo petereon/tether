@@ -8,16 +8,20 @@ BLE.
 ```python
 from tether import mcu, pc
 
+
 @pc.export
 def log_event(msg: str) -> None:
     print("MCU says:", msg)
 
+
 @mcu.export
 def read_temp() -> float:
-    from machine import ADC, Pin  # hardware imports go INSIDE the function
-                                   # body - this file also runs directly on
-                                   # your PC, where `machine` doesn't exist
+    # Hardware imports go INSIDE the function body: this file also runs
+    # directly on your PC, where `machine` doesn't exist.
+    from machine import ADC, Pin
+
     return ADC(Pin(4)).read_u16() / 65535
+
 
 board = mcu.connect("serial:auto")
 print(board.read_temp())

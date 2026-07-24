@@ -59,3 +59,14 @@ don't gate PR-worthy test coverage on physical hardware being attached.
 - **`ruff`** for both linting and formatting (`ruff check`, `ruff format`).
   Run `ruff check --fix` before considering a chunk's diff clean.
 - Run tests with `.venv/bin/pytest` (or `uv run pytest`).
+
+## CI
+
+- `.github/workflows/lint.yml` — `ruff check` + `ruff format --check` on
+  push/PR. `ruff format --check .` also covers fenced Python blocks in
+  `README.md` — keep those in sync with real ruff output, not hand-edited.
+- `.github/workflows/publish.yml` — on a published GitHub Release: full
+  test job (`ruff check`, `ruff format --check`, `pytest`, deliberately
+  *not* installing the `ble` extra — see the workflow's own comment) gates
+  a `uv build` + `uv publish` job. Reads the `PYPI_API_TOKEN` repo secret
+  into `UV_PUBLISH_TOKEN`.

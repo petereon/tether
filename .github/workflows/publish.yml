@@ -1,0 +1,53 @@
+name: Publish to PyPI
+
+# Fires on a GitHub Release being published, not on every tag push - lets a
+# release be drafted/reviewed before anything actually gets uploaded to
+# PyPI. Requires the PYPI_API_TOKEN repo secret (Settings > Secrets and
+# variables > Actions) - a PyPI API token scoped to this project. `uv
+# publish` reads it via UV_PUBLISH_TOKEN (CLAUDE.md: uv for build and
+# distribution, never raw pip/twine).
+on:
+  release:
+    types: [published]
+
+jobs:
+  # There's no unpublishing from PyPI - the full test suite (and lint,
+  # matching lint.yml) gates the publish job below rather than trusting
+  # that whatever's tagged for release already passed CI earlier. Not part
+  # of ble extras: two tests (test_transport_ble.py and test_connection.py)
+  # deliberately assert connect() fails loud when `bleak` ISN'T installed -
+  # installing the `ble` extra here would make those assertions false and
+  # break them, so this mirrors local dev (dev + serial only, no ble) on
+  # purpose, not by omission.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked --extra dev --extra serial
+
+      - run: uv run ruff check .
+
+      - run: uv run ruff format --check .
+
+      - run: uv run pytest
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - run: uv build
+
+      - run: uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
