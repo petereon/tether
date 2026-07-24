@@ -255,16 +255,70 @@ works.
   so it won't block process exit, but accumulates across a very large test
   suite).
 
-- [ ] **9. Serial transport**
+- [x] **9. Serial transport** — done 2026-07-24
   `transports/serial.py` — USB VID/PID auto-discovery (`"serial:auto"`),
   raw-REPL code push, `pyserial`-backed byte stream. Depends on: 7.
-  **Contract owed to chunk 7 (from chunk 7's review):** `Dispatcher._run_reader`
-  calls `reader.read()` with no size argument and expects a reasonably-sized
-  chunk back, blocking until at least one byte arrives. `pyserial`'s
-  `Serial.read()` defaults to `size=1` — this adapter's `read()` must
-  explicitly request a real chunk size (e.g. `self._serial.read(4096)`
-  or similar), not pass through the naive default, or the reader loop
-  degrades to processing one byte at a time.
+  (Chunk 7's read-chunking contract, quoted here previously, is satisfied —
+  see `SerialStream` below, not the naive `.read(size)` it warned against.)
+
+  **No physical hardware was available to build or validate this against.**
+  Implemented faithfully against the protocol documented in MicroPython's
+  own `tools/pyboard.py`, hand-rolled rather than depending on `mpremote`
+  (its equivalent internals are explicitly marked unstable/mid-refactor,
+  and importing the whole CLI package for one class was poor weight for
+  what's needed). Tested against scripted fakes reproducing the exact
+  documented byte sequences, plus one sanity check against `pyserial`'s
+  real `loop://` virtual port for `SerialStream`. Real-device verification
+  remains chunk 15's job (DESIGN.md § Testing) — passing here means
+  "faithful to the documented protocol," not "confirmed against hardware."
+  10 tests.
+
+  `discover(list_ports_fn=None, extra_vid_pid=None)` — matches
+  `serial.tools.list_ports.comports()` against a built-in (VID, PID) table
+  covering common ESP32/RP2040 USB-bridge chips (CP210x, CH340, FTDI,
+  Espressif native USB, RP2040) — not exhaustive by design (DESIGN.md's
+  "supporting ESP32 and similar"), with an `extra_vid_pid` escape hatch and
+  an error message pointing at it, so an unlisted board isn't silently
+  locked out of ever using auto-discovery.
+
+  `push_raw_repl(serial_obj, code, timeout=10.0, wait=True)` — drives the
+  standard (non-raw-paste) raw REPL protocol: interrupt, enter raw REPL,
+  send code in 256-byte/10ms-paced chunks (matches the reference pacing
+  exactly — deliberately not tuned faster without hardware to validate
+  buffer limits against), execute, optionally collect stdout/stderr and
+  raise on non-empty stderr, exit raw REPL.
+
+  `SerialStream` — wraps an open `pyserial.Serial` to satisfy chunk 7's
+  reader/writer contract: `read(1)` (blocks for the first byte) then drains
+  whatever else is immediately available via `in_waiting`, avoiding both
+  `pyserial`'s naive 1-byte default *and* the trap of requesting a large
+  fixed size directly (which under `timeout=None` blocks until that many
+  bytes arrive rather than returning early with whatever's buffered).
+
+  Real bug caught while building, not by review: the initial
+  `push_raw_repl` design blocked waiting for the executed code to *return*
+  before considering the push complete — correct for a short setup script,
+  but the actual on-device bundle (chunk 6's dispatch loop) never returns.
+  Every real `connect()` would have hung for the full default timeout and
+  then raised a spurious error, even though the code had started running
+  successfully. Fixed by splitting send+ack from collect-output, and adding
+  `wait=False` for code that's expected to run forever — chunk 10 is
+  responsible for using it for that call and confirming the dispatch loop
+  actually came up some other way (e.g. the protocol-version handshake),
+  not this function.
+
+  Reviewed (4-angle + manual security pass): reuse review confirmed
+  hand-rolling over depending on `mpremote` was the right call (documented
+  the rationale in the module docstring, since it wasn't recorded
+  anywhere). No simplification findings. Efficiency: added a comment
+  anchoring `_read_until`'s byte-at-a-time pattern to raw-REPL negotiation
+  only (hash-gated per upload) so it doesn't get copied into a hot path
+  later, and documented why the chunk-pacing sleep isn't being tuned
+  without hardware to validate against. Altitude (real gaps, both fixed):
+  the `wait=False` fix above, and the VID/PID escape hatch + clearer error
+  message. Security: no findings — this code talks to the user's own
+  physically-connected board, same trust tier as their own code, not a
+  remote/network peer.
 
 - [ ] **10. Connection orchestration**
   `connection.py::connect()` — full wire→probe→use flow: slice, bundle,
