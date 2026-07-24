@@ -22,10 +22,18 @@ works.
   the way top-level `get_type_hints()` return values are); kept the branch
   and added a regression test for it instead.
 
-- [ ] **2. Marshalling (PC side)**
+- [x] **2. Marshalling (PC side)** — done 2026-07-24
   `marshalling/` — length-prefixed msgpack framing (`[4-byte length][msg-type][msgpack body]`)
   using the `msgpack` package. Encode/decode for the v1 type set. No
-  transport dependency — pure bytes-in, bytes-out.
+  transport dependency — pure bytes-in, bytes-out. Also: incremental
+  `FrameDecoder` (feed/pull_frames) for parsing off a live byte stream,
+  needed by chunk 7's dispatch loop. Reviewed (4-angle simplify + manual
+  security pass): fixed an O(n·frames) buffer-trim efficiency issue via
+  zero-copy memoryview parsing, fixed an exception-safety gap where a
+  caught-and-held decode error left the buffer permanently unresizable
+  (memoryview export outliving the frame via the traceback), and added a
+  `MAX_FRAME_SIZE` (1 MiB) bound on the wire length prefix to close an
+  unbounded-memory DoS vector on corrupted/hostile input. 22 tests.
 
 - [ ] **3. AST slicer — MCU-bound extraction**
   `slicer/` — walk `@mcu.export`/`@mcu.loop` functions, transitively pull in
