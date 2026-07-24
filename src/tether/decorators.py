@@ -4,6 +4,13 @@ Kept deliberately simple/statically-analyzable (no metaclass or exec-based
 magic): a future language server needs to infer signatures and cross-boundary
 call targets by walking plain decorator calls. See DESIGN.md § Standing
 design constraint.
+
+`src/tether_runtime/mcu_decorators.py` mirrors this API's shape (`.export`,
+`.loop`, the same kwargs) for the on-device side — the two can never share
+an import (different runtimes: CPython here, MicroPython there; MicroPython
+function objects also don't support the attribute-tagging this file uses).
+If you change this file's decorator signatures, check whether that file
+needs the same change - there's no automated check tying them together.
 """
 
 from __future__ import annotations

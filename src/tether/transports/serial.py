@@ -27,6 +27,7 @@ hardware").
 
 from __future__ import annotations
 
+import base64
 import time
 from collections.abc import Callable
 from typing import Any
@@ -209,3 +210,103 @@ class SerialStream:
 
     def write(self, data: bytes) -> None:
         self._serial.write(data)
+
+
+def _file_write_lines(path: str, content: bytes, chunk_size: int) -> list[str]:
+    b64 = base64.b64encode(content).decode("ascii")
+    lines = [f"_f = open({path!r}, 'wb')"]
+    lines.extend(
+        f"_f.write(_b64.a2b_base64({b64[i : i + chunk_size]!r}))"
+        for i in range(0, len(b64), chunk_size)
+    )
+    lines.append("_f.close()")
+    return lines
+
+
+def write_file(
+    serial_obj: Any, path: str, content: bytes, *, chunk_size: int = 512, timeout: float = 30.0
+) -> None:
+    """Write `content` to `path` on the device's persistent filesystem via
+    raw REPL — needed because `push_raw_repl` alone only executes code
+    transiently; `tether_runtime/dispatch.py` (and umsgpack) need to exist
+    as real, importable files on-device.
+
+    Content is base64-encoded and embedded as Python source text (binary-
+    safe, avoids escaping issues with raw bytes in a source literal), sent
+    as ONE combined open/write/close script via a single `push_raw_repl`
+    call — not one call per chunk. Raw-REPL state (the open file handle)
+    isn't assumed to persist across separate enter/exit cycles without
+    real hardware to verify that assumption. For uploading several files
+    at once, use `write_files` instead — one raw-REPL round trip for
+    everything rather than one per file, since the physical serial upload
+    is already the slowest part of the whole system.
+    """
+    lines = [
+        "import ubinascii as _b64",
+        *_file_write_lines(path, content, chunk_size),
+        "del _f, _b64",
+    ]
+    push_raw_repl(serial_obj, "\n".join(lines).encode(), timeout=timeout)
+
+
+def write_files(
+    serial_obj: Any,
+    files: dict[str, bytes],
+    *,
+    dirs: tuple[str, ...] = (),
+    chunk_size: int = 512,
+    timeout: float = 60.0,
+) -> None:
+    """Write multiple files (and create any needed directories first) in
+    ONE combined raw-REPL round trip, rather than one enter/exit cycle per
+    file. Order of `files` is preserved (dict iteration order) in case any
+    later file depends on an earlier one existing (not currently the case,
+    but cheap to guarantee).
+    """
+    if not files and not dirs:
+        return
+    lines = ["import ubinascii as _b64", "import uos as _uos"]
+    lines.extend(f"try:\n    _uos.mkdir({d!r})\nexcept OSError:\n    pass" for d in dirs)
+    for path, content in files.items():
+        lines.extend(_file_write_lines(path, content, chunk_size))
+    # `_f` is only ever bound if `files` was non-empty - referencing it in
+    # `del` when nothing was written would raise NameError on-device.
+    names_to_delete = ["_b64", "_uos"] if not files else ["_f", "_b64", "_uos"]
+    lines.append(f"del {', '.join(names_to_delete)}")
+    push_raw_repl(serial_obj, "\n".join(lines).encode(), timeout=timeout)
+
+
+def ensure_dir(serial_obj: Any, path: str, *, timeout: float = 10.0) -> None:
+    """Create `path` as a directory on-device if it doesn't already exist."""
+    script = f"import uos\ntry:\n    uos.mkdir({path!r})\nexcept OSError:\n    pass\n"
+    push_raw_repl(serial_obj, script.encode(), timeout=timeout)
+
+
+_MISSING_FILE_MARKER = "__TETHER_MISSING__"
+
+
+def read_file(serial_obj: Any, path: str, *, timeout: float = 10.0) -> bytes | None:
+    """Read a file's content from the device's filesystem via raw REPL, or
+    `None` if it doesn't exist. Used for chunk 10's hash-check sentinel.
+    """
+    script = (
+        "try:\n"
+        "    import ubinascii as _b64\n"
+        f"    print(_b64.b2a_base64(open({path!r}, 'rb').read()).decode().strip())\n"
+        "except OSError:\n"
+        f"    print({_MISSING_FILE_MARKER!r})\n"
+    ).encode()
+
+    _enter_raw_repl(serial_obj, timeout=timeout)
+    try:
+        _exec_raw_start(serial_obj, script, timeout=timeout)
+        stdout, stderr = _follow_exec(serial_obj, timeout=timeout)
+        if stderr:
+            raise RawReplError(f"code raised on device: {stderr.decode(errors='replace')}")
+    finally:
+        _exit_raw_repl(serial_obj)
+
+    text = stdout.decode().strip()
+    if text == _MISSING_FILE_MARKER:
+        return None
+    return base64.b64decode(text)

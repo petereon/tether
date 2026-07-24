@@ -1,6 +1,14 @@
 import pytest
 
-from tether.transports.serial import RawReplError, SerialStream, discover, push_raw_repl
+from tether.transports.serial import (
+    RawReplError,
+    SerialStream,
+    discover,
+    push_raw_repl,
+    read_file,
+    write_file,
+    write_files,
+)
 
 
 class _FakeMicroPythonSerial:
@@ -61,8 +69,7 @@ def test_discover_accepts_extra_vid_pid_pairs():
         return [_FakePortInfo("/dev/ttyUSB0", 0x9999, 0x1111)]  # not in the built-in list
 
     assert (
-        discover(list_ports_fn=fake_list_ports, extra_vid_pid={(0x9999, 0x1111)})
-        == "/dev/ttyUSB0"
+        discover(list_ports_fn=fake_list_ports, extra_vid_pid={(0x9999, 0x1111)}) == "/dev/ttyUSB0"
     )
 
 
@@ -181,3 +188,112 @@ def test_serial_stream_write_passes_through():
     stream.write(b"data")
 
     assert bytes(fake.written) == b"data"
+
+
+def test_write_file_sends_open_write_close_as_one_script():
+    # One combined raw-repl exec, not multiple separate calls - state
+    # (the open file handle) can't be assumed to persist across separate
+    # raw-repl enter/exit cycles without real hardware to verify that
+    # assumption, so everything goes in a single script.
+    fake = _FakeMicroPythonSerial()
+
+    write_file(fake, "/dispatch.py", b"print('hello')\n")
+
+    sent = bytes(fake.written).decode()
+    assert "open('/dispatch.py', 'wb')" in sent
+    assert "a2b_base64(" in sent
+    assert sent.count("\x04") == 1  # exactly one raw-repl exec (one ctrl-D)
+
+
+def test_write_file_round_trips_binary_content_through_base64():
+    import base64
+
+    fake = _FakeMicroPythonSerial()
+    content = b"\x00\x01\x02binary\xff\xfe"
+
+    write_file(fake, "/x.bin", content)
+
+    sent = bytes(fake.written).decode()
+    # Extract the base64 chunk(s) embedded in the generated script and
+    # confirm they actually decode back to the original content - not just
+    # that *some* base64-looking text was sent.
+    import re
+
+    chunks = re.findall(r"a2b_base64\('([^']*)'\)", sent)
+    assert chunks, "expected at least one a2b_base64(...) call in the generated script"
+    decoded = b"".join(base64.b64decode(c) for c in chunks)
+    assert decoded == content
+
+
+def test_write_file_raises_on_device_side_error():
+    fake = _FakeMicroPythonSerial(stderr=b"OSError: [Errno 28] ENOSPC\n")
+
+    with pytest.raises(RawReplError, match="ENOSPC"):
+        write_file(fake, "/dispatch.py", b"content")
+
+
+def test_read_file_returns_none_when_file_missing():
+    fake = _FakeMicroPythonSerial(stdout=b"__TETHER_MISSING__\n")
+
+    assert read_file(fake, "/.tether_hash") is None
+
+
+def test_read_file_returns_decoded_content():
+    import base64
+
+    content = b"deadbeef"
+    fake = _FakeMicroPythonSerial(stdout=base64.b64encode(content) + b"\n")
+
+    assert read_file(fake, "/.tether_hash") == content
+
+
+def test_write_files_sends_everything_as_one_round_trip():
+    fake = _FakeMicroPythonSerial()
+
+    write_files(
+        fake,
+        {"/a.py": b"print(1)", "/b/c.py": b"print(2)"},
+        dirs=("/b",),
+    )
+
+    sent = bytes(fake.written).decode()
+    assert sent.count("\x04") == 1  # one raw-repl exec for everything
+    assert "mkdir('/b')" in sent
+    assert "open('/a.py', 'wb')" in sent
+    assert "open('/b/c.py', 'wb')" in sent
+
+
+def test_write_files_round_trips_all_content_correctly():
+    import base64
+    import re
+
+    fake = _FakeMicroPythonSerial()
+    files = {"/a.py": b"hello", "/b.py": b"\x00\x01world\xff"}
+
+    write_files(fake, files)
+
+    sent = bytes(fake.written).decode()
+    chunks = re.findall(r"a2b_base64\('([^']*)'\)", sent)
+    decoded = b"".join(base64.b64decode(c) for c in chunks)
+    assert decoded == b"".join(files.values())
+
+
+def test_write_files_with_only_dirs_does_not_reference_unbound_file_handle():
+    # `_f` is only bound inside the per-file write blocks - if `files` is
+    # empty, the generated script's cleanup `del` must not reference it,
+    # or the script would raise NameError on-device.
+    fake = _FakeMicroPythonSerial()
+
+    write_files(fake, {}, dirs=("/only_a_dir",))
+
+    sent = bytes(fake.written).decode()
+    assert "mkdir('/only_a_dir')" in sent
+    assert "_f" not in sent
+
+
+def test_write_files_with_nothing_to_do_sends_no_script():
+    fake = _FakeMicroPythonSerial()
+
+    write_files(fake, {})
+
+    assert bytes(fake.written) == b""

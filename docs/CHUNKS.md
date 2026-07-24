@@ -320,11 +320,121 @@ works.
   physically-connected board, same trust tier as their own code, not a
   remote/network peer.
 
-- [ ] **10. Connection orchestration**
+- [x] **10. Connection orchestration** — done 2026-07-24
   `connection.py::connect()` — full wire→probe→use flow: slice, bundle,
   hash-check against on-device sentinel (skip upload if unchanged),
   upload-if-needed, protocol-version handshake (`ProtocolVersionError` on
   mismatch), return ready `BoardHandle`. Depends on: 3, 4, 6, 9.
+  The largest chunk yet — the first time chunks 1-9 all actually run
+  together. `connect("mock://")` delegates to chunk 8's `MockTransport`
+  directly (no upload/hash/handshake — nothing to hash-check against).
+  `connect("serial:...")` does the real thing: derives the runtime file
+  set from `tether_runtime/` on disk (not hand-listed), batches the whole
+  upload into one raw-REPL round trip via a new `write_files` (extends
+  chunk 9's `write_file` single-file batching across multiple files - the
+  serial upload is already the slowest part of the whole system, so 8
+  separate enter/exit cycles avoided down to 1), always restarts the
+  on-device app fresh (deliberately not trying to detect "already
+  running", since that detection would itself need to read the same
+  connection the reader thread is about to own), then hands off to a real
+  `Dispatcher` and does the handshake. wifi/ble schemes correctly
+  `NotImplementedError` until chunks 12/13 exist.
+  New pieces this chunk had to invent, none pinned by any prior chunk:
+  - `src/tether_runtime/mcu_decorators.py` — a lightweight on-device
+    decorator shim, since sliced `@mcu.export`/`@mcu.loop` source needs
+    *something* named `mcu`/`pc` in scope on a device with no `tether`
+    package installed. Registers into a module-level list rather than
+    tagging function objects — **verified against a real MicroPython
+    interpreter that MicroPython function objects don't support arbitrary
+    attribute assignment the way CPython's do**, so chunk 1's PC-side
+    approach (`fn.__tether_export__ = ...`) doesn't port as-is; this was
+    only caught by actually running the shim under `micropython`, not by
+    reasoning about it.
+  - The protocol-version handshake itself: reuses the existing
+    `MSG_CALL`/`MSG_RESULT` machinery with a reserved function name
+    (`__tether_handshake__`) rather than adding a new wire message type -
+    zero changes needed to chunks 6/7's already-shipped, reviewed dispatch
+    code.
+  - Wiring `sys.stdin`/`sys.stdout` as the on-device wire transport, via
+    `uasyncio.StreamReader`/`StreamWriter` — **empirically verified against
+    a real MicroPython interpreter with piped I/O** that raw bytes
+    (including `0x03`) reach a running script's own reads correctly. This
+    mattered: an initial test showed `0x03` getting intercepted as a
+    keyboard interrupt even mid-script, which would have silently corrupted
+    the wire protocol every time a msgpack frame happened to contain that
+    byte — investigation traced it to the *test harness's* PTY running in
+    cooked terminal mode (converting `0x03` to `SIGINT` at the OS line-
+    discipline level), not to MicroPython or raw-REPL at all; real UART
+    hardware (and `pyserial`, which always opens ports in raw/non-canonical
+    mode) has no such line discipline. Re-tested with the PTY in raw mode
+    and confirmed clean pass-through — the architecture is sound.
+  - The exact MicroPython raw-REPL file-write/read encoding (base64 +
+    `ubinascii.a2b_base64`/`b2a_base64`, one combined script per operation)
+    — every generated script (write_file, write_files, read_file) was
+    extracted from its own test fake and **run for real under
+    `micropython`**, not just checked for shape, including a full binary
+    round-trip and directory creation.
+  Real bugs caught while building (verification-driven, most before any
+  review pass ran):
+  - `SerialStream`/`Dispatcher` needs *blocking* reads (`timeout=None`) so
+    an idle connection with no in-flight calls doesn't spuriously look
+    disconnected, but raw-REPL's own `_read_until` needs a *finite* timeout
+    or its deadline check never actually engages (a blocked `read(1)` never
+    returns to let it check) — caught by the altitude review, fixed by
+    opening the port at `timeout=1.0` for the raw-REPL phase and switching
+    to `ser.timeout = None` right before handing off to the `Dispatcher`.
+  - `_capture_caller()` must NOT re-execute the caller's source to recover
+    `@mcu.export` metadata — the caller's module is already running
+    (that's how `connect()` got invoked), so re-exec would double any of
+    its side effects (prints, connections opened at import time, etc).
+    Fixed before ever writing the buggy version, by inspecting the already-
+    executed caller frame's globals instead of re-running anything — but
+    worth recording since it's the kind of mistake that's easy to make and
+    hard to notice (no test failure, just quietly-doubled side effects).
+  - A genuine ordering/concurrency bug caught mid-design, before
+    implementation: the background `Dispatcher` reader thread and raw-REPL's
+    own synchronous reads must never run concurrently against the same
+    serial connection, or they'd race for bytes. Fixed by doing ALL raw-REPL
+    work (hash-check, upload, start-app) before the `Dispatcher` ever starts,
+    which is also *why* the design always restarts fresh rather than trying
+    to detect "already running" first (that detection would reintroduce the
+    exact same race).
+  Reviewed (4-angle + manual security pass on `connection.py`, the highest-
+  risk piece; a lighter combined pass on `mcu_decorators.py` and the
+  `serial.py` additions): fixed a real bug (altitude finding) where a
+  `connect()` failure left the serial port handle and a permanently-blocked
+  reader thread leaked with no cleanup, blocking an immediate retry on the
+  same port — now closed via `except BaseException: ser.close(); raise`
+  around the whole connect sequence. Fixed a second real bug (also
+  altitude): `_capture_caller()`'s runtime scan (finds anything with
+  `__tether_export__` set, works regardless of control flow) and the AST
+  slicer (only recognizes plain top-level `def`/`async def`) can disagree
+  for a conditionally-defined decorated function — now cross-checked at
+  connect() time with a clear `RuntimeError` instead of a confusing
+  `MCUTimeoutError` far from the actual cause. Fixed a real security-
+  adjacent bug (manual pass): the reserved `__tether_handshake__` handler
+  registered *before* user functions, so a user function accidentally
+  sharing that name would silently overwrite it and break the handshake
+  for good — reordered so the reserved registration always wins.
+  Simplification: derived the uploaded runtime file list from
+  `tether_runtime/` on disk instead of hand-maintaining it (a real drift
+  bug otherwise — a new file landing there would silently never get
+  uploaded); cached `BoardHandle.__getattr__`'s built closures into
+  `__dict__` so repeated access doesn't rebuild them and has normal
+  identity. `write_files` also fixed to handle an empty-files call cleanly
+  (would otherwise reference an unbound variable and raise `NameError`
+  on-device). 26 new/changed tests across `test_connection.py` and
+  `test_serial_transport.py`, plus 2 regression tests in `test_slicer.py`
+  for the async-function AST-recognition bug below.
+  One more bug this chunk surfaced in an *already-completed* chunk: the
+  AST slicer (chunk 3) and stub generator (chunk 4) only recognized
+  `ast.FunctionDef`, never `ast.AsyncFunctionDef` — so `@mcu.export async
+  def` was invisible to the slicer, even though async MCU-export functions
+  are a real, required case (an MCU function calling a `@pc.export` stub
+  must itself be async to await it, per chunk 4's own docstring). Only
+  surfaced once this chunk exercised the full pipeline with a genuinely
+  async exported function for the first time. Fixed in
+  `src/tether/slicer/__init__.py` with regression tests.
 
 - [ ] **11. Multi-board + disconnect handling**
   `connection.py` / `dispatch/` — concurrent `BoardHandle`s, per-board method

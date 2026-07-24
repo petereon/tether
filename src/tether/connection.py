@@ -2,7 +2,68 @@
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+from pathlib import Path
 from typing import Any
+
+from tether.dispatch import DEFAULT_TIMEOUT, Dispatcher
+from tether.errors import ProtocolVersionError
+from tether.slicer import generate_pc_stubs, slice_mcu_bound
+
+# Bumped whenever the wire protocol or dispatch runtime contract changes in
+# a way that would break compatibility with an already-uploaded on-device
+# bundle. Checked via a handshake call on every connect() (not hash-gated -
+# the user's own code hash can be unchanged while the underlying runtime
+# still changed between library versions). See DESIGN.md § Wire protocol.
+PROTOCOL_VERSION = 1
+
+_HANDSHAKE_NAME = "__tether_handshake__"
+
+
+def generate_bootstrap(sliced_source: str, stubs_source: str) -> str:
+    """Assemble the final on-device script: imports the runtime shim +
+    dispatch loop, defines the sliced @mcu.export/@mcu.loop functions and
+    the generated @pc.export proxy stubs, wires a Dispatcher over
+    sys.stdin/stdout (wrapped as uasyncio streams - verified against a real
+    MicroPython interpreter that this is safe: raw bytes including 0x03
+    reach the running script's own reads correctly once the environment
+    isn't a cooked-mode terminal, which real UART hardware never is),
+    registers every @mcu.export/@mcu.loop function plus the protocol
+    handshake handler, and runs the dispatch loop forever.
+    """
+    return f"""\
+from mcu_decorators import mcu, pc, registered_mcu_functions
+import dispatch as _tether_dispatch
+import uasyncio as _tether_asyncio
+import sys as _tether_sys
+
+{sliced_source}
+
+{stubs_source}
+
+async def _tether_main():
+    _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)
+    _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {{}})
+    _dispatcher = _tether_dispatch.Dispatcher(_reader, _writer)
+    globals()["call_pc"] = _dispatcher.call_pc
+    for _name, _fn, _hb_ms, _interval_ms in registered_mcu_functions():
+        if _interval_ms is not None:
+            _dispatcher.register_loop(_fn, _interval_ms)
+        elif _hb_ms is not None:
+            _dispatcher.register(_name, _fn, heartbeat_interval_ms=_hb_ms)
+        else:
+            _dispatcher.register(_name, _fn)
+    # Registered last, deliberately: if a user's own @mcu.export function
+    # happened to be named "__tether_handshake__" (unlikely, but not
+    # prevented anywhere), this must win and can't be silently shadowed by
+    # theirs - the reverse order would let a user function break the
+    # protocol-version handshake for every future connect().
+    _dispatcher.register({_HANDSHAKE_NAME!r}, lambda: {PROTOCOL_VERSION})
+    await _dispatcher.run()
+
+_tether_asyncio.run(_tether_main())
+"""
 
 
 class BoardHandle:
@@ -11,21 +72,223 @@ class BoardHandle:
     multi-board routing).
     """
 
-    def __init__(self, address: str) -> None:
-        self.address = address
+    def __init__(self, dispatcher: Dispatcher, export_specs: dict[str, Any]) -> None:
+        self._dispatcher = dispatcher
+        self._export_specs = export_specs
 
     def reconnect(self) -> None:
         """Explicit re-attach after MCUDisconnectedError. Never automatic."""
         raise NotImplementedError
 
     def __getattr__(self, name: str) -> Any:
-        raise NotImplementedError(f"call dispatch for {name!r} not yet implemented")
+        # __getattr__ only runs when normal attribute lookup fails - caching
+        # the built closure into __dict__ makes the next access resolve
+        # through that, without needing to call this at all. Also gives
+        # `board.read_temp is board.read_temp` the expected identity, in
+        # case any caller relies on it.
+        if name not in self._export_specs:
+            raise AttributeError(name)
+        spec = self._export_specs[name]
+        default_timeout = spec.timeout if spec.timeout is not None else DEFAULT_TIMEOUT
+
+        def call(*args: Any, timeout: float | None = default_timeout) -> Any:
+            return self._dispatcher.call_mcu(name, *args, timeout=timeout)
+
+        self.__dict__[name] = call
+        return call
 
 
-def connect(address: str) -> BoardHandle:
+def _capture_caller() -> tuple[str, Path, dict[str, Any]]:
+    """Read the calling file's source (for slicing) and its already-executed
+    module globals (for @mcu.export metadata) - NOT by re-executing the
+    source (the caller's module is already running; connect() is being
+    called from within it), which would double any of its side effects
+    (prints, connections opened at import time, etc).
+    """
+    # inspect.stack()[2]: [0]=this frame, [1]=connect()'s frame, [2]=the
+    # real caller - more robust to a future extra layer of indirection here
+    # than counting .f_back.f_back links by hand.
+    caller_frame = inspect.stack()[2].frame
+    filename = caller_frame.f_code.co_filename
+    path = Path(filename)
+    if not path.is_file():
+        raise RuntimeError(
+            f"connect() could not read the calling file's source from {filename!r} - "
+            "it must be called from a real .py file, not a REPL/exec'd string"
+        )
+
+    export_specs = {}
+    for name, obj in caller_frame.f_globals.items():
+        spec = getattr(obj, "__tether_export__", None)
+        if spec is not None and spec.side == "mcu":
+            export_specs[name] = spec
+    return path.read_text(), path.parent, export_specs
+
+
+def _hash_bundle(bootstrap: str) -> str:
+    return hashlib.sha256(bootstrap.encode()).hexdigest()
+
+
+def _connect_mock(source: str, base_dir: Path, export_specs: dict[str, Any]) -> BoardHandle:
+    from tether.transports.mock import MockTransport
+
+    transport = MockTransport(source, base_dir=base_dir)
+    reader, writer = transport.start()
+    dispatcher = Dispatcher(reader, writer)
+    dispatcher.start()
+    return BoardHandle(dispatcher, export_specs)
+
+
+def _upload_if_needed(
+    ser: Any, serial_transport: Any, bootstrap: str, bundle_hash: str, *, timeout: float
+) -> None:
+    existing_hash = serial_transport.read_file(ser, "/.tether_hash", timeout=timeout)
+    if existing_hash is not None and existing_hash.decode() == bundle_hash:
+        return
+
+    runtime_dir = Path(__file__).resolve().parents[1] / "tether_runtime"
+    # Derived from disk rather than hand-listed - a new file landing in
+    # tether_runtime/ (e.g. a future umsgpack helper) is picked up
+    # automatically instead of silently missing from the upload until an
+    # on-device ImportError surfaces it. __init__.py is the one PC-side-only
+    # marker file (see its own docstring) and is excluded.
+    runtime_paths = [
+        p for p in sorted(runtime_dir.rglob("*.py")) if p != runtime_dir / "__init__.py"
+    ]
+    runtime_files = {
+        f"/{p.relative_to(runtime_dir).as_posix()}": p.read_bytes() for p in runtime_paths
+    }
+    runtime_dirs = tuple(
+        sorted(
+            {
+                f"/{p.parent.relative_to(runtime_dir).as_posix()}"
+                for p in runtime_paths
+                if p.parent != runtime_dir
+            }
+        )
+    )
+    serial_transport.write_files(
+        ser,
+        {
+            **runtime_files,
+            "/tether_app.py": bootstrap.encode(),
+            "/.tether_hash": bundle_hash.encode(),
+        },
+        dirs=runtime_dirs,
+        timeout=timeout,
+    )
+
+
+def _connect_serial(
+    port_spec: str,
+    bootstrap: str,
+    export_specs: dict[str, Any],
+    exported_names: frozenset[str],
+    *,
+    timeout: float = 10.0,
+) -> BoardHandle:
+    import serial as pyserial
+
+    from tether.transports import serial as serial_transport
+
+    # Fail fast, at connect() time, on a decorated-but-never-sliced
+    # function: _capture_caller() finds @mcu.export functions by scanning
+    # already-executed live objects (works for any control flow, since it
+    # runs after the module has finished executing), while the AST slicer
+    # only recognizes plain top-level `def`/`async def` statements (matches
+    # DESIGN.md's statically-analyzable decorator API constraint). A
+    # function decorated inside `if`/`try`/etc would pass the former check
+    # but never get sliced or registered on-device - without this check,
+    # calling it would just hang until MCUTimeoutError, an unrelated-looking
+    # error far from the actual cause.
+    unsliced = export_specs.keys() - exported_names
+    if unsliced:
+        raise RuntimeError(
+            f"{sorted(unsliced)} are decorated with @mcu.export/@mcu.loop but weren't "
+            "found by static analysis of the source - decorated functions must be plain "
+            "top-level `def`/`async def` statements, not conditionally defined "
+            "(DESIGN.md § Standing design constraint)"
+        )
+
+    port = serial_transport.discover() if port_spec in ("", "auto") else port_spec
+    # Finite read timeout for the raw-REPL phase - `_read_until`'s deadline
+    # check only fires *between* reads, so a blocking (timeout=None) read
+    # would make every timeout= parameter downstream cosmetic if the device
+    # never responds (mid-boot, wrong baud, crashed). Switched to blocking
+    # (timeout=None) below, once the Dispatcher takes over: SerialStream's
+    # "empty read means disconnected" contract depends on reads that block
+    # for real data rather than waking on an idle timeout with nothing to
+    # report, which finite timeouts would otherwise trigger spuriously
+    # during any normal idle period with no in-flight calls.
+    ser = pyserial.Serial(port, baudrate=115200, timeout=1.0)
+    try:
+        # All raw-REPL work happens BEFORE the Dispatcher's reader thread
+        # ever starts - the two must never run concurrently against the
+        # same serial connection, or they'd race each other for bytes (the
+        # reader thread doesn't know about raw-REPL framing, and raw-REPL's
+        # own reads aren't coordinated with it). Once the app is confirmed
+        # started, raw-REPL is never touched again for this connection.
+        bundle_hash = _hash_bundle(bootstrap)
+        _upload_if_needed(ser, serial_transport, bootstrap, bundle_hash, timeout=timeout)
+
+        # Always (re)start fresh rather than trying to detect "is it
+        # already running" - that detection would itself need to read the
+        # connection, which is exactly the race this ordering avoids. A
+        # previously-running instance from an earlier connect() in this
+        # session gets interrupted and replaced; DESIGN.md's "fail loud, no
+        # silent retry" disconnect philosophy already treats device-side
+        # state as not something to preserve across reconnects.
+        serial_transport.push_raw_repl(ser, b"import tether_app\n", wait=False, timeout=timeout)
+
+        ser.timeout = None
+        stream = serial_transport.SerialStream(ser)
+        dispatcher = Dispatcher(stream, stream)
+        dispatcher.start()
+
+        version = dispatcher.call_mcu(_HANDSHAKE_NAME, timeout=timeout)
+        if version != PROTOCOL_VERSION:
+            raise ProtocolVersionError(
+                f"on-device runtime speaks protocol version {version}, "
+                f"this library expects {PROTOCOL_VERSION} - re-upload by clearing "
+                f"/.tether_hash on the device, or update tether"
+            )
+    except BaseException:
+        # No Dispatcher.stop() exists yet (chunk 7's known limitation) - if
+        # the reader thread already started, it stays blocked on ser until
+        # the process exits (a daemon thread, so at least that doesn't hang
+        # the process). Closing ser here still matters: it releases the OS
+        # handle so an immediate connect() retry on the same port doesn't
+        # fail (exclusive access on some platforms) or race a second reader
+        # against the first on others.
+        ser.close()
+        raise
+
+    return BoardHandle(dispatcher, export_specs)
+
+
+def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
     """Slice -> stub -> bundle -> hash-check -> upload -> handshake -> ready.
 
     `address` scheme selects transport:
       "serial:auto" | "serial:/dev/ttyUSB0" | "wifi:<ip>" | "ble:<addr>" | "mock://"
+
+    Auto-detects the calling file's source (must be called from a real .py
+    file) - matches the "single file" pitch: no need to pass your own
+    source to connect() explicitly.
     """
-    raise NotImplementedError
+    scheme, _, rest = address.partition(":")
+    source, base_dir, export_specs = _capture_caller()
+
+    if scheme == "mock":
+        return _connect_mock(source, base_dir, export_specs)
+
+    if scheme == "serial":
+        sliced = slice_mcu_bound(source, base_dir=base_dir)
+        stubs = generate_pc_stubs(source)
+        bootstrap = generate_bootstrap(sliced.source, stubs.source)
+        port_spec = rest.removeprefix("//")
+        return _connect_serial(
+            port_spec, bootstrap, export_specs, sliced.exported_names, timeout=timeout
+        )
+
+    raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")
