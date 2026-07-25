@@ -54,6 +54,24 @@ class RawReplError(Exception):
     """
 
 
+def list_devices(
+    list_ports_fn: Callable[[], Any] | None = None,
+    extra_vid_pid: frozenset[tuple[int, int]] | set[tuple[int, int]] | None = None,
+) -> list[str]:
+    """Like `discover()`, but returns every matching port instead of
+    requiring exactly one. `discover()` treats ambiguity as an error (the
+    right default for the library's `serial:auto` scheme) - the CLI wants
+    all matches instead, to let the user pick interactively.
+    """
+    if list_ports_fn is None:
+        from serial.tools import list_ports
+
+        list_ports_fn = list_ports.comports
+
+    known = _KNOWN_VID_PID | extra_vid_pid if extra_vid_pid else _KNOWN_VID_PID
+    return [p.device for p in list_ports_fn() if (p.vid, p.pid) in known]
+
+
 def discover(
     list_ports_fn: Callable[[], Any] | None = None,
     extra_vid_pid: frozenset[tuple[int, int]] | set[tuple[int, int]] | None = None,
@@ -68,22 +86,16 @@ def discover(
     "supporting ESP32 and similar" scope), and boards with an unlisted
     chip aren't otherwise locked out of auto-discovery.
     """
-    if list_ports_fn is None:
-        from serial.tools import list_ports
-
-        list_ports_fn = list_ports.comports
-
-    known = _KNOWN_VID_PID | extra_vid_pid if extra_vid_pid else _KNOWN_VID_PID
-    matches = [p for p in list_ports_fn() if (p.vid, p.pid) in known]
+    matches = list_devices(list_ports_fn, extra_vid_pid)
     if not matches:
         raise RawReplError(
             "no known MicroPython-capable USB serial device found "
             "(pass an explicit port, or extra_vid_pid=... for an unlisted board)"
         )
     if len(matches) > 1:
-        ports = ", ".join(p.device for p in matches)
+        ports = ", ".join(matches)
         raise RawReplError(f"multiple matching devices found ({ports}); specify a port explicitly")
-    return matches[0].device
+    return matches[0]
 
 
 def _read_until(serial_obj: Any, ending: bytes, timeout: float) -> bytes:
@@ -425,3 +437,30 @@ def read_file(serial_obj: Any, path: str, *, timeout: float = 10.0) -> bytes | N
     if text == _MISSING_FILE_MARKER:
         return None
     return base64.b64decode(text)
+
+
+def run_python(serial_obj: Any, code: bytes, *, timeout: float = 10.0) -> tuple[bytes, bytes]:
+    """Execute arbitrary Python source on-device via raw REPL, returning
+    (stdout, stderr) - the same enter/exec/follow/exit sequence read_file
+    uses internally, exposed as a public, reusable primitive instead of
+    read_file staying the only thing that can run code and get output
+    back. Does not raise on non-empty stderr (unlike read_file/write_file)
+    - callers decide what a given stderr means for their own use case
+    (e.g. the CLI's status check).
+    """
+    _enter_raw_repl(serial_obj, timeout=timeout)
+    try:
+        _exec_raw_start(serial_obj, code, timeout=timeout)
+        return _follow_exec(serial_obj, timeout=timeout)
+    finally:
+        _exit_raw_repl(serial_obj)
+
+
+def remove_file(serial_obj: Any, path: str, *, timeout: float = 10.0) -> None:
+    """Delete `path` from the device's filesystem via raw REPL. Silently
+    succeeds if the file doesn't exist (matches ensure_dir's existing
+    try/except OSError pattern) - used by the CLI's unprovision-wifi to
+    remove /tether_wifi.json.
+    """
+    script = f"import uos\ntry:\n    uos.remove({path!r})\nexcept OSError:\n    pass\n"
+    push_raw_repl(serial_obj, script.encode(), timeout=timeout)

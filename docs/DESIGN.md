@@ -74,15 +74,23 @@ At `connect()` time:
    must already be running a bootstrapped runtime; `tether` does not push
    code over wifi/BLE directly, by design, even once this exists.
 
-   **Current status:** the "board must already be running a bootstrapped
-   runtime" precondition above is not achievable today by any means,
-   manual or automatic. `generate_bootstrap()` (step 3) always wires the
-   dispatch loop to `sys.stdin`/`sys.stdout` - there is no variant that
-   wires it to a socket or a BLE GATT service, and no on-device
-   wifi-connection or BLE-advertising management exists either. Serial is
-   the only transport that works against a real device right now; wifi and
-   BLE are PC-side client code with nothing on-device to reach. See §
-   Transports.
+   **Current status (updated 2026-07-25):** the "board must already be
+   running a bootstrapped runtime" precondition is now achievable for
+   wifi via the `tether` CLI's `provision-wifi` command (`tether[cli]`
+   extra; `src/tether/cli.py` + `src/tether/provisioning.py`) - a small,
+   uploaded-once `boot.py` handles on-device wifi-connection management
+   (credentials, reconnect-on-boot) and TCP listening that
+   `generate_bootstrap()` itself still knows nothing about.
+   `generate_bootstrap()` (step 3) still always wires the dispatch loop's
+   `_tether_main()` the same way it always has, checking a
+   `_tether_stream_override` global before falling back to
+   `sys.stdin`/`sys.stdout`; nothing on the serial path ever sets that
+   global, so serial's stdio wiring is unchanged. `boot.py` is the one
+   thing that *does* set it, to the accepted socket's reader/writer,
+   before exec'ing `tether_app.py` - see § Transports' Wifi row for the
+   mechanism and its limitations. BLE has no equivalent yet: no on-device
+   BLE-advertising management or GATT listener exists, so BLE remains
+   PC-side client code with nothing on-device to reach. See § Transports.
 6. **Handshake.** Exchange a protocol-version frame. Hard error
    (`ProtocolVersionError`) on mismatch.
 7. **Ready.** Board handle returned; calls now dispatch over the transport.
@@ -151,7 +159,7 @@ At `connect()` time:
 | Transport | Discovery | Upload | Notes |
 |---|---|---|---|
 | Serial | `"serial:auto"` (USB VID/PID scan) or explicit port | Raw-REPL push | **Works today**, verified against real hardware. Primary/first transport, always code-push capable. Every connect (including reconnect) hardware-resets the board first (RTS/DTR toggle, ~1.3s) - added 2026-07-25 after real-hardware testing showed Ctrl-C alone can no longer recover a board already running a previous connect()'s dispatch loop, once `micropython.kbd_intr(-1)` is active on-device (see § Wire protocol). Harmless on an already-idle board. |
-| Wifi | `"wifi:<ip>"` | Not supported directly — board must already run a bootstrapped runtime | **Not usable against a real device yet.** PC-side client (pure stdlib `socket`) exists and is tested, but nothing generates or uploads an on-device program that listens on a socket - `generate_bootstrap()` only ever wires to `sys.stdin`/`sys.stdout`. There is also no on-device wifi-connection-management story (credentials, reconnect after reset) - explicitly out of scope when chunk 12 built the PC-side client, not yet revisited. |
+| Wifi | `"wifi:<ip>"` | Not supported directly — board must already run a bootstrapped runtime, now reachable via `tether provision-wifi` | **Provisioning works today**, verified against real ESP32 hardware, once a board has been provisioned via the `tether` CLI (`tether[cli]` extra; added 2026-07-25, see `docs/superpowers/specs/2026-07-25-wifi-upload-design.md`). `tether provision-wifi` uploads a `boot.py` (`src/tether/provisioning.py`'s `generate_wifi_boot()`) that runs automatically on every MicroPython boot: it reads credentials from `/tether_wifi.json` (absent = no-op, falls through to idle REPL exactly as before this existed), joins wifi with a bounded ~15s timeout (never permanently locking out serial on a bad password), opens a TCP listener on `DEFAULT_PORT` (8765), accepts exactly **one** connection for that boot cycle, and - if `/tether_app.py` is present - bridges it into the same generated dispatch loop serial uses, via a `_tether_stream_override` global that `generate_bootstrap()` checks before falling back to stdio (see step 5's "Current status" note above). `tether status`/`tether unprovision-wifi` round out the CLI, both verified end-to-end against a real ESP32. The socket-accept-and-bridge mechanism itself is verified against the real MicroPython interpreter (real sockets, real dispatch loop, real handshake) but an actual `mcu.connect("wifi:<ip>")` session hasn't yet been exercised against real ESP32 firmware - the CLI-side verification and the socket-bridge mechanism are each independently verified, but not yet the full chain together on hardware. Real, accepted limitations: `/tether_app.py` (the program a wifi connection actually bridges into) is only ever written by a prior *serial* `mcu.connect(...)` session - wifi never pushes code, and there's no hash-check on the wifi path, so a wifi connection silently runs whatever was uploaded last over serial; the TCP listener is **unauthenticated** - anyone on the same network can be the one connection a boot cycle accepts; no re-listen once the one accepted connection drops (needs a physical reset or a fresh `provision-wifi` run - see "Explicitly out of scope" in the design spec for why); credentials stored in plaintext on-device (no secure storage exists on this hardware class); `tether status` interrupts the board's current session to query it (same `reset_board()` tradeoff serial reconnection already accepts). |
 | BLE | `"ble:<addr>"` | Same bootstrap requirement as wifi | **Not usable against a real device yet**, same reason as wifi. Custom GATT service design (one write characteristic, one notify characteristic; frame chunking/reassembly in the transport adapter for BLE's small MTU) is implemented on the PC side and unit-tested against a hand-written fake, but there is no on-device GATT peripheral implementation, and BLE hardware has never been tested against this project at all. |
 
 Multiple boards are supported concurrently — `connect()` returns a handle,
@@ -195,6 +203,14 @@ Disconnection during a call fails loud (`MCUDisconnectedError`) — no silent
 auto-reconnect, since a board coming back may be in an unknown state (reset,
 lost in-progress work, or a physically different device). `board.reconnect()`
 is available as an explicit, deliberate re-attach.
+
+**Wifi-specific caveat:** `board.reconnect()` cannot succeed over wifi. A
+provisioned board's `boot.py` accepts exactly one TCP connection per boot
+cycle and does not re-listen once it drops (see § Transports' Wifi row) —
+recovering requires a physical reset or a fresh `provision-wifi` run, not
+a PC-side retry. `reconnect()` over wifi fails loud the same way any other
+disconnect does; it just cannot bring the board back by itself the way a
+serial reconnect can.
 
 ## Testing
 

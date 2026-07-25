@@ -61,8 +61,12 @@ def test_generated_bootstrap_runs_under_real_micropython_with_a_fake_pin():
     bootstrap = generate_bootstrap(sliced.source, stubs.source)
 
     patched = bootstrap.replace(
-        "    _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)\n"
-        "    _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {})\n",
+        '    _override = globals().get("_tether_stream_override")\n'
+        "    if _override is not None:\n"
+        "        _reader, _writer = _override\n"
+        "    else:\n"
+        "        _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)\n"
+        "        _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {})\n",
         "",
     ).replace("\n_tether_asyncio.run(_tether_main())\n", "\n")
 

@@ -29,10 +29,13 @@ def generate_bootstrap(sliced_source: str, stubs_source: str) -> str:
     dispatch loop, disables MicroPython's Ctrl-C keyboard interrupt on the
     UART (see the module-level comment on `import micropython` below),
     defines the sliced @mcu.export/@mcu.loop functions and the generated
-    @pc.export proxy stubs, wires a Dispatcher over sys.stdin/stdout
-    (wrapped as uasyncio streams), registers every @mcu.export/@mcu.loop
-    function plus the protocol handshake handler, and runs the dispatch
-    loop forever.
+    @pc.export proxy stubs, wires a Dispatcher over a pre-set
+    `_tether_stream_override` global if one exists (set by boot.py's wifi
+    bridge before exec'ing this script - see provisioning.py), falling
+    back to sys.stdin/sys.stdout (wrapped as uasyncio streams) for the
+    normal serial path, registers every @mcu.export/@mcu.loop function
+    plus the protocol handshake handler, and runs the dispatch loop
+    forever.
     """
     return f"""\
 from mcu_decorators import mcu, pc, registered_mcu_functions
@@ -61,8 +64,12 @@ _tether_micropython.kbd_intr(-1)
 {stubs_source}
 
 async def _tether_main():
-    _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)
-    _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {{}})
+    _override = globals().get("_tether_stream_override")
+    if _override is not None:
+        _reader, _writer = _override
+    else:
+        _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)
+        _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {{}})
     _dispatcher = _tether_dispatch.Dispatcher(_reader, _writer)
     globals()["call_pc"] = _dispatcher.call_pc
     for _name, _fn, _hb_ms, _interval_ms in registered_mcu_functions():
