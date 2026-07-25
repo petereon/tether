@@ -1,0 +1,26 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call: # lets publish.yml reuse this instead of duplicating it
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+
+      # Not the `ble` extra: two tests (test_transport_ble.py and
+      # test_connection.py) deliberately assert connect() fails loud when
+      # `bleak` ISN'T installed - installing it here would make those
+      # assertions false and break them. Mirrors local dev (dev + serial
+      # only, no ble) on purpose, not by omission.
+      - run: uv sync --locked --extra dev --extra serial
+
+      - run: uv run pytest

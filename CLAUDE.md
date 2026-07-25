@@ -65,8 +65,13 @@ don't gate PR-worthy test coverage on physical hardware being attached.
 - `.github/workflows/lint.yml` — `ruff check` + `ruff format --check` on
   push/PR. `ruff format --check .` also covers fenced Python blocks in
   `README.md` — keep those in sync with real ruff output, not hand-edited.
-- `.github/workflows/publish.yml` — on a published GitHub Release: full
-  test job (`ruff check`, `ruff format --check`, `pytest`, deliberately
-  *not* installing the `ble` extra — see the workflow's own comment) gates
-  a `uv build` + `uv publish` job. Reads the `PYPI_API_TOKEN` repo secret
+- `.github/workflows/test.yml` — `pytest` on push/PR, deliberately *not*
+  installing the `ble` extra (see the workflow's own comment: two tests
+  assert `connect()` fails loud when `bleak` isn't installed).
+- `.github/workflows/publish.yml` — on a published GitHub Release: reuses
+  `lint.yml` and `test.yml` (both trigger on `workflow_call`) to gate a
+  `uv build` + `uv publish` job. Reads the `PYPI_API_TOKEN` repo secret
   into `UV_PUBLISH_TOKEN`.
+- `astral-sh/setup-uv` has no floating major-version tag past v7 — pin to
+  an exact release tag (e.g. `@v9.0.0`), not `@v9`, or the workflow fails
+  at "Set up job" with "unable to find version".

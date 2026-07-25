@@ -11,33 +11,19 @@ on:
     types: [published]
 
 jobs:
-  # There's no unpublishing from PyPI - the full test suite (and lint,
-  # matching lint.yml) gates the publish job below rather than trusting
-  # that whatever's tagged for release already passed CI earlier. Not part
-  # of ble extras: two tests (test_transport_ble.py and test_connection.py)
-  # deliberately assert connect() fails loud when `bleak` ISN'T installed -
-  # installing the `ble` extra here would make those assertions false and
-  # break them, so this mirrors local dev (dev + serial only, no ble) on
-  # purpose, not by omission.
+  # There's no unpublishing from PyPI - lint and the full test suite gate
+  # the publish job below rather than trusting that whatever's tagged for
+  # release already passed CI earlier. Reuses lint.yml/test.yml (each
+  # triggers on `workflow_call` for exactly this) instead of duplicating
+  # their steps here.
+  lint:
+    uses: ./.github/workflows/lint.yml
+
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v9.0.0
-        with:
-          enable-cache: true
-
-      - run: uv sync --locked --extra dev --extra serial
-
-      - run: uv run ruff check .
-
-      - run: uv run ruff format --check .
-
-      - run: uv run pytest
+    uses: ./.github/workflows/test.yml
 
   publish:
-    needs: test
+    needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
