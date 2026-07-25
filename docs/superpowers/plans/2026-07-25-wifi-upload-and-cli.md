@@ -924,6 +924,7 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
             self.port = port
+
         def close(self):
             pass
 
@@ -937,7 +938,15 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
 
     result = CliRunner().invoke(
         main,
-        ["provision-wifi", "--port", "/dev/ttyUSB0", "--ssid", "MyNetwork", "--password", "hunter2"],
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -949,6 +958,7 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
             pass
+
         def close(self):
             pass
 
@@ -1079,6 +1089,7 @@ def test_status_command_reports_connected_with_ip(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
             pass
+
         def close(self):
             pass
 
@@ -1102,6 +1113,7 @@ def test_status_command_reports_not_provisioned(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
             pass
+
         def close(self):
             pass
 
@@ -1145,9 +1157,7 @@ def status_command(port: str | None) -> None:
     ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
     try:
         serial_transport.reset_board(ser)
-        stdout, stderr = serial_transport.run_python(
-            ser, provisioning.STATUS_SCRIPT, timeout=10.0
-        )
+        stdout, stderr = serial_transport.run_python(ser, provisioning.STATUS_SCRIPT, timeout=10.0)
     finally:
         ser.close()
 
@@ -1218,6 +1228,7 @@ def test_unprovision_wifi_removes_config_after_confirmation(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
             pass
+
         def close(self):
             pass
 
@@ -1243,7 +1254,8 @@ def test_unprovision_wifi_does_nothing_without_confirmation(monkeypatch):
 
     removed = {}
     monkeypatch.setattr(
-        "tether.transports.serial.remove_file", lambda ser, path, **kw: removed.setdefault("called", True)
+        "tether.transports.serial.remove_file",
+        lambda ser, path, **kw: removed.setdefault("called", True),
     )
 
     result = CliRunner().invoke(main, ["unprovision-wifi", "--port", "/dev/ttyUSB0"])

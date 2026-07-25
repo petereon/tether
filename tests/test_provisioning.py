@@ -85,6 +85,19 @@ class _FakeNetwork:
 
 _sys.modules["network"] = _FakeNetwork
 
+# Fake uos.listdir to include tether_wifi.json (provisioned board)
+import uos as _real_uos
+class _FakeUos:
+    def listdir(self, path):
+        result = list(_real_uos.listdir(path))
+        # Ensure tether_wifi.json is in the list (provisioned board)
+        if "tether_wifi.json" not in result:
+            result.append("tether_wifi.json")
+        return result
+
+_fake_uos = _FakeUos()
+_sys.modules["uos"] = _fake_uos
+
 {STATUS_SCRIPT.decode()}
 """
     stdout = run_micropython(script, timeout=10.0)
@@ -92,6 +105,74 @@ _sys.modules["network"] = _FakeNetwork
 
     assert info["connected"] is True
     assert info["ip"] == "10.0.0.5"
+
+
+@requires_micropython
+def test_status_script_never_provisioned_board_does_not_wait():
+    # Regression test for the performance issue: a never-provisioned board
+    # (no /tether_wifi.json) should report status quickly without waiting
+    # 8 seconds for a wifi connection that will never happen.
+    #
+    # Fakes a `network.WLAN` where isconnected() tracks call count, and
+    # fakes the filesystem so that listdir("/") does NOT contain
+    # "tether_wifi.json", causing _provisioned = False. Asserts that
+    # isconnected() is called only once or twice (not ~40 times from an
+    # 8-second/200ms poll loop).
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    _calls = 0
+    def __init__(self, *a):
+        pass
+    def isconnected(self):
+        _FakeWLAN._calls += 1
+        return False
+    def ifconfig(self):
+        return ("0.0.0.0", "255.255.255.0", "0.0.0.0", "0.0.0.0")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+# Fake uos with a listdir that excludes tether_wifi.json (never-provisioned board)
+import uos as _real_uos
+class _FakeUos:
+    def listdir(self, path):
+        result = list(_real_uos.listdir(path))
+        # Remove tether_wifi.json if present, simulating a never-provisioned board
+        if "tether_wifi.json" in result:
+            result.remove("tether_wifi.json")
+        return result
+
+_fake_uos = _FakeUos()
+_sys.modules["uos"] = _fake_uos
+
+{STATUS_SCRIPT.decode()}
+
+# Print the call count so we can verify it's low
+print("_calls: " + str(_FakeWLAN._calls))
+"""
+    stdout = run_micropython(script, timeout=10.0)
+    lines = stdout.strip().split("\n")
+    # Last line should be the call count, second-to-last should be the JSON status
+    call_count_line = lines[-1]
+    status_line = lines[-2]
+
+    # Extract call count
+    call_count = int(call_count_line.split(": ")[1])
+    info = json.loads(status_line)
+
+    # Should complete without waiting the full 8 seconds, so isconnected()
+    # should be called at most 2-3 times (once to check, maybe one more
+    # from other code flow), not ~40 times from 8000ms / 200ms polling.
+    assert call_count <= 3, (
+        f"Expected isconnected() to be called at most 3 times, but was called {call_count} times (indicating it waited through the poll loop)"
+    )
+    assert info["provisioned"] is False
+    assert info["connected"] is False
 
 
 @requires_micropython
