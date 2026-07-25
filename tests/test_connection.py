@@ -39,6 +39,19 @@ def test_generate_bootstrap_wires_streams_from_stdin_stdout():
     assert "sys.stdout.buffer" in script
 
 
+def test_generate_bootstrap_checks_for_a_stream_override_before_stdio():
+    # boot.py (chunk 19, wifi provisioning) sets a `_tether_stream_override`
+    # global to (reader, writer) before exec'ing this generated source, to
+    # bridge the dispatch loop onto a socket instead of stdio - the
+    # override must be checked FIRST, with stdio as the fallback, so every
+    # existing serial connect() (which never sets it) is unaffected.
+    script = generate_bootstrap("", "")
+    assert "_tether_stream_override" in script
+    override_check_index = script.index("_tether_stream_override")
+    stdio_wiring_index = script.index("sys.stdin.buffer")
+    assert override_check_index < stdio_wiring_index
+
+
 def test_generate_bootstrap_disables_the_ctrl_c_keyboard_interrupt():
     # Found against real ESP32 hardware, not reproducible against the PTY
     # simulation chunk 10 originally verified this with (which only proved
@@ -309,15 +322,20 @@ def test_generated_bootstrap_actually_works_end_to_end():
     # exactly as generated. `_reader`/`_writer` become module-level globals
     # (set up by the test driver below, before _tether_main runs) rather
     # than being constructed inside _tether_main's own local scope, so the
-    # driver can also reach the other end of the same pipe pair. Also drop
-    # the trailing self-running `_tether_asyncio.run(_tether_main())` -
+    # driver can also reach the other end of the same pipe pair. The
+    # override-checking logic must be stripped to use the test-provided
+    # globals. Also drop the trailing self-running `_tether_asyncio.run(_tether_main())` -
     # correct for real deployment (it's meant to run forever as the entry
     # point), but this test needs to drive _tether_main as a task inside
     # its own event loop instead, or that blocking call would prevent the
     # driver code below it from ever running at all.
     patched = bootstrap.replace(
-        "    _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)\n"
-        "    _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {})\n",
+        '    _override = globals().get("_tether_stream_override")\n'
+        "    if _override is not None:\n"
+        "        _reader, _writer = _override\n"
+        "    else:\n"
+        "        _reader = _tether_asyncio.StreamReader(_tether_sys.stdin.buffer)\n"
+        "        _writer = _tether_asyncio.StreamWriter(_tether_sys.stdout.buffer, {})\n",
         "",
     ).replace("\n_tether_asyncio.run(_tether_main())\n", "\n")
 
