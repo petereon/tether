@@ -94,6 +94,7 @@ def test_devices_command_reports_none_found(monkeypatch):
 
 def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
     written = {}
+    calls = []
 
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
@@ -103,9 +104,10 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
             pass
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
-    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
 
     def fake_write_files(ser, files, **kwargs):
+        calls.append("write")
         written.update(files)
 
     monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
@@ -126,6 +128,10 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
     assert result.exit_code == 0, result.output
     assert set(written.keys()) == {"/boot.py", "/tether_wifi.json"}
     assert b"MyNetwork" in written["/tether_wifi.json"]
+    assert calls == ["reset", "write", "reset"], (
+        "provision-wifi must reset before write (known state) and "
+        "reset after write (board picks up new config)"
+    )
 
 
 def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
