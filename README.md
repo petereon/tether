@@ -1,9 +1,49 @@
 # tether
 
-Write MicroPython and Python in one file. Call MCU functions from your PC
-script, and PC functions from your MCU code, like ordinary Python calls —
-`tether` handles slicing, upload, and wire marshalling over serial, wifi, or
+Write MicroPython and Python in one file, and call across the PC/MCU
+boundary like it's a normal function call.
+
+Building a project that pairs a microcontroller with a PC-side app usually
+means two separate codebases, a hand-rolled wire protocol, and manual
+marshalling every time you add a feature. `tether` collapses that into one
+file: decorate a function `@mcu.export` and it runs on the board; decorate
+one `@pc.export` and it runs on your PC. Call either one from the other
+side exactly like a local function call — `tether` figures out which parts
+of the file belong on the MCU, uploads just that code, and handles framing,
+serialization, and routing calls over the wire.
+
+Targets ESP32 and similar MicroPython-capable boards, over serial, wifi, or
 BLE.
+
+## How it works
+
+- **One file, two runtimes.** The same `.py` file runs as a normal script
+  on your PC and (in sliced form) as the program running on the MCU.
+  `@mcu.export`/`@mcu.loop` mark MCU-bound functions; `@pc.export` marks
+  PC-bound ones.
+- **AST slicing, not manual splitting.** At connect time, `tether` walks
+  the file's syntax tree from every `@mcu.export`/`@mcu.loop` function,
+  pulling in whatever helper functions, module-level assignments, and
+  local imports it actually depends on. Only that subset gets uploaded —
+  you don't maintain a separate MCU-only file by hand.
+- **Calls cross the boundary transparently.** Every exported function gets
+  a matching stub generated on the other side. Calling an MCU function from
+  the PC (or a PC function from the MCU) sends a request over the wire,
+  waits for the result, and returns it like any other function call —
+  including calls made *from inside* a call already in flight, in either
+  direction.
+- **Type-checked at the boundary.** Only `int`, `float`, `bool`, `str`,
+  `bytes`, `list`, and `dict` (recursively) can cross — enforced from type
+  hints at decoration time, so an unsupported type is a definition-time
+  error, not a surprise mid-call.
+
+## Install
+
+```bash
+uv pip install -e ".[serial]"   # or "[ble]" for Bluetooth; wifi needs no extra
+```
+
+## Example
 
 ```python
 from tether import mcu, pc
@@ -32,6 +72,14 @@ print(read_temp())
 needed at the call site. `board = mcu.connect(...)` still works if you want
 to be explicit (`board.read_temp()`), or need to juggle more than one board
 at once (`with board:` scopes which one is ambient for a block).
+
+## Transports
+
+| Transport | Address | Notes |
+|---|---|---|
+| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | The only transport that can push code to the board (over MicroPython's raw REPL). |
+| Wifi | `"wifi:<ip>"` | Pure stdlib socket, no extra install. Board must already be running a `tether`-uploaded program (get it there once over serial first). |
+| BLE | `"ble:<addr>"` | Same requirement as wifi — connects to an already-running board, doesn't push code. |
 
 ## Walkthrough: blink an LED
 
@@ -62,35 +110,12 @@ The example hardcodes `Pin(2, Pin.OUT)` — pin 2 is the common onboard LED
 pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
-**This walkthrough has been run against a real board** (ESP32-WROOM-32D,
-2026-07-24 and 2026-07-25) — connected over `serial:auto`, uploaded and
-started, blinked the onboard LED 5 times, and logged progress back from MCU
-to PC after each blink, exactly as shown above, including reconnecting and
-re-running repeatedly with no manual reset in between. Real-hardware runs
-across these two sessions found and fixed real bugs that no amount of
-testing without hardware had caught: a missing `mcu.connect` API wiring, a
-raw-REPL protocol race, a MicroPython Ctrl-C interception issue, a missing
-PC-side handler registration for `@pc.export` functions, and — found only
-once running the same script back-to-back multiple times — a board already
-running a previous connection's dispatch loop could no longer be recovered
-by Ctrl-C alone, needing an explicit hardware reset before every connect.
-See `docs/CHUNKS.md`'s chunk 15 and chunk 18 entries for the full account
-of each. Serial is the one transport verified this way so far; wifi and BLE
-are still verified only as thoroughly as possible without hardware (real
-TCP sockets / a hand-written fake matching bleak's API, respectively) — the
-same category of gap this note used to describe for all three.
-
 ## Status
 
-All 17 originally-planned chunks of `docs/CHUNKS.md`'s roadmap are
-implemented and tested (slicing, marshalling, dispatch, all three
-transports, connection orchestration, multi-board/reconnect handling, a
-real-hardware-verified example, CI lint, and a PyPI release workflow), plus
-chunk 18: an additional ambient-board calling convention (`read_temp()`,
-not just `board.read_temp()`) and the serial reconnect-reliability fixes
-found while exercising it against real hardware. See `docs/DESIGN.md` for
-the full locked architecture and `docs/CHUNKS.md` for exactly what's been
-built, what's been found and fixed along the way (including the real
-hardware findings above), and what's still open (wifi/BLE hardware
-verification; the PyPI release workflow's actual upload step, pending a
-real token).
+Core functionality (slicing, the wire protocol, all three transports,
+multi-board and reconnect handling) is implemented and tested. Serial has
+been verified against real ESP32 hardware, including reconnecting and
+re-running repeatedly. Wifi and BLE are covered by automated tests (real
+TCP sockets, and a fake matching the BLE library's API) but not yet
+verified against real hardware. See `docs/DESIGN.md` for the full
+architecture.
