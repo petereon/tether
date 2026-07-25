@@ -10,7 +10,14 @@ def test_mcu_export_accepts_supported_scalar_types():
 
     spec = read_temp.__tether_export__
     assert spec.side == "mcu"
-    assert spec.func is read_temp
+    # `read_temp` (post-decoration) is a PC-side dispatch wrapper, not the
+    # original function - it must never run the original body locally (see
+    # decorators.py's own comment). `spec.func` is the real, undecorated
+    # callable instead - used e.g. by transports/mock.py to register the
+    # actual handler on the simulated device side. Calling it directly
+    # (bypassing the wrapper entirely) proves it's the genuine original,
+    # not just an object with the right shape.
+    assert spec.func(scale="C", precision=2) == 0.0
 
 
 def test_mcu_export_rejects_missing_param_type_hint():

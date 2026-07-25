@@ -23,9 +23,15 @@ def read_temp() -> float:
     return ADC(Pin(4)).read_u16() / 65535
 
 
-board = mcu.connect("serial:auto")
-print(board.read_temp())
+mcu.connect("serial:auto")
+print(read_temp())
 ```
+
+`connect()` sets itself as the ambient "current board" — call an
+`@mcu.export` function like any other Python function, no board-awareness
+needed at the call site. `board = mcu.connect(...)` still works if you want
+to be explicit (`board.read_temp()`), or need to juggle more than one board
+at once (`with board:` scopes which one is ambient for a block).
 
 ## Walkthrough: blink an LED
 
@@ -57,25 +63,32 @@ pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
 **This walkthrough has been run against a real board** (ESP32-WROOM-32D,
-2026-07-24) — connected over `serial:auto`, uploaded and started, blinked
-the onboard LED 5 times, and logged progress back from MCU to PC after
-each blink, exactly as shown above. That first real-hardware run also
-found and fixed four real bugs that no amount of testing without hardware
-had caught (a missing `mcu.connect` API wiring, a raw-REPL protocol race,
-a MicroPython Ctrl-C interception issue, and a missing PC-side handler
-registration for `@pc.export` functions) — see `docs/CHUNKS.md`'s chunk 15
-entry for the full account of each. Serial is the one transport verified
-this way so far; wifi and BLE are still verified only as thoroughly as
-possible without hardware (real TCP sockets / a hand-written fake matching
-bleak's API, respectively) — the same category of gap this note used to
-describe for all three.
+2026-07-24 and 2026-07-25) — connected over `serial:auto`, uploaded and
+started, blinked the onboard LED 5 times, and logged progress back from MCU
+to PC after each blink, exactly as shown above, including reconnecting and
+re-running repeatedly with no manual reset in between. Real-hardware runs
+across these two sessions found and fixed real bugs that no amount of
+testing without hardware had caught: a missing `mcu.connect` API wiring, a
+raw-REPL protocol race, a MicroPython Ctrl-C interception issue, a missing
+PC-side handler registration for `@pc.export` functions, and — found only
+once running the same script back-to-back multiple times — a board already
+running a previous connection's dispatch loop could no longer be recovered
+by Ctrl-C alone, needing an explicit hardware reset before every connect.
+See `docs/CHUNKS.md`'s chunk 15 and chunk 18 entries for the full account
+of each. Serial is the one transport verified this way so far; wifi and BLE
+are still verified only as thoroughly as possible without hardware (real
+TCP sockets / a hand-written fake matching bleak's API, respectively) — the
+same category of gap this note used to describe for all three.
 
 ## Status
 
-All 17 chunks of `docs/CHUNKS.md`'s roadmap are implemented and tested
-(slicing, marshalling, dispatch, all three transports, connection
-orchestration, multi-board/reconnect handling, a real-hardware-verified
-example, CI lint, and a PyPI release workflow). See `docs/DESIGN.md` for
+All 17 originally-planned chunks of `docs/CHUNKS.md`'s roadmap are
+implemented and tested (slicing, marshalling, dispatch, all three
+transports, connection orchestration, multi-board/reconnect handling, a
+real-hardware-verified example, CI lint, and a PyPI release workflow), plus
+chunk 18: an additional ambient-board calling convention (`read_temp()`,
+not just `board.read_temp()`) and the serial reconnect-reliability fixes
+found while exercising it against real hardware. See `docs/DESIGN.md` for
 the full locked architecture and `docs/CHUNKS.md` for exactly what's been
 built, what's been found and fixed along the way (including the real
 hardware findings above), and what's still open (wifi/BLE hardware

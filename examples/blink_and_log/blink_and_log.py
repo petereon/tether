@@ -7,7 +7,13 @@ Run directly on your PC:
 
 tether slices out the @mcu.export-decorated code below, uploads it to the
 board over serial, and this same file's `if __name__ == "__main__":` block
-then drives it as a normal PC script.
+then drives it as a normal PC script - calling `blink(5)` directly, not
+`board.blink(5)`. `mcu.connect()` sets itself as the ambient "current
+board", so an @mcu.export function just called by name dispatches through
+it - no board-awareness needed at the call site. `board.blink(5)` (the
+value connect() returns) still works too if you want to be explicit, or
+need to disambiguate between more than one connected board via
+`with board:`.
 
 Hardware note: LED_PIN=2 is the common onboard LED pin on many ESP32 dev
 boards - check your board's pinout and adjust if it doesn't light up.
@@ -56,7 +62,7 @@ async def blink(times: int) -> None:
 
 
 if __name__ == "__main__":
-    board = mcu.connect("serial:auto")
+    mcu.connect("serial:auto")  # becomes the ambient board - see blink()'s own call below
     print("Connected. Blinking 5 times...")
-    board.blink(5)
+    blink(5)  # just a function call - no board-awareness needed at the call site
     print("Done.")

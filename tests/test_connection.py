@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tether import mcu, pc
+from tether._context import current_board
 from tether.connection import PROTOCOL_VERSION, connect, generate_bootstrap
 from tether.dispatch import Dispatcher
 from tether.transports.wifi import WifiStream
@@ -79,6 +80,31 @@ def _mock_read_temp() -> float:
     return 21.5
 
 
+_ambient_local_execution_count = 0
+
+
+@mcu.export
+def _mock_ambient_counter() -> int:
+    # MockTransport execs the SAME source text in a SEPARATE namespace to
+    # simulate "the device" (see transports/mock.py) - so this global gets
+    # incremented ONLY if THIS exact PC-side function object's body somehow
+    # ran locally instead of dispatching over the (mock) wire. Needed
+    # because a plain return value here (e.g. _mock_read_temp's 21.5)
+    # can't distinguish "correctly dispatched" from "buggily fell through
+    # to local execution" - both paths would return the same literal,
+    # since the mock device re-execs identical source.
+    global _ambient_local_execution_count
+    # `x = x + 1`, not `x += 1`: the slicer's dependency walk only tracks
+    # Name references with Load context (marshalling/__init__.py-adjacent
+    # concern, see slicer/__init__.py's _referenced_names) - an AugAssign
+    # target has Store context, so `x += 1` would never pull in this
+    # global's `= 0` initializer when this function gets sliced for the
+    # mock "device" side, and MockTransport would raise NameError there
+    # instead of testing anything about ambient dispatch.
+    _ambient_local_execution_count = _ambient_local_execution_count + 1
+    return 42
+
+
 @pc.export
 def _mock_double(x: int) -> int:
     return x * 2
@@ -87,6 +113,62 @@ def _mock_double(x: int) -> int:
 @mcu.export
 async def _mock_read_scaled() -> int:
     return await _mock_double(21)
+
+
+_reentrant_observed_board: list[object] = []
+
+
+@pc.export
+def _mock_relay() -> float:
+    # Runs on a Dispatcher worker thread, triggered by an incoming MCU
+    # call (see _mock_trigger_relay below) - _mock_relay is @pc.export, a
+    # real PC-side function called directly (not sliced/re-exec'd like
+    # @mcu.export functions are for the mock "device"), so it can observe
+    # current_board directly and the test can inspect that afterward -
+    # sidesteps the "two mock:// boards run identical devices, so return
+    # values alone can't distinguish them" problem the multi-board `with`
+    # test above works around differently.
+    _reentrant_observed_board.append(current_board.get())
+    return 0.0
+
+
+@mcu.export
+async def _mock_trigger_relay() -> float:
+    return await _mock_relay()
+
+
+def test_reentrant_handler_sees_the_triggering_board_as_ambient_not_the_connecting_threads_default():
+    # A @pc.export handler running because board_a's MCU called it must see
+    # board_a as ambient for any further ambient MCU calls it makes itself
+    # - NOT board_b, even though board_b is what's ambient on the
+    # connecting/main thread (the "most recent connect() wins" default from
+    # the test above). Otherwise a reentrant handler on one board could
+    # accidentally dispatch a "local" ambient call to a completely
+    # different board.
+    board_a = connect("mock://")
+    connect("mock://")  # board_b - becomes ambient on THIS thread, deliberately not asserted on
+    _reentrant_observed_board.clear()
+
+    board_a._mock_trigger_relay()
+
+    assert _reentrant_observed_board == [board_a]
+
+
+def test_reentrant_handler_sees_the_board_correctly_immediately_after_reconnect():
+    # The gap this closes: unlike a fresh connect(), a reconnected device
+    # may already be running @mcu.loop background tasks that call back
+    # immediately - Dispatcher.board must be correct from dial()'s very
+    # first moment (set via the closure variable each _connect_*() function
+    # threads into _start_and_handshake/dial), not just "eventually" set by
+    # BoardHandle.__init__ after dial() has already returned and started
+    # the reader thread.
+    board = connect("mock://")
+    board.reconnect()
+    _reentrant_observed_board.clear()
+
+    board._mock_trigger_relay()
+
+    assert _reentrant_observed_board == [board]
 
 
 def test_connect_mock_mcu_can_call_back_into_a_registered_pc_export_function():
@@ -105,6 +187,40 @@ def test_connect_mock_mcu_can_call_back_into_a_registered_pc_export_function():
 def test_connect_mock_reaches_a_registered_mcu_export_function():
     board = connect("mock://")
     assert board._mock_read_temp() == 21.5
+
+
+def test_calling_an_exported_function_directly_with_no_board_connected_raises_clearly():
+    # No connect() has happened in this test - _mock_read_temp() called
+    # directly (not via board.<name>()) must fail loud and clear, not
+    # silently run its own body locally (which would happen to return the
+    # same 21.5 either way here, masking the bug) or hang.
+    with pytest.raises(RuntimeError, match="_mock_read_temp"):
+        _mock_read_temp()
+
+
+def test_calling_an_exported_function_directly_dispatches_through_the_ambient_board():
+    connect("mock://")  # sets itself as the ambient "current" board
+    assert _mock_ambient_counter() == 42
+    # Proves the call actually crossed the (mock) wire rather than falling
+    # through to running the PC-side function object's own body locally -
+    # see _mock_ambient_counter's own comment for why the return value
+    # alone can't distinguish the two.
+    assert _ambient_local_execution_count == 0
+
+
+def test_with_board_scopes_the_ambient_board_for_multi_board_disambiguation():
+    board_a = connect("mock://")
+    board_b = connect("mock://")  # most-recently-connected wins by default
+    assert current_board.get() is board_b
+
+    with board_a:
+        assert current_board.get() is board_a
+        assert _mock_read_temp() == 21.5  # dispatches through board_a specifically
+
+    # Restores the PREVIOUS ambient value (board_b), not just clears it -
+    # proper token-based reset, not a naive "set to None".
+    assert current_board.get() is board_b
+    assert _mock_read_temp() == 21.5  # dispatches through board_b now
 
 
 def test_mcu_connect_is_the_public_api_design_md_documents():

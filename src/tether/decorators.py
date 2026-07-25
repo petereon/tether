@@ -15,11 +15,14 @@ needs the same change - there's no automated check tying them together.
 
 from __future__ import annotations
 
+import functools
 import inspect
 import typing
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, TypeVar
+
+from tether._context import current_board
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -47,13 +50,45 @@ class _McuNamespace:
     ) -> Callable[[F], F]:
         def decorate(fn: F) -> F:
             _validate_signature(fn)  # raises at decoration time; see DESIGN.md Q4
-            fn.__tether_export__ = ExportSpec(  # type: ignore[attr-defined]
+            spec = ExportSpec(
                 func=fn,
                 side="mcu",
                 timeout=timeout,
                 heartbeat_interval=heartbeat_interval,
             )
-            return fn
+
+            # The returned callable is NOT `fn` - `fn`'s body only ever
+            # runs on the MCU (the slicer works from source text, so this
+            # substitution doesn't affect what gets uploaded), and must
+            # never execute here on the PC. Calling the decorated name
+            # directly (no `board.<name>()`) dispatches through whichever
+            # BoardHandle is ambient (see tether/_context.py) - the "call
+            # it like a normal Python function, with no awareness of where
+            # it runs" story. `board.<name>()` still works too (explicit,
+            # bypasses ambient lookup) - this is additive, not a
+            # replacement.
+            @functools.wraps(fn)
+            def dispatch(*args: Any, **kwargs: Any) -> Any:
+                board = current_board.get()
+                if board is None:
+                    raise RuntimeError(
+                        f"{fn.__name__}() called with no board in context - call "
+                        f"mcu.connect(...) first, or wrap the call in `with board:` "
+                        f"if you're working with more than one board"
+                    )
+                # Reuses BoardHandle's own cached call closure, which
+                # already accepts an optional `timeout=` override
+                # (connection.py's __getattr__). No timeout kwarg here
+                # means none in `kwargs` either, so the closure's own
+                # default (spec.timeout, or DEFAULT_TIMEOUT) applies
+                # untouched - forwarding kwargs plainly, rather than
+                # defaulting timeout ourselves, is what avoids silently
+                # passing timeout=None ("wait forever") on every ambient
+                # call that didn't ask for it.
+                return getattr(board, fn.__name__)(*args, **kwargs)
+
+            dispatch.__tether_export__ = spec  # type: ignore[attr-defined]
+            return dispatch  # type: ignore[return-value]
 
         return decorate(func) if func is not None else decorate
 

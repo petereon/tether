@@ -1095,6 +1095,178 @@ works.
   release is published, this is the one thing left to confirm actually
   works end-to-end.
 
+- [x] **18. Ambient board context + serial reconnect reliability** — done
+  2026-07-25. Not part of the original 17-chunk plan - added after the
+  user raised a design concern about `board.blink(5)`'s calling
+  convention feeling like unexplained magic (a plain top-level function
+  with no visible connection to the `board` object it becomes an attribute
+  of). Two pieces of work, both driven by continued real-hardware testing
+  on the same ESP32-WROOM-32D from chunk 15.
+
+  ## Part A: ambient board context
+
+  Design settled via discussion, not unilaterally: talked through the
+  actual tension (decorators run at module-import time, before any board
+  object exists, so a decorated function can't syntactically reference
+  its board; multi-board support needs *some* explicit disambiguation
+  mechanism) and landed on `contextvars`-based ambient state - closer to
+  algebraic-effects/dynamic-scoping than the more "FP-pure" Reader-pattern
+  alternative also discussed, chosen because it's what actually satisfies
+  "call it like normal Python, no board-awareness at the call site" for
+  the common single-board case, which is what was asked for. See
+  DESIGN.md's dated amendment under § Call semantics for the locked
+  writeup.
+
+  What was built:
+  - `src/tether/_context.py` (new): `current_board: ContextVar` - split
+    into its own tiny module so `decorators.py` (reads it) and
+    `connection.py` (sets it) don't need to import each other.
+  - `decorators.py`'s `@mcu.export` now returns a dispatch wrapper
+    (`functools.wraps`-preserved) instead of the original function -
+    calling the decorated name directly looks up `current_board.get()`
+    and dispatches through `getattr(board, fn.__name__)(*args, **kwargs)`,
+    reusing `BoardHandle.__getattr__`'s already-cached call closure rather
+    than reimplementing dispatch. `@mcu.loop` is unchanged (never called
+    directly by anyone, PC or otherwise, so it doesn't need this).
+  - `connection.py`'s `connect()` sets `current_board` to the
+    newly-connected board (most-recent-wins default - simple, and matches
+    how e.g. matplotlib's "current figure" works). `BoardHandle` gained
+    `__enter__`/`__exit__` (`with board:`) for explicit multi-board
+    scoping, using a `threading.local()` stack of context tokens (not a
+    plain list/single field) so it's correct both for nesting *and* for
+    the same `BoardHandle` being entered concurrently from different
+    threads - not just single-threaded convenience.
+  - `dispatch/__init__.py`'s `Dispatcher` gained a `board` attribute and
+    `_handle_call` now scopes `current_board` to `self.board` for the
+    duration of running each incoming-call handler (via a new
+    `_board_scoped()` contextmanager, mirroring the existing
+    `_heartbeat_ticking` pattern rather than a bespoke inline try/finally)
+    - so a reentrant `@pc.export` handler's own ambient calls resolve to
+    whichever board actually triggered it, not whatever's ambient on the
+    connecting/main thread. Verified empirically, not assumed, that this
+    was necessary: neither plain `threading.Thread` nor
+    `concurrent.futures.ThreadPoolExecutor` propagate a calling thread's
+    `contextvars.Context` to the thread that runs the work (unlike
+    `asyncio.Task`, which does) - confirmed with small throwaway scripts
+    before writing any implementation.
+  - `transports/mock.py` fixed to register `spec.func` (the real
+    undecorated callable, always available via `ExportSpec.func`) instead
+    of `namespace[name]` (now the PC-side dispatch wrapper) as the mock
+    "device"'s own handler - the same `tether.decorators.mcu`/`pc`
+    singleton objects get re-exec'd inside `MockTransport` to simulate the
+    device side, and the wrapper's ambient-dispatch behavior would be
+    wrong there (it would try to look up a board from inside the
+    simulated device's own execution).
+  - `examples/blink_and_log/blink_and_log.py` updated to demonstrate the
+    new style (`blink(5)`, not `board.blink(5)`) and re-verified
+    end-to-end against real hardware, LED blink visually confirmed.
+
+  Real correctness gap found via review (altitude angle) and fixed before
+  it could bite: `dispatcher.board = self` was originally set only
+  *after* `dial()` returns (`BoardHandle.__init__`/`reconnect()`), but
+  `dial()` itself calls `dispatcher.start()` before `BoardHandle` exists
+  to reference - for the very first-ever `connect()` this window is
+  practically unreachable (nothing has been uploaded/started yet for a
+  background task to call back through), but for `reconnect()`
+  specifically it's real: the device may already be running an
+  `@mcu.loop` background task that calls back immediately, before the
+  post-hoc assignment would otherwise run. Fixed by threading a mutable
+  closure variable (`board: BoardHandle | None`) through each
+  `_connect_*()` function that `dial()` itself reads and sets
+  `dispatcher.board` from, before `dispatcher.start()` - `None` only for
+  the still-unreachable very-first-call case, correctly populated for
+  every `reconnect()` afterward since the closure variable gets updated
+  once the first `BoardHandle` exists. Regression test:
+  `test_reentrant_handler_sees_the_board_correctly_immediately_after_reconnect`.
+
+  Reviewed via 4 parallel cleanup agents (spend limit had recovered from
+  chunk 14's interruption) plus a manual security pass (no findings - no
+  security boundary touched). Reuse: no findings beyond one cosmetic note
+  (applied - see `_board_scoped()` above). Simplification (1 finding,
+  applied): a `_TIMEOUT_NOT_GIVEN` sentinel in the dispatch wrapper was
+  unnecessary - plain `**kwargs` forwarding to the already-timeout-aware
+  cached closure does the identical job with less code. Efficiency: no
+  findings - the ContextVar set/reset pair and cached-closure `getattr`
+  are both negligible next to the thread-pool submission and (when used)
+  heartbeat-ticker thread already on the same path. Altitude (3 findings):
+  the `dispatcher.board`/reconnect race above (applied, see above); the
+  `mock.py` `spec.func` fix confirmed complete (no other site assumed the
+  decorated name was still the original callable, `@mcu.loop` unaffected
+  since it's unchanged); confirmed this is the first thing to depend on
+  `ExportSpec.func`'s exact identity as "the original, unwrapped
+  callable" - not itself a bug, but noted so a future `ExportSpec`/
+  `decorators.export` edit doesn't break that invariant unknowingly.
+
+  ## Part B: serial reconnect reliability
+
+  Found by the user simply running the (now ambient-context-using)
+  example twice in a row: second run crashed with
+  `frame too large: declared <garbage>`. Root cause: two of the SAME
+  session's earlier real-hardware fixes (chunk 15's `push_raw_repl`
+  `wait=False` no longer sending the raw-REPL exit sequence, and
+  `micropython.kbd_intr(-1)` disabling Ctrl-C interception) combined to
+  remove the *only* way to recover a board still running a previous
+  connection's dispatch loop - a second `connect()`'s interrupt bytes
+  were landing directly in the old loop's frame parser as garbage instead
+  of interrupting it. Decoded the garbage length value twice during
+  investigation (`\x04Tra...` the first time - literally the start of a
+  crash traceback; `\r\x03\r\x01` the second time - literally
+  `_enter_raw_repl`'s own interrupt+enter-raw-repl bytes) rather than
+  guessing, confirming the mechanism precisely before designing a fix.
+
+  Fixed with `reset_board()` (new, `transports/serial.py`), called before
+  every raw-REPL interaction in `_connect_serial`'s `dial()`, not just the
+  first. Took two more real-hardware findings to get the fix itself
+  right, neither assumed:
+  - An RTS-only pulse alone (matching esptool's own `HardReset` strategy,
+    checked against esptool's actual source rather than guessed) does
+    NOT reliably interrupt a program that's actively running right now -
+    repeated real-hardware testing showed it silently failing to recover
+    a stuck board most of the time. Fixed by pulsing into the ROM
+    bootloader first (DTR+RTS, matching esptool's `ClassicReset`) - the
+    bootloader unconditionally takes over the chip, so this always stops
+    whatever was running - then a second RTS-only pulse boots normally
+    out of the bootloader instead of leaving it stuck there.
+  - Sending raw-REPL bytes too soon after releasing reset races the boot
+    banner - bytes arriving mid-boot get silently consumed instead of
+    reaching the idle REPL that's actually ready for them. Confirmed by
+    watching `_enter_raw_repl` succeed once a real settle delay was added,
+    fail without it, on the identical reset sequence. Fixed with a ~1s
+    trailing sleep in `reset_board()` before touching the connection
+    again.
+
+  Best-effort, not hard-fail, on platforms where RTS/DTR control isn't
+  available at all (`except OSError: return`) - matches esptool's own
+  precedent for exactly this (`ResetStrategy.__call__`'s handling of
+  `ENOTTY`/`EINVAL`) rather than turning an optional robustness step into
+  a hard requirement.
+
+  Verified end-to-end against real hardware repeatedly, not just once:
+  ran `blink_and_log.py` 3-4 times back-to-back with no manual
+  intervention (multiple separate test batches, all clean), and separately
+  exercised `board.reconnect()` explicitly against real hardware
+  (`add(2, 3)` then reconnect then `add(10, 20)`, both correct). Unit
+  tests use a hand-written fake recording RTS/DTR transitions
+  (`test_reset_board_pulses_into_bootloader_then_boots_normally`,
+  `test_reset_board_degrades_gracefully_when_rts_is_unsupported`) with
+  `time.sleep` patched out via `monkeypatch` so the suite doesn't pay
+  `reset_board()`'s real ~1.3s per test run - the first use of
+  `monkeypatch` in this test suite (no prior sleep here was ever big
+  enough to need it).
+
+  DESIGN.md updated in two places (dated amendments, not silent drift):
+  § Call semantics for the ambient-context addition, § Wire protocol +
+  the Serial row of § Transports for the `kbd_intr`/hardware-reset
+  consequence.
+
+  167 tests passing (was 157 at the end of chunk 17; +2 ambient-context
+  mock tests, +1 multi-board `with` test, +2 reentrant-handler tests
+  [fresh connect + immediately-after-reconnect], +1 `mcu.connect` identity
+  test, +2 `reset_board` tests, +1 existing `test_decorators.py`
+  assertion updated for the new wrapper-vs-original-callable distinction,
+  +1 existing `push_raw_repl` wait=False test updated for the corrected
+  behavior it now pins).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

@@ -102,6 +102,69 @@ def _read_until(serial_obj: Any, ending: bytes, timeout: float) -> bytes:
     return bytes(data)
 
 
+def reset_board(serial_obj: Any) -> None:
+    """Hardware-reset the board via its RTS/DTR-wired EN and GPIO0 pins -
+    the classic ESP32 auto-reset circuit.
+
+    Needed before every raw-REPL interaction, not just the first - found
+    against real hardware, not anticipated: once a board's dispatch loop is
+    running (generate_bootstrap's `micropython.kbd_intr(-1)`, see
+    connection.py) plus push_raw_repl's wait=False path deliberately never
+    sending the raw-REPL exit sequence anymore (see its own docstring for
+    why), there is no software-level way back to a clean raw-REPL prompt
+    from a board that's already running a previous connect()'s dispatch
+    loop. Without this, a second connect() attempt's Ctrl-C interrupt bytes
+    land directly in the OLD dispatch loop's frame parser instead of
+    interrupting it, corrupting its declared frame length and crashing it -
+    which then leaves `_enter_raw_repl`'s banner wait reading that crash's
+    traceback instead of the expected banner.
+
+    Two pulses, not one - found empirically against real hardware, not
+    assumed: an RTS-only pulse alone (esptool's `HardReset` strategy,
+    normally used for the *final* "resume the running app" step after
+    already being in the ROM bootloader) does NOT reliably interrupt a
+    program that's actively running right now - repeated real-hardware
+    testing showed it silently failing to recover a board stuck in a
+    previous dispatch loop, most of the time. The fix: pulse into the ROM
+    bootloader first (DTR held low/GPIO0 low during the reset pulse,
+    matching esptool's `ClassicReset`) - the bootloader completely takes
+    over the chip, so this unconditionally stops whatever was running,
+    unlike a plain EN pulse. Then a second, RTS-only pulse boots normally
+    out of the bootloader instead of leaving it stuck there waiting for a
+    download protocol it'll never receive.
+
+    The trailing sleep matters too, and isn't just a nicety - also found
+    empirically: sending raw-REPL bytes too soon after releasing reset
+    races the boot banner. Bytes that arrive while the board is still
+    mid-boot get silently consumed instead of reaching the idle REPL
+    that's actually ready for them, so `_enter_raw_repl` was found to
+    still fail even when the reset itself had genuinely succeeded.
+
+    Best-effort: some serial adapters/platforms don't expose RTS/DTR
+    control at all (matches esptool's own graceful degrade for exactly
+    this) - proceeds without resetting rather than hard-failing a connect()
+    attempt that might not have needed it anyway; the raw-REPL work that
+    follows still gets its own clear timeout error if the board genuinely
+    wasn't in a usable state.
+    """
+    try:
+        serial_obj.dtr = False
+        serial_obj.rts = True
+        time.sleep(0.1)
+        serial_obj.dtr = True
+        serial_obj.rts = False
+        time.sleep(0.1)
+        serial_obj.dtr = False
+
+        serial_obj.rts = True
+        time.sleep(0.1)
+        serial_obj.rts = False
+    except OSError:
+        return
+    time.sleep(1.0)  # let the boot sequence actually finish, see above
+    serial_obj.reset_input_buffer()
+
+
 def _enter_raw_repl(serial_obj: Any, timeout: float) -> None:
     serial_obj.write(b"\r\x03")  # ctrl-C: interrupt any running program
 

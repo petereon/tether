@@ -6,6 +6,7 @@ from tether.transports.serial import (
     discover,
     push_raw_repl,
     read_file,
+    reset_board,
     write_file,
     write_files,
 )
@@ -82,6 +83,83 @@ def test_discover_raises_when_multiple_known_devices_found():
 
     with pytest.raises(RawReplError, match="multiple"):
         discover(list_ports_fn=fake_list_ports)
+
+
+class _FakeResettableSerial:
+    """Records RTS/DTR transitions - reset_board() drives a two-pulse
+    sequence (bootloader entry via DTR+RTS, then a normal-boot RTS-only
+    pulse) found necessary against real hardware: an RTS-only pulse alone
+    does not reliably interrupt a program that's actively running right
+    now (see reset_board's own docstring for the full story).
+    """
+
+    def __init__(self):
+        self.rts_history: list[bool] = []
+        self.dtr_history: list[bool] = []
+        self._rts = False
+        self._dtr = False
+        self.reset_input_buffer_called = False
+
+    @property
+    def rts(self) -> bool:
+        return self._rts
+
+    @rts.setter
+    def rts(self, value: bool) -> None:
+        self._rts = value
+        self.rts_history.append(value)
+
+    @property
+    def dtr(self) -> bool:
+        return self._dtr
+
+    @dtr.setter
+    def dtr(self, value: bool) -> None:
+        self._dtr = value
+        self.dtr_history.append(value)
+
+    def reset_input_buffer(self) -> None:
+        self.reset_input_buffer_called = True
+
+
+def test_reset_board_pulses_into_bootloader_then_boots_normally(monkeypatch):
+    # No need for reset_board's real ~1.3s of settle time in a unit test -
+    # only the pin-toggle sequence itself is under test here.
+    monkeypatch.setattr("tether.transports.serial.time.sleep", lambda seconds: None)
+    fake = _FakeResettableSerial()
+
+    reset_board(fake)
+
+    # Bootloader-entry pulse: DTR low then high while RTS pulses low then
+    # high (GPIO0 held low during the reset pulse), then DTR released -
+    # matches esptool's ClassicReset shape.
+    assert fake.dtr_history == [False, True, False]
+    # Two RTS pulses total: the bootloader-entry one above, plus the
+    # trailing RTS-only pulse that boots normally out of the bootloader.
+    assert fake.rts_history == [True, False, True, False]
+    assert fake.reset_input_buffer_called is True
+
+
+def test_reset_board_degrades_gracefully_when_rts_is_unsupported():
+    # Matches esptool's own precedent (reset.py's ResetStrategy.__call__):
+    # some serial adapters/platforms don't expose RTS/DTR control at all.
+    # A connect() attempt on such an adapter shouldn't hard-fail just
+    # because this best-effort robustness step isn't available - the
+    # subsequent raw-REPL work still gets its own clear timeout error if
+    # the board genuinely wasn't in a usable state.
+    class _NoRtsSerial:
+        @property
+        def rts(self) -> bool:
+            raise OSError("Setting RTS/DTR lines is not supported")
+
+        @rts.setter
+        def rts(self, value: bool) -> None:
+            raise OSError("Setting RTS/DTR lines is not supported")
+
+        def reset_input_buffer(self) -> None:
+            pass
+
+    reset_board(_NoRtsSerial())  # must not raise
 
 
 def test_push_raw_repl_sends_code_and_enters_exits_raw_repl():

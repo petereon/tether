@@ -211,12 +211,21 @@ class MockTransport:
 
         for name in sliced.exported_names:
             spec = namespace[name].__tether_export__
+            # spec.func, not namespace[name]: @mcu.export's decorator
+            # (decorators.py) now returns a PC-side dispatch wrapper that
+            # routes through the ambient "current board" - registering
+            # THAT as the mock "device"'s own handler would be wrong (it
+            # would try to look up a board from inside the simulated
+            # device's own call, not run the real function body). spec.func
+            # is the original, undecorated callable - exactly what a real
+            # device would actually run for this handler.
+            handler = spec.func
             if spec.interval_ms is not None:
-                dispatcher.register_loop(namespace[name], spec.interval_ms)
+                dispatcher.register_loop(handler, spec.interval_ms)
                 continue
             heartbeat_ms = (
                 int(spec.heartbeat_interval * 1000)
                 if spec.heartbeat_interval is not None
                 else default_heartbeat_ms
             )
-            dispatcher.register(name, namespace[name], heartbeat_interval_ms=heartbeat_ms)
+            dispatcher.register(name, handler, heartbeat_interval_ms=heartbeat_ms)

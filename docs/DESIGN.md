@@ -124,18 +124,60 @@ At `connect()` time:
   frame type. A function that blocks synchronously (no `await` points) gets
   no heartbeat — an accurate reflection of the board being genuinely
   unresponsive during that window.
+- **Ctrl-C is disabled on-device** (`micropython.kbd_intr(-1)`, set before
+  the dispatch loop starts reading any protocol bytes) — added 2026-07-25
+  after real-hardware testing (not the CPython/PTY simulation this was
+  originally checked with) showed MicroPython intercepts a raw `0x03` byte
+  as a keyboard interrupt even when it's just a data byte inside a running
+  program's own stdin stream, not a terminal-level signal. msgpack encodes
+  small integers as their own literal byte value, so any call argument that
+  happens to produce `0x03` (e.g. the integer `3`) would otherwise kill the
+  dispatch loop from the inside. This is why a stuck board can no longer be
+  recovered via Ctrl-C alone — see § Transports' Serial row for the
+  hardware-reset consequence.
 
 ## Transports
 
 | Transport | Discovery | Upload | Notes |
 |---|---|---|---|
-| Serial | `"serial:auto"` (USB VID/PID scan) or explicit port | Raw-REPL push | Primary/first transport, always code-push capable |
+| Serial | `"serial:auto"` (USB VID/PID scan) or explicit port | Raw-REPL push | Primary/first transport, always code-push capable. Every connect (including reconnect) hardware-resets the board first (RTS/DTR toggle, ~1.3s) - added 2026-07-25 after real-hardware testing showed Ctrl-C alone can no longer recover a board already running a previous connect()'s dispatch loop, once `micropython.kbd_intr(-1)` is active on-device (see § Wire protocol). Harmless on an already-idle board. |
 | Wifi | `"wifi:<ip>"` | Not supported directly — board must already run a bootstrapped runtime | Pure stdlib `socket` on PC side |
 | BLE | `"ble:<addr>"` | Same bootstrap requirement as wifi | Custom GATT service (one write characteristic, one notify characteristic); frame chunking/reassembly handled transparently in the transport adapter (BLE MTU is small) |
 
 Multiple boards are supported concurrently — `connect()` returns a handle,
 decorated functions are accessed as attributes on that handle
 (`board.read_temp()`), never as ambiguous global calls.
+
+**Amendment (2026-07-25):** decorated functions are now *also* directly
+callable by name (`read_temp()`, no `board.` prefix) - this doesn't
+contradict the "never as ambiguous global calls" line above, it resolves
+the ambiguity differently. `connect()` sets itself as the ambient "current
+board" (a `contextvars.ContextVar`, thread/task-safe - the same mechanism
+`asyncio`/`decimal` use for this kind of state), so a directly-called
+export dispatches through whichever board is ambient. For the common
+single-board case this needs zero extra syntax - the original design's own
+goal ("calling a local one" - see this section's opening pitch) applies
+more literally than `board.read_temp()` ever did. Multi-board
+disambiguation is still fully supported, just via an explicit `with
+board:` scope instead of always requiring the attribute form:
+```python
+with board_a:
+    read_temp()  # -> board_a
+with board_b:
+    read_temp()  # -> board_b
+```
+`board.read_temp()` still works unchanged (explicit, bypasses the ambient
+lookup) - this was purely additive, not a breaking change, driven by
+wanting PC-side calling code to read like normal Python with no
+boundary-awareness at the call site, outside the decorators themselves.
+A reentrant `@pc.export` handler (running because some board's MCU called
+it) sees *that* board as ambient for any further ambient calls it makes
+itself, not whatever's ambient on the connecting/main thread - contextvars
+don't propagate across `Dispatcher`'s worker-thread pool on their own
+(confirmed empirically, not assumed - neither plain `threading.Thread` nor
+`concurrent.futures.ThreadPoolExecutor` copy a calling thread's context by
+default), so `Dispatcher` sets the ambient board fresh, per handled call,
+to the board it itself belongs to.
 
 ## Disconnection
 

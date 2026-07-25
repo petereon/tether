@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from tether._context import current_board
 from tether.dispatch import DEFAULT_TIMEOUT, Dispatcher
 from tether.errors import ProtocolVersionError
 from tether.slicer import generate_pc_stubs, slice_mcu_bound
@@ -83,9 +85,19 @@ _tether_asyncio.run(_tether_main())
 
 
 class BoardHandle:
-    """Returned by `connect()`. Decorated `@mcu.export` functions are exposed
-    as bound attributes here — never as ambiguous global calls (DESIGN.md,
-    multi-board routing).
+    """Returned by `connect()`. Decorated `@mcu.export` functions are
+    directly callable (`read_temp()`) and dispatch through whichever board
+    is ambient (see tether/_context.py) - `connect()` sets itself as the
+    ambient default, covering the common single-board case with zero extra
+    ceremony. They're also exposed as bound attributes here
+    (`board.read_temp()`) - explicit, bypasses the ambient lookup entirely,
+    useful for one-off calls or when it's clearer to name the board
+    directly. Both call the same underlying dispatch.
+
+    `with board:` scopes `board` as the ambient default for the block -
+    the multi-board disambiguation story (DESIGN.md): connecting a second
+    board would otherwise silently shift the ambient default away from the
+    first.
     """
 
     def __init__(
@@ -96,10 +108,43 @@ class BoardHandle:
         dial: Callable[[], Dispatcher],
     ) -> None:
         self._dispatcher = dispatcher
+        # Lets the dispatcher make `self` the ambient board (tether/_context.py)
+        # for the duration of handling an incoming call - see Dispatcher.board's
+        # own comment (tether/dispatch/__init__.py). Every _connect_*()
+        # function's own dial() closure already passes `board` into
+        # _start_and_handshake()/sets dispatcher.board directly BEFORE
+        # dispatcher.start() runs (closing the real gap: a reconnected
+        # device may already be running @mcu.loop tasks that call back
+        # immediately) - this assignment only still matters for dial()'s
+        # very first-ever call, when no BoardHandle exists yet for the
+        # closure variable to hold. Real devices don't send unsolicited
+        # calls before the PC's own handshake completes, so that remaining
+        # window isn't reachable in practice - kept for correctness, not
+        # because it's been hit.
+        dispatcher.board = self
         self._export_specs = export_specs
         # Re-runs the same connect flow (transport-specific) to produce a
         # fresh Dispatcher, for reconnect() below.
         self._dial = dial
+        # Per-thread stack of context tokens (threading.local, not a plain
+        # list) so `with board:` is correct both for nesting (LIFO within
+        # one thread) and for the same BoardHandle being entered
+        # concurrently from different threads (tether.dispatch.Dispatcher
+        # hands reentrant incoming calls to a worker pool) - a shared list
+        # would let one thread's __exit__ pop a token that belongs to a
+        # different thread's __enter__.
+        self._context_tokens = threading.local()
+
+    def __enter__(self) -> BoardHandle:  # noqa: PYI034 - `Self` needs Python 3.11+, project floor is 3.10
+        stack = getattr(self._context_tokens, "stack", None)
+        if stack is None:
+            stack = []
+            self._context_tokens.stack = stack
+        stack.append(current_board.set(self))
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        current_board.reset(self._context_tokens.stack.pop())
 
     def reconnect(self) -> None:
         """Explicit re-attach after MCUDisconnectedError. Never automatic
@@ -112,7 +157,14 @@ class BoardHandle:
         closures - no need to re-fetch `board.<name>` after reconnecting.
         """
         old_dispatcher = self._dispatcher
+        # self._dial() already sets the new dispatcher's .board correctly
+        # (the closure variable it reads was updated to `self` back when
+        # this BoardHandle was first constructed) - this reconnect() call
+        # is exactly the case that mattered: unlike a fresh connect(), the
+        # device here may already be running @mcu.loop tasks that call
+        # back immediately, before this line would otherwise run.
         self._dispatcher = self._dial()
+        self._dispatcher.board = self  # belt-and-suspenders; see __init__'s comment
         # The old dispatcher's reader thread has no way to be interrupted
         # mid blocking-read (Dispatcher doesn't own the transport's own
         # close()) - it stays blocked until the process exits, same
@@ -187,6 +239,7 @@ def _start_and_handshake(
     timeout: float,
     mismatch_hint: str,
     pc_handlers: dict[str, Callable[..., Any]],
+    board: BoardHandle | None,
 ) -> Dispatcher:
     """Start a Dispatcher over an already-connected stream and perform the
     protocol-version handshake - shared by every transport's dial() closure
@@ -201,8 +254,15 @@ def _start_and_handshake(
     race with the reader thread either way, but doing it first keeps the
     "fully ready before this dispatcher does anything" ordering simple to
     reason about.
+
+    `board`: the owning BoardHandle if it already exists (reconnect()'s
+    dial() calls pass it), `None` on a fresh connect()'s very first dial()
+    call (BoardHandle can't exist before its own constructor has run at
+    least once) - see _connect_mock's matching comment for why closing this
+    gap for reconnect() specifically matters.
     """
     dispatcher = Dispatcher(stream, stream)
+    dispatcher.board = board
     for name, handler in pc_handlers.items():
         dispatcher.register(name, handler)
     dispatcher.start()
@@ -224,6 +284,18 @@ def _connect_mock(
 ) -> BoardHandle:
     from tether.transports.mock import MockTransport
 
+    # Read by dial() below, assigned once the BoardHandle exists - `None`
+    # only for dial()'s very first-ever call (BoardHandle can't exist
+    # before its own constructor has run at least once). Closing this gap
+    # for reconnect() specifically matters: unlike the first connect(), a
+    # reconnected device may already be running @mcu.loop background tasks
+    # that call back immediately, before BoardHandle.__init__'s own
+    # post-hoc `dispatcher.board = self` (connection.py) would otherwise
+    # run - setting it here, inside dial() itself and before
+    # dispatcher.start(), closes that window instead of just documenting
+    # it as unreachable.
+    board: BoardHandle | None = None
+
     def dial() -> Dispatcher:
         # A fresh MockTransport per dial (including on reconnect) - each
         # instance owns its own thread/event loop/queues (see mock.py), so
@@ -232,12 +304,14 @@ def _connect_mock(
         transport = MockTransport(source, base_dir=base_dir)
         reader, writer = transport.start()
         dispatcher = Dispatcher(reader, writer)
+        dispatcher.board = board
         for name, handler in pc_handlers.items():
             dispatcher.register(name, handler)
         dispatcher.start()
         return dispatcher
 
-    return BoardHandle(dial(), export_specs, dial=dial)
+    board = BoardHandle(dial(), export_specs, dial=dial)
+    return board
 
 
 def _upload_if_needed(
@@ -289,6 +363,12 @@ def _connect_serial(
     *,
     timeout: float = 10.0,
 ) -> BoardHandle:
+    # See _connect_mock's matching comment: None only for dial()'s very
+    # first-ever call, assigned once the BoardHandle exists so subsequent
+    # dial() calls (from reconnect()) can pass it into
+    # _start_and_handshake before dispatcher.start() runs.
+    board: BoardHandle | None = None
+
     def dial() -> Dispatcher:
         """One full connect-or-reconnect attempt: rediscover the port (if
         "auto"), upload-if-needed, restart the app fresh, handshake. Called
@@ -335,6 +415,16 @@ def _connect_serial(
         # any normal idle period with no in-flight calls.
         ser = pyserial.Serial(port, baudrate=115200, timeout=1.0)
         try:
+            # Hardware-reset before any raw-REPL interaction, every time -
+            # found against real hardware: a board already running a
+            # PREVIOUS connect()'s dispatch loop can no longer be recovered
+            # via Ctrl-C alone once micropython.kbd_intr(-1) is active
+            # on-device and push_raw_repl's wait=False stopped sending the
+            # raw-REPL exit sequence (see reset_board's own docstring for
+            # the full mechanism). Harmless on a board that's already idle -
+            # just reboots it again into the same ready state.
+            serial_transport.reset_board(ser)
+
             # All raw-REPL work happens BEFORE the Dispatcher's reader
             # thread ever starts - the two must never run concurrently
             # against the same serial connection, or they'd race each other
@@ -362,6 +452,7 @@ def _connect_serial(
                 timeout=timeout,
                 mismatch_hint="re-upload by clearing /.tether_hash on the device, or update tether",
                 pc_handlers=pc_handlers,
+                board=board,
             )
         except BaseException:
             # No Dispatcher.stop() exists yet (chunk 7's known limitation) -
@@ -377,7 +468,8 @@ def _connect_serial(
 
         return dispatcher
 
-    return BoardHandle(dial(), export_specs, dial=dial)
+    board = BoardHandle(dial(), export_specs, dial=dial)
+    return board
 
 
 def _connect_wifi(
@@ -397,6 +489,8 @@ def _connect_wifi(
 
     host, _, port_str = rest.partition(":")
     port = int(port_str) if port_str else wifi_transport.DEFAULT_PORT
+    # See _connect_mock's matching comment.
+    board: BoardHandle | None = None
 
     def dial() -> Dispatcher:
         stream = wifi_transport.connect(host, port, timeout=timeout)
@@ -406,6 +500,7 @@ def _connect_wifi(
                 timeout=timeout,
                 mismatch_hint="update tether or the on-device runtime",
                 pc_handlers=pc_handlers,
+                board=board,
             )
         except BaseException:
             # Matches _connect_serial's dial(): a failed handshake (wrong
@@ -415,7 +510,8 @@ def _connect_wifi(
             stream.close()
             raise
 
-    return BoardHandle(dial(), export_specs, dial=dial)
+    board = BoardHandle(dial(), export_specs, dial=dial)
+    return board
 
 
 def _connect_ble(
@@ -431,6 +527,9 @@ def _connect_ble(
     """
     from tether.transports import ble as ble_transport
 
+    # See _connect_mock's matching comment.
+    board: BoardHandle | None = None
+
     def dial() -> Dispatcher:
         stream = ble_transport.connect(rest, timeout=timeout)
         try:
@@ -439,6 +538,7 @@ def _connect_ble(
                 timeout=timeout,
                 mismatch_hint="update tether or the on-device runtime",
                 pc_handlers=pc_handlers,
+                board=board,
             )
         except BaseException:
             # Matches _connect_serial/_connect_wifi's dial(): a failed
@@ -446,7 +546,8 @@ def _connect_ble(
             stream.close()
             raise
 
-    return BoardHandle(dial(), export_specs, dial=dial)
+    board = BoardHandle(dial(), export_specs, dial=dial)
+    return board
 
 
 def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
@@ -463,14 +564,13 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
     source, base_dir, export_specs, pc_handlers = _capture_caller()
 
     if scheme == "mock":
-        return _connect_mock(source, base_dir, export_specs, pc_handlers)
-
-    if scheme == "serial":
+        board = _connect_mock(source, base_dir, export_specs, pc_handlers)
+    elif scheme == "serial":
         sliced = slice_mcu_bound(source, base_dir=base_dir)
         stubs = generate_pc_stubs(source)
         bootstrap = generate_bootstrap(sliced.source, stubs.source)
         port_spec = rest.removeprefix("//")
-        return _connect_serial(
+        board = _connect_serial(
             port_spec,
             bootstrap,
             export_specs,
@@ -478,11 +578,17 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
             pc_handlers,
             timeout=timeout,
         )
+    elif scheme == "wifi":
+        board = _connect_wifi(rest, export_specs, pc_handlers, timeout=timeout)
+    elif scheme == "ble":
+        board = _connect_ble(rest, export_specs, pc_handlers, timeout=timeout)
+    else:
+        raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")
 
-    if scheme == "wifi":
-        return _connect_wifi(rest, export_specs, pc_handlers, timeout=timeout)
-
-    if scheme == "ble":
-        return _connect_ble(rest, export_specs, pc_handlers, timeout=timeout)
-
-    raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")
+    # Most-recently-connected board becomes the ambient default for
+    # directly-callable @mcu.export functions (decorators.py) - a plain
+    # `read_temp()` after this just works for the common single-board
+    # case, with `with board:` (BoardHandle.__enter__/__exit__ below)
+    # available to disambiguate when more than one board is connected.
+    current_board.set(board)
+    return board

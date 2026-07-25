@@ -22,6 +22,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from tether._context import current_board
 from tether.errors import MCUDisconnectedError, MCUTimeoutError, RemoteError
 from tether.marshalling import FrameDecoder, encode_frame
 
@@ -93,6 +94,21 @@ class Dispatcher:
         self._write_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._reader_thread = threading.Thread(target=self._run_reader, daemon=True)
+        # Set by connection.py right after constructing the owning
+        # BoardHandle (a plain post-construction assignment - Dispatcher
+        # can't take it as a constructor arg without tether.dispatch
+        # depending on tether.connection, which already depends on
+        # tether.dispatch). Used by _handle_call below to make this board
+        # the ambient "current board" (tether/_context.py) for the
+        # duration of handling an incoming call, so a @pc.export handler
+        # that itself makes an ambient @mcu.export call resolves to
+        # whichever board actually triggered it - not whatever's ambient
+        # on the connecting/main thread, which contextvars wouldn't see on
+        # this worker thread anyway (confirmed empirically: neither plain
+        # threading.Thread nor ThreadPoolExecutor propagate a calling
+        # thread's context to the thread that runs the work, unlike
+        # asyncio.Task).
+        self.board: Any = None
         # Set once the reader thread observes the transport is gone - lets
         # any *subsequent* call_mcu() fail immediately instead of writing
         # into a dead transport and waiting out a full timeout for a
@@ -246,7 +262,7 @@ class Dispatcher:
             return
         handler, heartbeat_interval = entry
 
-        with self._heartbeat_ticking(req_id, heartbeat_interval):
+        with self._board_scoped(), self._heartbeat_ticking(req_id, heartbeat_interval):
             try:
                 result = handler(*args)
             except Exception as exc:  # noqa: BLE001 - any handler exception must become MSG_ERROR
@@ -254,6 +270,17 @@ class Dispatcher:
                 self._send_error(req_id, type(exc).__name__, str(exc), tb)
                 return
         self._send(MSG_RESULT, {"id": req_id, "value": result})
+
+    @contextlib.contextmanager
+    def _board_scoped(self):
+        # This dispatcher's board becomes the ambient "current board"
+        # (tether/_context.py) for the duration of running the handler -
+        # see self.board's own comment in __init__.
+        token = current_board.set(self.board)
+        try:
+            yield
+        finally:
+            current_board.reset(token)
 
     @contextlib.contextmanager
     def _heartbeat_ticking(self, req_id: int, interval: float | None):
