@@ -107,6 +107,22 @@ try:
     if _provisioned:
         _deadline = time.ticks_add(time.ticks_ms(), 8000)
         while not _wlan.isconnected() and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
+            # WLAN.status() and its numeric codes are ESP32-specific, not
+            # part of MicroPython's portable network.WLAN API - only
+            # isconnected() is portable. Where status() is available it
+            # reaches a terminal value (anything other than "idle"/1000 or
+            # "connecting"/1001) as soon as the outcome - success or
+            # failure - is decided, well before isconnected() would time
+            # out waiting the full deadline. isconnected() stays the
+            # ground truth reported below either way; status() is only
+            # used to stop polling early. If .status() doesn't exist or
+            # raises, fall back to the plain isconnected()-only wait.
+            try:
+                _st = _wlan.status()
+                if _st < 1000 or _st > 1001:
+                    break
+            except Exception:
+                pass
             time.sleep_ms(200)
     _connected = _wlan.isconnected()
     _ip = _wlan.ifconfig()[0] if _connected else None

@@ -176,6 +176,84 @@ print("_calls: " + str(_FakeWLAN._calls))
 
 
 @requires_micropython
+def test_status_script_exits_early_via_status_code_instead_of_waiting_full_deadline():
+    # Real-hardware finding (ESP32, network "Culo"): network.WLAN.status()
+    # returns numeric state codes during connection - STAT_CONNECTING
+    # (1001) while still associating, STAT_GOT_IP (1010) on success. Once
+    # status() leaves the "in progress" range (1000 STAT_IDLE / 1001
+    # STAT_CONNECTING), the outcome (success or failure) is already
+    # decided - there's no reason to keep polling out the full 8s/200ms
+    # deadline. This fakes a WLAN whose status() reports "connecting" for
+    # the first couple of calls then flips to "got IP", with isconnected()
+    # (the ground truth reported in the final JSON) catching up by the
+    # time of the post-loop check - and asserts the loop exits after only
+    # a handful of iterations, not the ~40 an 8000ms/200ms deadline would
+    # produce. Against the pre-fix STATUS_SCRIPT (status()-blind) this
+    # fails: isconnected() never becomes true (nothing ever increments the
+    # fake's internal stage without status() being polled), so it waits
+    # out the whole 8s deadline and still reports connected: false.
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    _calls = 0
+    _status_calls = 0
+    def __init__(self, *a):
+        pass
+    def isconnected(self):
+        _FakeWLAN._calls += 1
+        return _FakeWLAN._status_calls >= 3
+    def status(self):
+        _FakeWLAN._status_calls += 1
+        return 1001 if _FakeWLAN._status_calls < 3 else 1010
+    def ifconfig(self):
+        return ("10.0.0.7", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    STAT_IDLE = 1000
+    STAT_CONNECTING = 1001
+    STAT_GOT_IP = 1010
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+# Fake uos.listdir to include tether_wifi.json (provisioned board)
+import uos as _real_uos
+class _FakeUos:
+    def listdir(self, path):
+        result = list(_real_uos.listdir(path))
+        if "tether_wifi.json" not in result:
+            result.append("tether_wifi.json")
+        return result
+
+_fake_uos = _FakeUos()
+_sys.modules["uos"] = _fake_uos
+
+{STATUS_SCRIPT.decode()}
+
+print("_calls: " + str(_FakeWLAN._calls))
+"""
+    stdout = run_micropython(script, timeout=12.0)
+    lines = stdout.strip().split("\n")
+    call_count_line = lines[-1]
+    status_line = lines[-2]
+
+    call_count = int(call_count_line.split(": ")[1])
+    info = json.loads(status_line)
+
+    # An 8000ms/200ms deadline would call isconnected() ~40 times; exiting
+    # via the status-code fast path should keep this in the single digits.
+    assert call_count <= 6, (
+        f"Expected isconnected() to be called at most 6 times (fast exit via "
+        f"status()), but was called {call_count} times (indicates it waited "
+        f"through the full poll loop)"
+    )
+    assert info["connected"] is True
+    assert info["ip"] == "10.0.0.7"
+
+
+@requires_micropython
 def test_boot_py_bridges_a_real_socket_into_the_dispatch_loop():
     # Fakes `network` (no real wifi under the unix port) and monkeypatches
     # the listen port to something unlikely to collide, then runs the
