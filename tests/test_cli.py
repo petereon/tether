@@ -146,7 +146,13 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
-    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
 
     prompted = {}
 
@@ -162,6 +168,9 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert prompted["secure"] is True
+    # The prompted value must actually be the one written to the device -
+    # not just that beaupy.prompt was called with the right arguments.
+    assert b"prompted-password" in written["/tether_wifi.json"]
 
 
 def test_status_command_reports_connected_with_ip(monkeypatch):

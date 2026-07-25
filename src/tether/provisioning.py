@@ -86,15 +86,29 @@ if _cfg is not None:
                     }},
                 )
             except (OSError, EOFError):
-                pass
+                print(
+                    "tether: wifi client disconnected - boot.py exiting "
+                    "(reset or re-provision for a new connection)"
+                )
+            finally:
+                try:
+                    _conn.close()
+                except OSError:
+                    pass
 """
 
 # Run via serial.run_python() by the CLI's `status` command. Structured
 # output (one JSON line) rather than freeform prints - robust to parse on
 # the PC side, no fragile string matching.
 STATUS_SCRIPT = b"""\
-import ujson as _json
-import uos as _uos
+try:
+    import ujson as _json
+except ImportError:
+    import json as _json
+try:
+    import uos as _uos
+except ImportError:
+    import os as _uos
 
 _provisioned = "tether_wifi.json" in _uos.listdir("/")
 _connected = False
@@ -105,24 +119,29 @@ try:
 
     _wlan = network.WLAN(network.STA_IF)
     if _provisioned:
+        # WLAN.status() and its numeric codes are ESP32-specific, not part
+        # of MicroPython's portable network.WLAN API - only isconnected()
+        # is portable. Only attempt the status()-based fast-exit when the
+        # named STAT_IDLE/STAT_CONNECTING constants actually exist on this
+        # port - guessing a numeric "in progress" range (e.g. 1000/1001)
+        # would misfire on a port with a different scheme (falsely
+        # treating an in-progress state as terminal and reporting "not
+        # connected" too early, the exact bug this poll exists to avoid).
+        # If either constant is missing, skip the fast-exit and fall back
+        # to the plain isconnected()-only wait for the full deadline.
+        # isconnected() stays the ground truth reported below either way;
+        # status() (when usable) only decides when to stop polling early.
+        _idle = getattr(network, "STAT_IDLE", None)
+        _connecting = getattr(network, "STAT_CONNECTING", None)
         _deadline = time.ticks_add(time.ticks_ms(), 8000)
         while not _wlan.isconnected() and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
-            # WLAN.status() and its numeric codes are ESP32-specific, not
-            # part of MicroPython's portable network.WLAN API - only
-            # isconnected() is portable. Where status() is available it
-            # reaches a terminal value (anything other than "idle"/1000 or
-            # "connecting"/1001) as soon as the outcome - success or
-            # failure - is decided, well before isconnected() would time
-            # out waiting the full deadline. isconnected() stays the
-            # ground truth reported below either way; status() is only
-            # used to stop polling early. If .status() doesn't exist or
-            # raises, fall back to the plain isconnected()-only wait.
-            try:
-                _st = _wlan.status()
-                if _st < 1000 or _st > 1001:
-                    break
-            except Exception:
-                pass
+            if _idle is not None and _connecting is not None:
+                try:
+                    _st = _wlan.status()
+                    if _st != _idle and _st != _connecting:
+                        break
+                except Exception:
+                    pass
             time.sleep_ms(200)
     _connected = _wlan.isconnected()
     _ip = _wlan.ifconfig()[0] if _connected else None

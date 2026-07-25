@@ -8,7 +8,36 @@ docs/superpowers/specs/2026-07-25-wifi-upload-design.md for the design.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
 import click
+
+
+@contextmanager
+def _open_board(port: str) -> Iterator[Any]:
+    """Open a serial connection to the board for the duration of the
+    `with` block, translating connection and raw-REPL failures into a
+    clean click.ClickException instead of a raw traceback - the common
+    first-run failures (port busy, permission denied, board unplugged
+    mid-operation, board that won't enter raw REPL) all had no CLI-level
+    handling before this helper existed.
+    """
+    import serial as pyserial
+
+    from tether.transports.serial import RawReplError
+
+    try:
+        ser = pyserial.Serial(port, baudrate=115200, timeout=1.0)
+    except pyserial.SerialException as exc:
+        raise click.ClickException(f"could not open {port}: {exc}") from None
+    try:
+        yield ser
+    except (pyserial.SerialException, RawReplError) as exc:
+        raise click.ClickException(f"communication with {port} failed: {exc}") from None
+    finally:
+        ser.close()
 
 
 def _resolve_port(port: str | None) -> str:
@@ -62,9 +91,13 @@ def devices_command() -> None:
 def provision_wifi_command(port: str | None, ssid: str, password: str | None) -> None:
     """Upload a boot.py that auto-connects to WiFi and makes the board
     reachable over tether's wifi transport on every boot.
+
+    Note: this uploads boot.py + wifi credentials only - the program that
+    actually runs when a wifi client connects (tether_app.py) is uploaded
+    separately by a normal serial `mcu.connect(...)` session. Run that at
+    least once, over serial, before connecting to this board over wifi.
     """
     import beaupy
-    import serial as pyserial
 
     from tether import provisioning
     from tether.transports import serial as serial_transport
@@ -75,13 +108,10 @@ def provision_wifi_command(port: str | None, ssid: str, password: str | None) ->
 
     files = provisioning.generate_wifi_boot(ssid, password)
 
-    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
-    try:
+    with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
         serial_transport.write_files(ser, files)
         serial_transport.reset_board(ser)
-    finally:
-        ser.close()
 
     click.echo(f"Provisioned {resolved_port} for wifi network {ssid!r}. Board is restarting.")
     click.echo("Run `tether status` in a few seconds to check connectivity.")
@@ -93,27 +123,27 @@ def status_command(port: str | None) -> None:
     """Check whether a board is wifi-provisioned and currently connected."""
     import json
 
-    import serial as pyserial
-
     from tether import provisioning
     from tether.transports import serial as serial_transport
 
     resolved_port = _resolve_port(port)
-    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
-    try:
+    with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
         stdout, stderr = serial_transport.run_python(ser, provisioning.STATUS_SCRIPT, timeout=10.0)
-    finally:
-        ser.close()
 
     if stderr:
         raise click.ClickException(f"status check failed: {stderr.decode(errors='replace')}")
 
-    info = json.loads(stdout.decode().strip())
-    if not info["provisioned"]:
+    try:
+        info = json.loads(stdout.decode(errors="replace").strip())
+        provisioned, connected, ip = info["provisioned"], info["connected"], info["ip"]
+    except (json.JSONDecodeError, KeyError) as exc:
+        raise click.ClickException(f"could not parse status response: {exc}") from None
+
+    if not provisioned:
         click.echo("Not provisioned for wifi. Run `tether provision-wifi` first.")
-    elif info["connected"]:
-        click.echo(f"Provisioned and connected. IP: {info['ip']}")
+    elif connected:
+        click.echo(f"Provisioned and connected. IP: {ip}")
     else:
         click.echo("Provisioned but not currently connected to wifi.")
 
@@ -121,9 +151,14 @@ def status_command(port: str | None) -> None:
 @main.command("unprovision-wifi")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 def unprovision_wifi_command(port: str | None) -> None:
-    """Remove stored WiFi credentials from a board."""
+    """Remove stored WiFi credentials from a board.
+
+    Note: this only removes /tether_wifi.json - the auto-run boot.py
+    itself is left in place (harmless without credentials: it does
+    nothing and falls through to the idle REPL, same as a never-
+    provisioned board). Re-run `provision-wifi` to provision again.
+    """
     import beaupy
-    import serial as pyserial
 
     from tether.transports import serial as serial_transport
 
@@ -132,12 +167,9 @@ def unprovision_wifi_command(port: str | None) -> None:
         click.echo("Cancelled.")
         return
 
-    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
-    try:
+    with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
         serial_transport.remove_file(ser, "/tether_wifi.json")
-    finally:
-        ser.close()
 
     click.echo(f"Removed wifi credentials from {resolved_port}.")
 

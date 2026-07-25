@@ -443,7 +443,14 @@ def test_remove_file_does_not_raise_when_file_is_already_gone():
     # uos.remove() raises OSError for a missing file - remove_file must
     # swallow that (matches ensure_dir's existing try/except OSError
     # pattern for mkdir), since "already removed" and "just removed it"
-    # should look the same to the caller.
-    fake = _FakeMicroPythonSerial(stderr=b"")  # device-side try/except means stderr stays empty
+    # should look the same to the caller. The fake always returns empty
+    # stderr regardless of what's sent, so it can't simulate the device
+    # actually raising OSError - the real guarantee this test protects is
+    # that remove_file's generated script itself contains the swallow, not
+    # just that this particular fake happens not to raise.
+    fake = _FakeMicroPythonSerial(stderr=b"")
 
     remove_file(fake, "/tether_wifi.json")  # must not raise
+
+    sent = bytes(fake.written).decode()
+    assert "except OSError" in sent

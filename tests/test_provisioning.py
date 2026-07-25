@@ -254,6 +254,69 @@ print("_calls: " + str(_FakeWLAN._calls))
 
 
 @requires_micropython
+def test_status_script_skips_fast_exit_when_status_code_scheme_is_unknown():
+    # Guards against reintroducing the exact bug the fast-exit fixes: a
+    # board whose network module has a *different* status() numeric scheme
+    # (e.g. rp2/Pico W's STAT_LINK_DOWN/STAT_LINK_JOIN/STAT_LINK_UP/etc,
+    # not ESP32's STAT_IDLE/STAT_CONNECTING) must not have the fast-exit
+    # misinterpret an in-progress code as terminal and report "not
+    # connected" before the connection actually finishes. This fakes a
+    # WLAN with a status() that returns rp2-style codes (1 = "joining",
+    # unrelated to ESP32's 1000/1001) and no STAT_IDLE/STAT_CONNECTING
+    # attributes on the network module at all - since neither named
+    # constant exists, the fast-exit must not activate, and the script
+    # must fall back to the plain isconnected()-only wait until it
+    # actually becomes true.
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    _calls = 0
+    def __init__(self, *a):
+        pass
+    def isconnected(self):
+        _FakeWLAN._calls += 1
+        return _FakeWLAN._calls > 3
+    def status(self):
+        # rp2-style STAT_LINK_JOIN == 1 - numerically inside ESP32's old
+        # hardcoded 1000/1001 "in progress" range check would have been
+        # (wrongly) treated as terminal by a naive `< 1000 or > 1001` test.
+        return 1
+    def ifconfig(self):
+        return ("10.0.0.9", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    STAT_LINK_JOIN = 1
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+# Fake uos.listdir to include tether_wifi.json (provisioned board)
+import uos as _real_uos
+class _FakeUos:
+    def listdir(self, path):
+        result = list(_real_uos.listdir(path))
+        if "tether_wifi.json" not in result:
+            result.append("tether_wifi.json")
+        return result
+
+_fake_uos = _FakeUos()
+_sys.modules["uos"] = _fake_uos
+
+{STATUS_SCRIPT.decode()}
+"""
+    stdout = run_micropython(script, timeout=10.0)
+    info = json.loads(stdout.strip())
+
+    # Must still reach "connected" via the plain isconnected() poll - not
+    # exit early/misreport "not connected" just because status() returned
+    # a value outside ESP32's numeric range.
+    assert info["connected"] is True
+    assert info["ip"] == "10.0.0.9"
+
+
+@requires_micropython
 def test_boot_py_bridges_a_real_socket_into_the_dispatch_loop():
     # Fakes `network` (no real wifi under the unix port) and monkeypatches
     # the listen port to something unlikely to collide, then runs the
