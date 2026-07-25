@@ -305,6 +305,27 @@ class SerialStream:
 
 
 def _file_write_lines(path: str, content: bytes, chunk_size: int) -> list[str]:
+    # Base64 encodes in 4-character groups. Slicing the encoded string on a
+    # boundary that isn't a multiple of 4 splits a group across two chunks;
+    # a2b_base64() on the resulting misaligned chunk raises ValueError
+    # on-device (or worse, silently misdecodes). chunk_size=512 (both public
+    # callers' default) is already a multiple of 4, so this is currently
+    # latent - but chunk_size is a public kwarg on write_file/write_files,
+    # so guard it here, the single choke point both funnel through, rather
+    # than trust every future caller to remember the constraint. Raising
+    # (matching this codebase's existing style for invalid-input-shaped
+    # errors - see slicer's unsupported-parameter-kind check and
+    # marshalling's oversized-frame check) rather than silently clamping:
+    # this is a programmer error in a value the caller explicitly chose,
+    # not an environmental condition to degrade gracefully around, so it
+    # should fail loudly and immediately instead of quietly using a
+    # different chunk size than requested.
+    if chunk_size < 4 or chunk_size % 4 != 0:
+        raise ValueError(
+            f"chunk_size must be a positive multiple of 4 (base64 encodes in "
+            f"4-character groups; a misaligned chunk_size corrupts "
+            f"a2b_base64 decoding on-device), got {chunk_size}"
+        )
     b64 = base64.b64encode(content).decode("ascii")
     lines = [f"_f = open({path!r}, 'wb')"]
     lines.extend(
@@ -358,7 +379,21 @@ def write_files(
     if not files and not dirs:
         return
     lines = ["import ubinascii as _b64", "import uos as _uos"]
-    lines.extend(f"try:\n    _uos.mkdir({d!r})\nexcept OSError:\n    pass" for d in dirs)
+    # uos.mkdir() is POSIX-style (not mkdir -p): the parent must already
+    # exist, or it raises OSError - silently swallowed below,
+    # indistinguishable from "already exists", so a child-before-parent
+    # ordering would leave the child directory never actually created and
+    # a later file write into it failing. Sort by path depth (number of
+    # `/` separators) rather than relying on plain lexicographic sort:
+    # sorting by depth guarantees parent-before-child regardless of naming,
+    # and is more obviously correct to a future reader than the incidental
+    # (if actually-correct, for any depth, given every intermediate
+    # ancestor is itself in the set) correctness of a plain string sort.
+    # Secondary key on the string itself only for deterministic output
+    # among equal-depth entries (creation order among siblings doesn't
+    # matter on-device) - makes generated scripts reproducible for tests.
+    sorted_dirs = sorted(dirs, key=lambda d: (d.count("/"), d))
+    lines.extend(f"try:\n    _uos.mkdir({d!r})\nexcept OSError:\n    pass" for d in sorted_dirs)
     for path, content in files.items():
         lines.extend(_file_write_lines(path, content, chunk_size))
     # `_f` is only ever bound if `files` was non-empty - referencing it in

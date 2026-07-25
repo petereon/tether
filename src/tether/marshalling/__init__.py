@@ -15,11 +15,21 @@ import msgpack
 _LENGTH_PREFIX = struct.Struct(">I")
 _MSG_TYPE_SIZE = 1
 
-# Bound on the msg-type+body length a length prefix may declare. Well beyond
-# any realistic v1 RPC payload (embedded/msgpack-sized calls); exists so a
+# Bound on the msg-type+body length a length prefix may declare. Exists so a
 # corrupted or hostile length field can't make FrameDecoder buffer unbounded
-# bytes before anything is validated.
-MAX_FRAME_SIZE = 1 << 20  # 1 MiB
+# bytes before anything is validated. Sized for the MCU side of this bound
+# (tether_runtime/dispatch.MAX_FRAME_SIZE, which this mirrors), not this
+# process's own memory budget: a stock ESP32-WROOM board has no PSRAM and
+# only ~100-200KB typical free heap under MicroPython, so the old 1 MiB
+# value let a single readexactly() attempt an allocation that would
+# MemoryError well before reaching the nominal cap - reachable remotely now
+# that an unauthenticated wifi transport exists (see provisioning.py). 64
+# KiB comfortably fits a stock board's free heap with headroom for the rest
+# of the runtime, while still leaving real room for legitimate payloads
+# (small file contents, lists) - see MAX_FRAME_SIZE in
+# tether_runtime/dispatch.py, which MUST be updated together with this one
+# or the two sides of the wire protocol disagree on what's rejected.
+MAX_FRAME_SIZE = 1 << 16  # 64 KiB
 
 
 def encode_frame(msg_type: int, payload: Any) -> bytes:

@@ -233,7 +233,7 @@ def _capture_caller() -> tuple[str, Path, dict[str, Any], dict[str, Callable[...
             # reaches this live callable, not just a name the slicer/stub
             # generator knew about at bundle-build time.
             pc_handlers[name] = obj
-    return path.read_text(), path.parent, export_specs, pc_handlers
+    return path.read_text(encoding="utf-8"), path.parent, export_specs, pc_handlers
 
 
 def _hash_bundle(bootstrap: str) -> str:
