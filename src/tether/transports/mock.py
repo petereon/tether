@@ -53,6 +53,21 @@ def _install_micropython_shims() -> None:
     legitimately relies on, so the real (unmodified) module runs correctly
     under CPython. Not a chunk 6 bug - chunk 6 targets real MicroPython;
     this compatibility layer belongs to the mock transport, not to it.
+
+    No teardown, by design, not oversight: both guards below
+    (`"uasyncio" not in sys.modules` / `not hasattr(sys, "print_exception")`)
+    make this function idempotent, and both installs are purely additive -
+    CPython's `sys` has no real `print_exception`, and there's no real
+    `uasyncio` package under CPython for the shim to shadow, so nothing a
+    legitimate import would resolve to is ever overwritten. That means
+    leaving both installed for the rest of the process is inert rather than
+    a correctness risk: re-running this function is a no-op, and there's no
+    real module whose behavior changes as a result of the shim staying
+    resident. Scoping install/removal to each `MockTransport`'s lifetime
+    would be more "correct" in the abstract, but isn't worth the added
+    lifecycle complexity for a process-global, additive-only, test-only
+    compatibility shim - see the module docstring's Caveats section for the
+    one collision path this doesn't cover (bare `import dispatch`).
     """
     if "uasyncio" not in sys.modules:
         shim = types.ModuleType("uasyncio")
