@@ -55,5 +55,37 @@ def devices_command() -> None:
         click.echo(device)
 
 
+@main.command("provision-wifi")
+@click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
+@click.option("--ssid", required=True, help="WiFi network name.")
+@click.option("--password", default=None, help="WiFi password (prompted if omitted).")
+def provision_wifi_command(port: str | None, ssid: str, password: str | None) -> None:
+    """Upload a boot.py that auto-connects to WiFi and makes the board
+    reachable over tether's wifi transport on every boot.
+    """
+    import beaupy
+    import serial as pyserial
+
+    from tether import provisioning
+    from tether.transports import serial as serial_transport
+
+    resolved_port = _resolve_port(port)
+    if password is None:
+        password = beaupy.prompt("WiFi password:", secure=True)
+
+    files = provisioning.generate_wifi_boot(ssid, password)
+
+    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
+    try:
+        serial_transport.reset_board(ser)
+        serial_transport.write_files(ser, files)
+        serial_transport.reset_board(ser)
+    finally:
+        ser.close()
+
+    click.echo(f"Provisioned {resolved_port} for wifi network {ssid!r}. Board is restarting.")
+    click.echo("Run `tether status` in a few seconds to check connectivity.")
+
+
 if __name__ == "__main__":
     main()
