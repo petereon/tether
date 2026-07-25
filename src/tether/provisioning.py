@@ -133,6 +133,10 @@ try:
         # status() (when usable) only decides when to stop polling early.
         _idle = getattr(network, "STAT_IDLE", None)
         _connecting = getattr(network, "STAT_CONNECTING", None)
+        # 8000ms here must stay comfortably under cli.py's status_command
+        # run_python(..., timeout=10.0) - that timeout also has to cover
+        # reset_board() and the raw-REPL round trip on top of this wait,
+        # so don't raise one without checking the other has headroom left.
         _deadline = time.ticks_add(time.ticks_ms(), 8000)
         while not _wlan.isconnected() and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
             if _idle is not None and _connecting is not None:

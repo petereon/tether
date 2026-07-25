@@ -129,6 +129,9 @@ def status_command(port: str | None) -> None:
     resolved_port = _resolve_port(port)
     with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
+        # timeout=10.0 must stay comfortably above STATUS_SCRIPT's own
+        # internal 8s wifi-connect poll (provisioning.py) - it also has
+        # to cover the raw-REPL round trip on top of that wait.
         stdout, stderr = serial_transport.run_python(ser, provisioning.STATUS_SCRIPT, timeout=10.0)
 
     if stderr:
