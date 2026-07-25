@@ -21,6 +21,6 @@ jobs:
       # `bleak` ISN'T installed - installing it here would make those
       # assertions false and break them. Mirrors local dev (dev + serial
       # only, no ble) on purpose, not by omission.
-      - run: uv sync --locked --extra dev --extra serial
+      - run: uv sync --locked --extra dev --extra serial --extra cli
 
       - run: uv run pytest
