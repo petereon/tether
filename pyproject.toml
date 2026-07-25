@@ -17,7 +17,11 @@ dependencies = [
 [project.optional-dependencies]
 serial = ["pyserial>=3.5"]
 ble = ["bleak>=0.21"]
+cli = ["click>=8.1", "beaupy>=3.0", "pyserial>=3.5"]
 dev = ["pytest>=8.0"]
+
+[project.scripts]
+tether = "tether.cli:main"
 
 [build-system]
 requires = ["hatchling"]

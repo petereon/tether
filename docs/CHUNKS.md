@@ -1267,6 +1267,96 @@ works.
   +1 existing `push_raw_repl` wait=False test updated for the corrected
   behavior it now pins).
 
+- [x] **19. WiFi provisioning + CLI** — done 2026-07-25. Not part of the
+  original 17-chunk plan (like chunk 18) - closes the gap chunk 12 left
+  open: `tether`'s wifi transport is now usable against a real board, via
+  a new `tether` CLI. Design spec:
+  `docs/superpowers/specs/2026-07-25-wifi-upload-design.md`.
+
+  New `tether[cli]` extra (`click`, `beaupy`, `pyserial`) and console-script
+  entry point (`[project.scripts] tether = "tether.cli:main"`), with four
+  commands: `tether devices` (lists connected MicroPython-capable USB
+  serial devices), `tether provision-wifi --ssid ... [--password ...]`
+  (uploads a `boot.py` + credentials file, prompting for a hidden password
+  via `beaupy` if `--password` is omitted), `tether status` (reports
+  whether a board is provisioned and currently connected), and `tether
+  unprovision-wifi` (removes stored credentials, gated behind a
+  `beaupy.confirm()` prompt since it's destructive, unlike the others).
+  `--port` is optional everywhere - `_resolve_port()` auto-discovers via a
+  new `serial.list_devices()` primitive and prompts interactively via
+  `beaupy.select()` when more than one device is connected.
+
+  On-device: a new `boot.py` template (`src/tether/provisioning.py`'s
+  `generate_wifi_boot()`), uploaded once by `provision-wifi`, auto-runs on
+  every MicroPython boot. If `/tether_wifi.json` is absent it does
+  nothing - a never-provisioned board behaves exactly as it did before
+  this feature existed, no separate opt-in flag needed. If present, it
+  joins wifi with a bounded ~15s timeout (falling through to idle REPL on
+  failure or a bad password, so serial access is never permanently locked
+  out), opens a TCP listener on the wifi transport's existing
+  `DEFAULT_PORT` (8765), accepts exactly one connection for the lifetime
+  of that boot, and - if `/tether_app.py` exists - bridges the accepted
+  socket into the existing dispatch loop via a new
+  `_tether_stream_override` injection point in `generate_bootstrap()`
+  (`src/tether/connection.py`). This override is the mechanism that makes
+  everything else possible without touching the existing serial path:
+  `generate_bootstrap()` now checks for a pre-set `_tether_stream_override`
+  global before falling back to `sys.stdin`/`sys.stdout`, so a normal
+  serial `connect()` (nothing ever sets the override there) gets the exact
+  same generated code and stdio path as before - zero behavior change for
+  existing usage.
+
+  Three small additions to `transports/serial.py`: `list_devices()`
+  (today's `discover()` still deliberately errors on ambiguity for the
+  library's `serial:auto` scheme; refactored to share `list_devices()`'s
+  filtering rather than duplicate it), `run_python()` (a general
+  run-code-get-output primitive, generalized from `read_file`'s
+  enter/exec/follow/exit sequence - used by `status` to run
+  `STATUS_SCRIPT` on the board and parse its one-line JSON result), and
+  `remove_file()` (used by `unprovision-wifi`).
+
+  Real finding from implementation, not anticipated by the design or plan:
+  a status-check race condition, discovered only via real ESP32 hardware
+  testing. `tether status` interrupts the board (a `reset_board()`
+  hard-reset + raw-REPL entry, the same documented tradeoff every other
+  command already accepts) to ask its live state, but the Ctrl-C from that
+  interrupt was landing while `boot.py`'s own wifi-connect-wait loop was
+  still mid-poll - real association+DHCP takes 2-6s, so a single-shot
+  `isconnected()` check in `STATUS_SCRIPT` reliably reported "not
+  currently connected" even on a healthy, correctly-provisioned board.
+  Fixed across three iterative commits, each re-verified against the real
+  board before moving to the next: (1) `STATUS_SCRIPT` polls
+  `isconnected()` for up to 8s instead of checking once, mirroring
+  `_BOOT_PY_TEMPLATE`'s own `time.ticks_add`/`time.ticks_diff`/
+  `time.sleep_ms` poll pattern; (2) that poll is gated behind `if
+  _provisioned:` so a never-provisioned board (no `/tether_wifi.json`,
+  never called `wlan.connect()` in the first place) reports status
+  instantly instead of wasting ~8s waiting for a connection that will
+  never happen; (3) the loop exits early via `network.WLAN.status()`'s
+  numeric state codes (ESP32-specific, not part of MicroPython's portable
+  API - falls back silently to the plain `isconnected()`-only wait if
+  `.status()` is unavailable) as soon as the outcome is decided, instead
+  of always waiting out the full deadline.
+
+  Real-hardware verification (ESP32, USB serial, network "Culo"):
+  `provision-wifi`, `status`, and `unprovision-wifi` all verified
+  end-to-end against the real board, including `status` correctly
+  reporting "Provisioned and connected. IP: 192.168.0.197" after the race
+  fix, and "Not provisioned for wifi." once `unprovision-wifi` removed the
+  credentials file. The plain serial `connect()` path
+  (`examples/blink_and_log/blink_and_log.py`, unmodified) was re-verified
+  clean after unprovisioning, confirming this feature left the existing
+  serial path completely undisturbed.
+
+  195 tests passing (was 167 at the end of chunk 18; +28: 1 in
+  `test_connection.py` for the `_tether_stream_override` check, 6 new
+  `list_devices`/`run_python`/`remove_file` tests in
+  `test_serial_transport.py`, and 21 across the two new files
+  `test_provisioning.py` and `test_cli.py` - including
+  real-`micropython`-unix-port-interpreter tests for `boot.py`'s
+  socket-accept/stream-bridging logic and `STATUS_SCRIPT`'s polling
+  behavior).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
