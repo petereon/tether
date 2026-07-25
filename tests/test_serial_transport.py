@@ -384,3 +384,70 @@ def test_write_files_with_nothing_to_do_sends_no_script():
     write_files(fake, {})
 
     assert bytes(fake.written) == b""
+
+
+def test_write_file_rejects_chunk_size_not_a_multiple_of_four():
+    # Base64 encodes in 4-character groups; a chunk_size that isn't a
+    # multiple of 4 splits a group across two on-device a2b_base64() calls,
+    # which raises ValueError on the device (or worse, misdecodes). This is
+    # currently latent - both public callers default to chunk_size=512,
+    # already a multiple of 4 - but chunk_size is a public kwarg, so a
+    # future caller passing e.g. chunk_size=10 must fail loudly here,
+    # before anything is sent to the device, rather than corrupt on-device.
+    fake = _FakeMicroPythonSerial()
+
+    with pytest.raises(ValueError, match="multiple of 4"):
+        write_file(fake, "/dispatch.py", b"some file content long enough to chunk", chunk_size=10)
+
+    # Nothing should have reached the device - fail fast, before upload.
+    assert bytes(fake.written) == b""
+
+
+def test_write_files_rejects_chunk_size_not_a_multiple_of_four():
+    # Same guard, reached through write_files' shared chunking helper.
+    fake = _FakeMicroPythonSerial()
+
+    with pytest.raises(ValueError, match="multiple of 4"):
+        write_files(fake, {"/a.py": b"some content long enough to chunk across"}, chunk_size=6)
+
+    assert bytes(fake.written) == b""
+
+
+def test_write_file_with_valid_small_chunk_size_round_trips_chunk_by_chunk():
+    # Prove alignment enforcement doesn't just reject bad values - a
+    # legitimately-aligned, non-default chunk_size must still produce
+    # chunks that are each independently valid base64 groups. Decode each
+    # a2b_base64(...) call's argument exactly as the on-device script would
+    # (one b64decode per chunk, not one over the whole concatenated
+    # string) and confirm the reassembled bytes match the original content.
+    import base64
+    import re
+
+    fake = _FakeMicroPythonSerial()
+    content = b"0123456789abcdefghijklmnopqrstuvwxyz"  # forces several chunks at size 8
+
+    write_file(fake, "/x.bin", content, chunk_size=8)
+
+    sent = bytes(fake.written).decode()
+    chunks = re.findall(r"a2b_base64\('([^']*)'\)", sent)
+    assert len(chunks) > 1, "expected the small chunk_size to actually split into multiple chunks"
+    decoded = b"".join(base64.b64decode(c) for c in chunks)
+    assert decoded == content
+
+
+def test_write_files_sorts_dirs_by_depth_so_parents_are_created_before_children():
+    # uos.mkdir() is POSIX-style (not mkdir -p): the parent must already
+    # exist. If dirs is given child-before-parent, mkdir(child) fails with
+    # OSError - silently swallowed by the try/except, indistinguishable
+    # from "already exists" - and the child directory never actually gets
+    # created. write_files must sort dirs by depth internally so callers
+    # don't have to remember to pre-sort.
+    fake = _FakeMicroPythonSerial()
+
+    # Deliberately child-before-parent, and not lexicographically sorted.
+    write_files(fake, {}, dirs=("/foo/bar", "/foo", "/zzz"))
+
+    sent = bytes(fake.written).decode()
+    foo_pos = sent.index("mkdir('/foo')")
+    foo_bar_pos = sent.index("mkdir('/foo/bar')")
+    assert foo_pos < foo_bar_pos, "parent directory must be created before its child"
