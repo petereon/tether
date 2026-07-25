@@ -34,13 +34,32 @@ _MSG_TYPE_SIZE = 1
 
 # Mirrors tether/marshalling.MAX_FRAME_SIZE (chunk 2) - see
 # tether_runtime/umsgpack/VENDORED.md's security note for why this bound
-# must exist before umsgpack ever touches the frame body.
-MAX_FRAME_SIZE = 1 << 20
+# must exist before umsgpack ever touches the frame body. Sized for real
+# hardware: a stock ESP32-WROOM board has no PSRAM and only ~100-200KB
+# typical free heap under MicroPython, so the old 1 MiB value let a single
+# readexactly() attempt an allocation that would MemoryError well before
+# reaching the nominal cap - reachable remotely now that an unauthenticated
+# wifi transport exists. 64 KiB comfortably fits a stock board's free heap
+# with headroom for the rest of the runtime, while still leaving real room
+# for legitimate payloads (small file contents, lists). MUST be updated
+# together with tether/marshalling.MAX_FRAME_SIZE or the two sides of the
+# wire protocol disagree on what's rejected.
+MAX_FRAME_SIZE = 1 << 16  # 64 KiB
 
 # Default heartbeat cadence for a handler registered without an explicit
 # interval - DESIGN.md's heartbeat design is "automatic by default", not
 # opt-in per function.
 DEFAULT_HEARTBEAT_INTERVAL_MS = 1000
+
+# Cap on concurrently in-flight MSG_CALL handler tasks. Each one is a
+# uasyncio task holding its own stack/locals until it finishes, so with no
+# bound a peer sending CALL frames faster than handlers complete (malicious
+# or buggy, now reachable over the unauthenticated wifi listener - same
+# security context as MAX_FRAME_SIZE above) can exhaust the board's RAM.
+# 8 is generous for interactive RPC use (far more concurrent calls than a
+# typical script issues) while still being a meaningful, small bound
+# relative to what a stock board's RAM can hold in flight.
+MAX_CONCURRENT_CALLS = 8
 
 
 class RemoteError(Exception):
@@ -162,6 +181,9 @@ class Dispatcher:
         self._pending = {}  # request id -> _Pending
         self._handlers = {}  # name -> (callable, heartbeat_interval_ms)
         self._loops = []  # list of (fn, interval_ms)
+        self._in_flight_calls = 0
+        self._call_slot_free = asyncio.Event()
+        self._call_slot_free.set()
 
     def register(self, name, handler, heartbeat_interval_ms=DEFAULT_HEARTBEAT_INTERVAL_MS):
         self._handlers[name] = (handler, heartbeat_interval_ms)
@@ -181,8 +203,8 @@ class Dispatcher:
         req_id = self._new_id()
         pending = _Pending()
         self._pending[req_id] = pending
-        await self._send(MSG_CALL, {"id": req_id, "name": name, "args": list(args)})
         try:
+            await self._send(MSG_CALL, {"id": req_id, "name": name, "args": list(args)})
             while True:
                 await pending.event.wait()
                 pending.event.clear()
@@ -204,6 +226,15 @@ class Dispatcher:
         while True:
             msg_type, payload = await _read_frame(self._reader)
             if msg_type == MSG_CALL:
+                # Backpressure at the read loop itself: hold off reading (and
+                # spawning) further calls once MAX_CONCURRENT_CALLS handler
+                # tasks are already outstanding, rather than spawning without
+                # bound. Simpler than a semaphore-style primitive and needs
+                # nothing beyond the Event already used elsewhere here.
+                while self._in_flight_calls >= MAX_CONCURRENT_CALLS:
+                    self._call_slot_free.clear()
+                    await self._call_slot_free.wait()
+                self._in_flight_calls += 1
                 asyncio.create_task(self._handle_call(payload))
             elif msg_type in (MSG_RESULT, MSG_ERROR, MSG_HEARTBEAT):
                 self._route_response(msg_type, payload)
@@ -222,46 +253,55 @@ class Dispatcher:
             pending.resolve_result(payload.get("value"))
 
     async def _handle_call(self, payload):
-        req_id = payload["id"]
-        name = payload["name"]
-        args = payload.get("args", [])
-
-        entry = self._handlers.get(name)
-        if entry is None:
-            await self._send(
-                MSG_ERROR,
-                {
-                    "id": req_id,
-                    "type": "LookupError",
-                    "message": f"no handler named {name!r}",
-                    "traceback": "",
-                },
-            )
-            return
-        handler, heartbeat_interval_ms = entry
-
-        heartbeat_task = None
-        if heartbeat_interval_ms:
-            heartbeat_task = asyncio.create_task(
-                self._heartbeat_ticker(req_id, heartbeat_interval_ms)
-            )
+        # Outer try/finally always releases this task's MAX_CONCURRENT_CALLS
+        # slot (incremented by run() before spawning this task), even if a
+        # handler raises or the frame references an unregistered name -
+        # otherwise a slot would leak per such call, same failure shape as
+        # the pending-request leak this file also fixes elsewhere.
         try:
-            result = await _maybe_await(handler(*args))
-        except Exception as exc:  # noqa: BLE001 - any handler exception must become MSG_ERROR
-            await self._send(
-                MSG_ERROR,
-                {
-                    "id": req_id,
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                    "traceback": _format_exception(exc),
-                },
-            )
-            return
+            req_id = payload["id"]
+            name = payload["name"]
+            args = payload.get("args", [])
+
+            entry = self._handlers.get(name)
+            if entry is None:
+                await self._send(
+                    MSG_ERROR,
+                    {
+                        "id": req_id,
+                        "type": "LookupError",
+                        "message": f"no handler named {name!r}",
+                        "traceback": "",
+                    },
+                )
+                return
+            handler, heartbeat_interval_ms = entry
+
+            heartbeat_task = None
+            if heartbeat_interval_ms:
+                heartbeat_task = asyncio.create_task(
+                    self._heartbeat_ticker(req_id, heartbeat_interval_ms)
+                )
+            try:
+                result = await _maybe_await(handler(*args))
+            except Exception as exc:  # noqa: BLE001 - any handler exception must become MSG_ERROR
+                await self._send(
+                    MSG_ERROR,
+                    {
+                        "id": req_id,
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "traceback": _format_exception(exc),
+                    },
+                )
+                return
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+            await self._send(MSG_RESULT, {"id": req_id, "value": result})
         finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-        await self._send(MSG_RESULT, {"id": req_id, "value": result})
+            self._in_flight_calls -= 1
+            self._call_slot_free.set()
 
     async def _heartbeat_ticker(self, req_id, interval_ms):
         # Runs as a task alongside the handler, not interleaved into it -

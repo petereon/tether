@@ -116,6 +116,117 @@ asyncio.run(main())
 
 
 @requires_micropython
+def test_read_frame_accepts_frame_just_under_max_size():
+    # Generous headroom below MAX_FRAME_SIZE absorbs umsgpack's per-value
+    # header overhead so the *declared* frame length (not just the string
+    # payload) lands comfortably under the bound.
+    out = run_micropython("""
+import uasyncio as asyncio
+import dispatch
+
+class FakeReader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+    async def readexactly(self, n):
+        chunk = self.data[self.pos:self.pos+n]
+        self.pos += n
+        return chunk
+
+async def main():
+    payload = {"data": "x" * (dispatch.MAX_FRAME_SIZE - 4096)}
+    frame = dispatch._encode_frame(1, payload)
+    declared_length = int.from_bytes(frame[0:4], "big")
+    print("within bound:", declared_length <= dispatch.MAX_FRAME_SIZE)
+    reader = FakeReader(frame)
+    msg_type, decoded = await dispatch._read_frame(reader)
+    print("msg_type:", msg_type)
+    print("ok:", decoded["data"] == payload["data"])
+
+asyncio.run(main())
+""")
+    assert "within bound: True" in out
+    assert "msg_type: 1" in out
+    assert "ok: True" in out
+
+
+@requires_micropython
+def test_read_frame_rejects_frame_just_over_max_size():
+    out = run_micropython("""
+import uasyncio as asyncio
+import dispatch
+
+class FakeReader:
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+    async def readexactly(self, n):
+        chunk = self.data[self.pos:self.pos+n]
+        self.pos += n
+        return chunk
+
+async def main():
+    payload = {"data": "x" * (dispatch.MAX_FRAME_SIZE + 4096)}
+    frame = dispatch._encode_frame(1, payload)
+    declared_length = int.from_bytes(frame[0:4], "big")
+    print("over bound:", declared_length > dispatch.MAX_FRAME_SIZE)
+    # Only the 4-byte length header is needed for rejection - _read_frame
+    # bounds-checks before ever calling readexactly() for the body.
+    reader = FakeReader(frame[:4])
+    try:
+        await dispatch._read_frame(reader)
+        print("NO ERROR RAISED")
+    except ValueError as e:
+        print("raised:", e)
+
+asyncio.run(main())
+""")
+    assert "over bound: True" in out
+    assert "raised:" in out
+    assert "NO ERROR" not in out
+
+
+@requires_micropython
+def test_call_pc_removes_pending_entry_when_send_raises():
+    # Regression test for a pending-request memory leak: call_pc() used to
+    # register self._pending[req_id] and then await self._send(...) OUTSIDE
+    # the try/finally that deletes it. If _send() raised (e.g. OSError from
+    # a dropped connection), the finally never ran and the entry leaked in
+    # self._pending forever - unbounded growth on every connection drop that
+    # happens mid-call_pc, on a board with very little RAM to spare.
+    out = run_micropython("""
+import uasyncio as asyncio
+import dispatch
+
+class BoomWriter:
+    def write(self, data):
+        raise OSError("connection dropped")
+    async def drain(self):
+        pass
+
+class NeverReader:
+    async def readexactly(self, n):
+        # call_pc() fails inside _send(), before it would ever wait on a
+        # read - this just needs to never resolve on its own.
+        await asyncio.sleep(1000)
+
+async def main():
+    d = dispatch.Dispatcher(NeverReader(), BoomWriter())
+    try:
+        await d.call_pc("whatever")
+        print("NO ERROR RAISED")
+    except OSError as e:
+        print("raised:", e)
+    print("pending count:", len(d._pending))
+
+asyncio.run(main())
+""")
+    assert "raised:" in out
+    assert "NO ERROR" not in out
+    assert "pending count: 0" in out
+
+
+@requires_micropython
 def test_call_pc_roundtrip_to_a_registered_handler():
     out = run_micropython(
         _PIPE_HELPER
@@ -446,3 +557,56 @@ asyncio.run(main())
     )
     assert "remote_type:" in out
     assert "NO ERROR" not in out
+
+
+@requires_micropython
+def test_run_bounds_concurrent_handler_tasks():
+    # Bug: run()'s MSG_CALL handling did asyncio.create_task(self._handle_call(...))
+    # with no cap at all - a peer sending many CALL frames in quick
+    # succession (now reachable over the unauthenticated wifi listener)
+    # could spawn unbounded concurrent tasks, each holding its own
+    # stack/locals, exhausting the board's RAM. This drives more concurrent
+    # requests than the cap and asserts the number of *simultaneously
+    # running* handler bodies never exceeds it - not just "it doesn't
+    # crash".
+    out = run_micropython(
+        _PIPE_HELPER
+        + """
+import dispatch
+
+async def main():
+    (reader_a, writer_a), (reader_b, writer_b) = make_pair()
+    a = dispatch.Dispatcher(reader_a, writer_a)
+    b = dispatch.Dispatcher(reader_b, writer_b)
+
+    running = 0
+    max_running = 0
+    async def slow(i):
+        nonlocal running, max_running
+        running += 1
+        if running > max_running:
+            max_running = running
+        await asyncio.sleep_ms(30)
+        running -= 1
+        return i
+    b.register("slow", slow)
+
+    asyncio.create_task(a.run())
+    asyncio.create_task(b.run())
+
+    tasks = [asyncio.create_task(a.call_pc("slow", i)) for i in range(20)]
+    results = []
+    for t in tasks:
+        results.append(await t)
+
+    print("max_running:", max_running)
+    print("num_results:", len(results))
+    print("results_ok:", sorted(results) == list(range(20)))
+
+asyncio.run(main())
+"""
+    )
+    max_running = int(out.strip().split("max_running:")[1].split("\n")[0])
+    assert max_running <= 8, f"expected at most 8 concurrent handlers in flight, got {max_running}"
+    assert "num_results: 20" in out
+    assert "results_ok: True" in out
