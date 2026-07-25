@@ -179,6 +179,40 @@ def test_call_mcu_after_disconnect_fails_fast_instead_of_writing_into_a_dead_tra
     assert time.monotonic() - start < 1.0
 
 
+def test_send_result_failure_after_successful_handler_is_made_visible(capsys):
+    # _route_frame() dispatches MSG_CALL onto a ThreadPoolExecutor and
+    # discards the Future (fire-and-forget by design - see its own
+    # comment). If the handler succeeds but the final self._send(MSG_RESULT,
+    # ...) then raises (e.g. the transport dropped between receiving the
+    # call and replying), that exception used to vanish into the discarded
+    # Future with zero diagnostic - the caller was just left to hit its own
+    # MCUTimeoutError with no pointer to the real cause. Assert both halves
+    # of the fix: the caller still times out (a broken transport can't be
+    # un-broken by better error handling) *and* something visible is now
+    # emitted on the responding side.
+    (reader_a, writer_a), (reader_b, _writer_b) = _make_pair()
+
+    class _BrokenWriter:
+        def write(self, data: bytes) -> None:
+            raise OSError("broken pipe")
+
+    a = Dispatcher(reader_a, writer_a)
+    b = Dispatcher(reader_b, _BrokenWriter())
+
+    b.register("add", lambda x, y: x + y)
+
+    a.start()
+    b.start()
+
+    with pytest.raises(MCUTimeoutError):
+        a.call_mcu("add", 2, 3, timeout=0.3)
+
+    captured = capsys.readouterr()
+    assert "add" in captured.err
+    assert "OSError" in captured.err
+    assert "broken pipe" in captured.err
+
+
 def test_close_shuts_down_the_incoming_call_worker_pool():
     # close() is what BoardHandle.reconnect() calls on the abandoned
     # dispatcher so a reconnect doesn't leak a fresh 4-thread pool per call.

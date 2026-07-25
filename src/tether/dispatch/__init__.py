@@ -16,6 +16,7 @@ If these change, chunk 6 must change to match.
 from __future__ import annotations
 
 import contextlib
+import sys
 import threading
 import traceback
 from collections.abc import Callable
@@ -269,7 +270,35 @@ class Dispatcher:
                 tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
                 self._send_error(req_id, type(exc).__name__, str(exc), tb)
                 return
-        self._send(MSG_RESULT, {"id": req_id, "value": result})
+        try:
+            self._send(MSG_RESULT, {"id": req_id, "value": result})
+        except Exception as exc:  # noqa: BLE001 - see comment below for why this is caught here
+            # The handler ran successfully, but sending its result failed
+            # (e.g. the transport dropped between receiving the call and
+            # replying, or `result` isn't encodable). This method runs on a
+            # ThreadPoolExecutor worker via a submit() in _route_frame whose
+            # Future is intentionally fire-and-forget (no caller ever
+            # awaits it or attaches a callback) - left unguarded, this
+            # exception would vanish into that discarded Future with zero
+            # visibility: no crash, no log, nothing. The MCU-side caller is
+            # simply left to hit its own MCUTimeoutError with no pointer to
+            # the real cause.
+            #
+            # Not attempting another self._send(MSG_ERROR, ...) here: the
+            # reason we're in this except block is that sending already
+            # failed once, so the transport itself is presumed broken and
+            # a retry would likely just fail the same way for no benefit.
+            #
+            # This codebase has no logging framework (checked - no
+            # `import logging` anywhere under src/), so printing a clear
+            # diagnostic to stderr is the simplest way to surface a
+            # background-thread failure that otherwise has nowhere to go,
+            # without introducing new machinery for one call site.
+            print(
+                f"tether: failed to send result for call {name!r} (id={req_id}): "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
 
     @contextlib.contextmanager
     def _board_scoped(self):
