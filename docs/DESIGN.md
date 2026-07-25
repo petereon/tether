@@ -71,8 +71,18 @@ At `connect()` time:
 4. **Hash-check.** Compare a hash of the bundle against a sentinel already on
    the board. Skip upload + reset if unchanged (fast dev-loop iteration).
 5. **Upload** (if needed) via raw-REPL over serial. For wifi/BLE, the board
-   must already be running a bootstrapped runtime (pushed once over serial);
-   `tether` does not push code over wifi/BLE directly.
+   must already be running a bootstrapped runtime; `tether` does not push
+   code over wifi/BLE directly, by design, even once this exists.
+
+   **Current status:** the "board must already be running a bootstrapped
+   runtime" precondition above is not achievable today by any means,
+   manual or automatic. `generate_bootstrap()` (step 3) always wires the
+   dispatch loop to `sys.stdin`/`sys.stdout` - there is no variant that
+   wires it to a socket or a BLE GATT service, and no on-device
+   wifi-connection or BLE-advertising management exists either. Serial is
+   the only transport that works against a real device right now; wifi and
+   BLE are PC-side client code with nothing on-device to reach. See §
+   Transports.
 6. **Handshake.** Exchange a protocol-version frame. Hard error
    (`ProtocolVersionError`) on mismatch.
 7. **Ready.** Board handle returned; calls now dispatch over the transport.
@@ -140,9 +150,9 @@ At `connect()` time:
 
 | Transport | Discovery | Upload | Notes |
 |---|---|---|---|
-| Serial | `"serial:auto"` (USB VID/PID scan) or explicit port | Raw-REPL push | Primary/first transport, always code-push capable. Every connect (including reconnect) hardware-resets the board first (RTS/DTR toggle, ~1.3s) - added 2026-07-25 after real-hardware testing showed Ctrl-C alone can no longer recover a board already running a previous connect()'s dispatch loop, once `micropython.kbd_intr(-1)` is active on-device (see § Wire protocol). Harmless on an already-idle board. |
-| Wifi | `"wifi:<ip>"` | Not supported directly — board must already run a bootstrapped runtime | Pure stdlib `socket` on PC side |
-| BLE | `"ble:<addr>"` | Same bootstrap requirement as wifi | Custom GATT service (one write characteristic, one notify characteristic); frame chunking/reassembly handled transparently in the transport adapter (BLE MTU is small) |
+| Serial | `"serial:auto"` (USB VID/PID scan) or explicit port | Raw-REPL push | **Works today**, verified against real hardware. Primary/first transport, always code-push capable. Every connect (including reconnect) hardware-resets the board first (RTS/DTR toggle, ~1.3s) - added 2026-07-25 after real-hardware testing showed Ctrl-C alone can no longer recover a board already running a previous connect()'s dispatch loop, once `micropython.kbd_intr(-1)` is active on-device (see § Wire protocol). Harmless on an already-idle board. |
+| Wifi | `"wifi:<ip>"` | Not supported directly — board must already run a bootstrapped runtime | **Not usable against a real device yet.** PC-side client (pure stdlib `socket`) exists and is tested, but nothing generates or uploads an on-device program that listens on a socket - `generate_bootstrap()` only ever wires to `sys.stdin`/`sys.stdout`. There is also no on-device wifi-connection-management story (credentials, reconnect after reset) - explicitly out of scope when chunk 12 built the PC-side client, not yet revisited. |
+| BLE | `"ble:<addr>"` | Same bootstrap requirement as wifi | **Not usable against a real device yet**, same reason as wifi. Custom GATT service design (one write characteristic, one notify characteristic; frame chunking/reassembly in the transport adapter for BLE's small MTU) is implemented on the PC side and unit-tested against a hand-written fake, but there is no on-device GATT peripheral implementation, and BLE hardware has never been tested against this project at all. |
 
 Multiple boards are supported concurrently — `connect()` returns a handle,
 decorated functions are accessed as attributes on that handle

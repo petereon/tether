@@ -12,8 +12,9 @@ side exactly like a local function call — `tether` figures out which parts
 of the file belong on the MCU, uploads just that code, and handles framing,
 serialization, and routing calls over the wire.
 
-Targets ESP32 and similar MicroPython-capable boards, over serial, wifi, or
-BLE.
+Targets ESP32 and similar MicroPython-capable boards. Serial is the
+transport that works today; wifi and BLE are planned but not yet usable
+against a real device — see Transports below.
 
 ## How it works
 
@@ -77,9 +78,9 @@ at once (`with board:` scopes which one is ambient for a block).
 
 | Transport | Address | Notes |
 |---|---|---|
-| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | The only transport that can push code to the board (over MicroPython's raw REPL). |
-| Wifi | `"wifi:<ip>"` | Pure stdlib socket, no extra install. Board must already be running a `tether`-uploaded program (get it there once over serial first). |
-| BLE | `"ble:<addr>"` | Same requirement as wifi — connects to an already-running board, doesn't push code. |
+| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. The only transport that can push code to the board (over MicroPython's raw REPL). |
+| Wifi | `"wifi:<ip>"` | **Not usable against a real device yet.** The PC-side client exists, but `tether` has no way to get a wifi-reachable program *onto* a board in the first place — the code it uploads only ever runs over serial's stdin/stdout, never a socket. Planned. |
+| BLE | `"ble:<addr>"` | **Not usable against a real device yet**, same reason as wifi — no on-device BLE listener exists. Planned. |
 
 ## Walkthrough: blink an LED
 
@@ -112,10 +113,13 @@ up.
 
 ## Status
 
-Core functionality (slicing, the wire protocol, all three transports,
-multi-board and reconnect handling) is implemented and tested. Serial has
-been verified against real ESP32 hardware, including reconnecting and
-re-running repeatedly. Wifi and BLE are covered by automated tests (real
-TCP sockets, and a fake matching the BLE library's API) but not yet
-verified against real hardware. See `docs/DESIGN.md` for the full
+Core functionality (slicing, the wire protocol, dispatch, multi-board and
+reconnect handling) is implemented and tested. Serial is fully working and
+has been verified against real ESP32 hardware, including reconnecting and
+re-running repeatedly.
+
+Wifi and BLE are PC-side client code only, covered by automated tests
+(real TCP sockets, and a fake matching the BLE library's API) — but there
+is currently no on-device listener for either to connect to, so neither
+works against a real board yet. See `docs/DESIGN.md` for the full
 architecture.
