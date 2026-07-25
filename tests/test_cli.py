@@ -1,3 +1,5 @@
+import json
+
 import click
 import pytest
 from click.testing import CliRunner
@@ -160,3 +162,56 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert prompted["secure"] is True
+
+
+def test_status_command_reports_connected_with_ip(monkeypatch):
+    calls = []
+
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
+
+    status = {"provisioned": True, "connected": True, "ip": "192.168.1.42"}
+
+    def fake_run_python(ser, code, timeout=10.0):
+        calls.append("run_python")
+        return json.dumps(status).encode() + b"\n", b""
+
+    monkeypatch.setattr("tether.transports.serial.run_python", fake_run_python)
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "192.168.1.42" in result.output
+    assert calls == ["reset", "run_python"], (
+        "status must reset the board (known state) before running the status check script"
+    )
+
+
+def test_status_command_reports_not_provisioned(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    status = {"provisioned": False, "connected": False, "ip": None}
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (json.dumps(status).encode(), b""),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "not provisioned" in result.output.lower()

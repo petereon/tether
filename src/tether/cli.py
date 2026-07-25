@@ -87,5 +87,36 @@ def provision_wifi_command(port: str | None, ssid: str, password: str | None) ->
     click.echo("Run `tether status` in a few seconds to check connectivity.")
 
 
+@main.command("status")
+@click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
+def status_command(port: str | None) -> None:
+    """Check whether a board is wifi-provisioned and currently connected."""
+    import json
+
+    import serial as pyserial
+
+    from tether import provisioning
+    from tether.transports import serial as serial_transport
+
+    resolved_port = _resolve_port(port)
+    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
+    try:
+        serial_transport.reset_board(ser)
+        stdout, stderr = serial_transport.run_python(ser, provisioning.STATUS_SCRIPT, timeout=10.0)
+    finally:
+        ser.close()
+
+    if stderr:
+        raise click.ClickException(f"status check failed: {stderr.decode(errors='replace')}")
+
+    info = json.loads(stdout.decode().strip())
+    if not info["provisioned"]:
+        click.echo("Not provisioned for wifi. Run `tether provision-wifi` first.")
+    elif info["connected"]:
+        click.echo(f"Provisioned and connected. IP: {info['ip']}")
+    else:
+        click.echo("Provisioned but not currently connected to wifi.")
+
+
 if __name__ == "__main__":
     main()
