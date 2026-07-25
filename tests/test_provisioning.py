@@ -51,6 +51,50 @@ from tether.connection import PROTOCOL_VERSION, generate_bootstrap
 
 
 @requires_micropython
+def test_status_script_polls_instead_of_checking_isconnected_once():
+    # Real-hardware finding: `reset_board()` (RTS/DTR pulse, ~1.3s) returns
+    # long before boot.py's own wifi-connect-wait loop finishes - and the
+    # raw-REPL entry that follows it sends Ctrl-C, interrupting that loop
+    # before association+DHCP (empirically 2-6s) completes. A single
+    # up-front `isconnected()` check therefore reports "not connected" on
+    # a board that would have connected within another second or two.
+    #
+    # Fakes a `network.WLAN` whose isconnected() only turns True after a
+    # few calls (standing in for "association finishes shortly after
+    # STATUS_SCRIPT starts checking") and asserts STATUS_SCRIPT's JSON
+    # output reports connected - proving it polls rather than giving up on
+    # the first check. Against the pre-fix single-shot STATUS_SCRIPT this
+    # fails (reports connected: false), since isconnected() is only ever
+    # called once.
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    _calls = 0
+    def __init__(self, *a):
+        pass
+    def isconnected(self):
+        _FakeWLAN._calls += 1
+        return _FakeWLAN._calls > 3
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+{STATUS_SCRIPT.decode()}
+"""
+    stdout = run_micropython(script, timeout=10.0)
+    info = json.loads(stdout.strip())
+
+    assert info["connected"] is True
+    assert info["ip"] == "10.0.0.5"
+
+
+@requires_micropython
 def test_boot_py_bridges_a_real_socket_into_the_dispatch_loop():
     # Fakes `network` (no real wifi under the unix port) and monkeypatches
     # the listen port to something unlikely to collide, then runs the

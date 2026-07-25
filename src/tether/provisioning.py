@@ -101,8 +101,12 @@ _connected = False
 _ip = None
 try:
     import network
+    import time
 
     _wlan = network.WLAN(network.STA_IF)
+    _deadline = time.ticks_add(time.ticks_ms(), 8000)
+    while not _wlan.isconnected() and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
+        time.sleep_ms(200)
     _connected = _wlan.isconnected()
     _ip = _wlan.ifconfig()[0] if _connected else None
 except Exception:
