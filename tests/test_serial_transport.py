@@ -4,9 +4,12 @@ from tether.transports.serial import (
     RawReplError,
     SerialStream,
     discover,
+    list_devices,
     push_raw_repl,
     read_file,
+    remove_file,
     reset_board,
+    run_python,
     write_file,
     write_files,
 )
@@ -83,6 +86,24 @@ def test_discover_raises_when_multiple_known_devices_found():
 
     with pytest.raises(RawReplError, match="multiple"):
         discover(list_ports_fn=fake_list_ports)
+
+
+def test_list_devices_returns_all_known_matches():
+    def fake_list_ports():
+        return [
+            _FakePortInfo("/dev/ttyUSB0", 0x10C4, 0xEA60),  # CP210x - known
+            _FakePortInfo("/dev/ttyUSB1", 0x1A86, 0x7523),  # CH340 - also known
+            _FakePortInfo("/dev/ttyUSB2", 0x1234, 0x5678),  # unknown chip
+        ]
+
+    assert list_devices(list_ports_fn=fake_list_ports) == ["/dev/ttyUSB0", "/dev/ttyUSB1"]
+
+
+def test_list_devices_returns_empty_list_when_none_found():
+    def fake_list_ports():
+        return [_FakePortInfo("/dev/ttyUSB0", 0x1234, 0x5678)]
+
+    assert list_devices(list_ports_fn=fake_list_ports) == []
 
 
 class _FakeResettableSerial:
@@ -334,6 +355,29 @@ def test_read_file_returns_decoded_content():
     assert read_file(fake, "/.tether_hash") == content
 
 
+def test_run_python_returns_stdout_and_stderr():
+    fake = _FakeMicroPythonSerial(stdout=b"hello\n", stderr=b"")
+
+    stdout, stderr = run_python(fake, b"print('hello')")
+
+    assert stdout == b"hello\n"
+    assert stderr == b""
+
+
+def test_run_python_returns_stderr_without_raising():
+    # Unlike read_file/write_file, run_python is a low-level primitive -
+    # it hands back whatever the device printed to stderr rather than
+    # raising, so callers (e.g. the CLI's status check) can decide for
+    # themselves what a given stderr means instead of it always being a
+    # hard error.
+    fake = _FakeMicroPythonSerial(stdout=b"", stderr=b"Traceback...\nValueError: boom\n")
+
+    stdout, stderr = run_python(fake, b"raise ValueError('boom')")
+
+    assert stdout == b""
+    assert b"ValueError: boom" in stderr
+
+
 def test_write_files_sends_everything_as_one_round_trip():
     fake = _FakeMicroPythonSerial()
 
@@ -384,3 +428,22 @@ def test_write_files_with_nothing_to_do_sends_no_script():
     write_files(fake, {})
 
     assert bytes(fake.written) == b""
+
+
+def test_remove_file_deletes_an_existing_file():
+    fake = _FakeMicroPythonSerial()
+
+    remove_file(fake, "/tether_wifi.json")
+
+    sent = bytes(fake.written).decode()
+    assert "uos.remove('/tether_wifi.json')" in sent
+
+
+def test_remove_file_does_not_raise_when_file_is_already_gone():
+    # uos.remove() raises OSError for a missing file - remove_file must
+    # swallow that (matches ensure_dir's existing try/except OSError
+    # pattern for mkdir), since "already removed" and "just removed it"
+    # should look the same to the caller.
+    fake = _FakeMicroPythonSerial(stderr=b"")  # device-side try/except means stderr stays empty
+
+    remove_file(fake, "/tether_wifi.json")  # must not raise
