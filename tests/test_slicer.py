@@ -1,4 +1,6 @@
-from tether.slicer import slice_mcu_bound
+import pytest
+
+from tether.slicer import SlicerError, slice_mcu_bound
 
 
 def test_single_decorated_function_with_no_dependencies():
@@ -306,3 +308,62 @@ async def read_scaled() -> int:
     result = slice_mcu_bound(source)
 
     assert "async def _slow_read() -> int:" in result.source
+
+
+def test_tuple_unpacking_assignment_raises_clear_error_instead_of_silently_dropping():
+    # Before the fix: `_bound_names` only recognized a single `ast.Name`
+    # target, so `a, b = compute()` bound nothing at all - `a`/`b` were
+    # silently missing from `bindings`, and the dependency walk in
+    # slice_mcu_bound just skipped them (no error), producing a slice
+    # missing the statement that defines them and a cryptic on-device
+    # NameError with no indication of the real cause. This must instead
+    # fail loudly and clearly at slice time (mirrors the "unsliced" check
+    # in connection.py - same design philosophy: no unrelated-looking
+    # errors far from the actual cause).
+    source = """
+from tether import mcu
+
+a, b = compute()
+
+@mcu.export
+def read_both() -> int:
+    return a + b
+"""
+    with pytest.raises(SlicerError, match="tuple/list-unpacking"):
+        slice_mcu_bound(source)
+
+
+def test_missing_ruff_binary_raises_clear_error(monkeypatch):
+    # ruff is a core dependency (pyproject.toml), so this is an edge case
+    # (broken venv, unusual packaging, PATH misconfiguration) rather than
+    # something a normal install would hit - but subprocess.run's raw
+    # FileNotFoundError should still be translated into a clear,
+    # actionable SlicerError rather than propagating as-is.
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("[Errno 2] No such file or directory: 'ruff'")
+
+    monkeypatch.setattr("tether.slicer.subprocess.run", fake_run)
+
+    source = """
+from tether import mcu
+
+@mcu.export
+def read_temp() -> float:
+    return 21.5
+"""
+    with pytest.raises(SlicerError, match="ruff"):
+        slice_mcu_bound(source)
+
+
+def test_list_unpacking_assignment_raises_clear_error_instead_of_silently_dropping():
+    source = """
+from tether import mcu
+
+[a, b] = compute()
+
+@mcu.export
+def read_both() -> int:
+    return a + b
+"""
+    with pytest.raises(SlicerError, match="tuple/list-unpacking"):
+        slice_mcu_bound(source)

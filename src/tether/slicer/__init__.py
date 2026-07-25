@@ -14,8 +14,10 @@ decorator syntax as written. Making those decorator names resolve on-device
 after this module produces the bundle — not used for the slicing itself.
 
 Known limitation: module-level assignment targets must be a single `Name`
-(`x = ...`, `x: T = ...`). Tuple/list-unpacking targets (`x, y = ...`) bind
-nothing and are silently excluded — not currently supported.
+(`x = ...`, `x: T = ...`). Tuple/list-unpacking targets (`x, y = ...` or
+`[x, y] = ...`) aren't supported — rather than silently binding nothing
+(which would let dependent code disappear from the slice with no warning),
+this raises `SlicerError` at slice time.
 """
 
 from __future__ import annotations
@@ -25,6 +27,18 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+
+class SlicerError(RuntimeError):
+    """Raised for source constructs the AST slicer can't handle, or when the
+    slicer's own tooling (the `ruff` post-slice cleanup pass) can't run.
+    Distinct from the runtime `TetherError` hierarchy in `errors.py`, which
+    is for cross-boundary call failures - this is a static-analysis-time
+    error, matching the plain-`RuntimeError`-with-clear-message pattern
+    `connection.py`'s "unsliced" check already uses for the same class of
+    "fail loud now, not with a cryptic error far from the actual cause"
+    problem.
+    """
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,23 @@ def _bound_names(node: ast.stmt) -> list[str]:
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return [node.target.id]
     if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, (ast.Tuple, ast.List)):
+                # A single `ast.Name` target is the only shape handled
+                # below - a tuple/list target here would silently bind
+                # nothing (see this module's docstring), leaving any
+                # `@mcu.export` function that references its names with a
+                # slice missing the statement that defines them, and a
+                # cryptic on-device NameError with zero indication of the
+                # real cause. Fail loud, here, with the actual source line,
+                # instead (same philosophy as connection.py's "unsliced"
+                # check).
+                raise SlicerError(
+                    f"line {node.lineno}: tuple/list-unpacking assignment "
+                    f"(`{ast.unparse(target)} = ...`) at module scope isn't "
+                    "supported by the slicer - use separate assignments "
+                    "(`a = ...; b = ...`) instead"
+                )
         return [t.id for t in node.targets if isinstance(t, ast.Name)]
     if isinstance(node, (ast.Import, ast.ImportFrom)):
         # PC-only `tether` package — never installed on the MCU (only
@@ -149,7 +180,7 @@ def _collect_bindings(
             if local_path is not None:
                 if local_path not in visited_files:
                     visited_files.add(local_path)
-                    sub_tree = ast.parse(local_path.read_text())
+                    sub_tree = ast.parse(local_path.read_text(encoding="utf-8"))
                     _collect_bindings(sub_tree, local_path.parent, bindings, visited_files)
                 for alias in node.names:
                     local_name = alias.asname or alias.name
@@ -213,21 +244,35 @@ def _strip_unused_imports(source: str) -> str:
     subprocess failure (ruff missing/crashing), which should still crash
     loud rather than silently produce garbage output.
     """
-    result = subprocess.run(
-        [
-            "ruff",
-            "check",
-            "--fix",
-            "--exit-zero",
-            "--select=F401",
-            "--stdin-filename=tether_sliced_bundle.py",
-            "-",
-        ],
-        input=source,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "ruff",
+                "check",
+                "--fix",
+                "--exit-zero",
+                "--select=F401",
+                "--stdin-filename=tether_sliced_bundle.py",
+                "-",
+            ],
+            input=source,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        # `ruff` is a core dependency (pyproject.toml), so this should be
+        # rare in practice - but a broken venv, unusual packaging, or a PATH
+        # misconfiguration could still leave the binary unresolvable. Point
+        # straight at that rather than let a raw FileNotFoundError surface.
+        # Only FileNotFoundError is caught here - a genuine ruff crash/other
+        # subprocess failure still propagates via `check=True` above,
+        # unchanged (see this function's docstring for why that's
+        # deliberate).
+        raise SlicerError(
+            "the `ruff` CLI is required for AST slicing (declared as a core "
+            "dependency) but wasn't found on PATH - check your installation"
+        ) from exc
     return result.stdout
 
 
