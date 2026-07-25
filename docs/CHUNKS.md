@@ -1357,6 +1357,59 @@ works.
   socket-accept/stream-bridging logic and `STATUS_SCRIPT`'s polling
   behavior).
 
+**Addendum (2026-07-25) — `mcu.connect("wifi:<ip>")` verified against real
+ESP32 firmware.** Chunk 19's own verification covered the CLI
+(`provision-wifi`/`status`/`unprovision-wifi`) and the socket-bridge
+mechanism against the real MicroPython interpreter, but not yet an actual
+wifi RPC session against real hardware - this addendum closes that gap.
+
+Verified against the same ESP32 (network "JOZEF-A-BETKA" this time - the
+board was disconnected and reconnected to a different network between
+sessions): uploaded a small script over serial (`mcu.connect("serial:auto")`,
+one `@mcu.export` function calling back into one `@pc.export` function),
+provisioned wifi, then `mcu.connect("wifi:<ip>")` from a separate PC
+process. Confirmed working: a plain PC-to-MCU call (`add(3, 4) == 7`); an
+MCU-to-PC reverse call from inside that same MCU handler (`@pc.export`
+invoked via `await` from MCU code, itself dependent on the reverse call's
+real return value flowing back correctly - not just "didn't crash");
+remote-exception propagation (deliberately triggered a MicroPython-only
+`NotImplementedError` - slicing a string with `[::-1]`, unsupported on
+MicroPython - and confirmed it surfaced PC-side as a `RemoteError` with
+the correct type and message, proving the error path works over wifi too,
+not just the happy path).
+
+Two real findings from this pass, both now documented in DESIGN.md's
+Wifi transport row and README.md's "WiFi provisioning CLI" section
+(not fixed - documented as known limitations, since fixing either would
+be new scope beyond a verification pass):
+
+1. **Wifi never pushes code - confirmed the hard way.** Editing the
+   verification script's `@mcu.export` function after the initial serial
+   upload and testing again over wifi silently ran the *old* code (the
+   original, since-reverted `msg[::-1]` version) until a fresh serial
+   upload was done. This was already documented as a design consequence
+   in chunk 19, but this is now a directly-observed confirmation of the
+   exact failure mode, not just an inferred one.
+2. **`tether status` leaves the board unable to accept a new wifi
+   connection afterward - not anticipated in the original design.**
+   `status` hard-resets the board and interrupts `boot.py` via raw-REPL
+   entry, then exits raw REPL back to the plain interactive REPL rather
+   than triggering a fresh hardware reset - `boot.py` only auto-runs on
+   an actual reset, not on raw-REPL exit, so the TCP listener it had
+   opened is gone (an unreferenced local variable in the now-interrupted
+   script) even though `status` had just reported "connected". The wifi
+   *association* itself survives (confirmed: `WLAN.isconnected()` stays
+   true across the interrupt, since that's firmware-level state
+   independent of the interrupted Python script) - only the *listener*
+   doesn't. Practically: `provision-wifi` → `status` → `mcu.connect(...)`
+   times out on the connect, discovered directly when the first
+   verification attempt (which checked `status` first, per the CLI's own
+   printed suggestion) timed out; a retry that skipped the `status` check
+   worked immediately. A fix (reset again after the status query,
+   mirroring `provision_wifi_command`'s existing double-reset pattern) is
+   a reasonable, small follow-up - not implemented here, since this was a
+   verification pass, not a fix pass.
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
