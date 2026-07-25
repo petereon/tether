@@ -118,5 +118,29 @@ def status_command(port: str | None) -> None:
         click.echo("Provisioned but not currently connected to wifi.")
 
 
+@main.command("unprovision-wifi")
+@click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
+def unprovision_wifi_command(port: str | None) -> None:
+    """Remove stored WiFi credentials from a board."""
+    import beaupy
+    import serial as pyserial
+
+    from tether.transports import serial as serial_transport
+
+    resolved_port = _resolve_port(port)
+    if not beaupy.confirm(f"Remove wifi credentials from {resolved_port}?"):
+        click.echo("Cancelled.")
+        return
+
+    ser = pyserial.Serial(resolved_port, baudrate=115200, timeout=1.0)
+    try:
+        serial_transport.reset_board(ser)
+        serial_transport.remove_file(ser, "/tether_wifi.json")
+    finally:
+        ser.close()
+
+    click.echo(f"Removed wifi credentials from {resolved_port}.")
+
+
 if __name__ == "__main__":
     main()

@@ -194,6 +194,53 @@ def test_status_command_reports_connected_with_ip(monkeypatch):
     )
 
 
+def test_unprovision_wifi_removes_config_after_confirmation(monkeypatch):
+    calls = []
+
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
+    monkeypatch.setattr("beaupy.confirm", lambda question: True)
+
+    removed = {}
+
+    def fake_remove_file(ser, path, **kwargs):
+        calls.append("remove")
+        removed["path"] = path
+
+    monkeypatch.setattr("tether.transports.serial.remove_file", fake_remove_file)
+
+    result = CliRunner().invoke(main, ["unprovision-wifi", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert removed["path"] == "/tether_wifi.json"
+    assert calls == ["reset", "remove"], (
+        "unprovision-wifi must reset the board (known state) before removing the wifi config"
+    )
+
+
+def test_unprovision_wifi_does_nothing_without_confirmation(monkeypatch):
+    monkeypatch.setattr("beaupy.confirm", lambda question: False)
+
+    removed = {}
+    monkeypatch.setattr(
+        "tether.transports.serial.remove_file",
+        lambda ser, path, **kw: removed.setdefault("called", True),
+    )
+
+    result = CliRunner().invoke(main, ["unprovision-wifi", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "called" not in removed
+    assert "cancelled" in result.output.lower()
+
+
 def test_status_command_reports_not_provisioned(monkeypatch):
     class _FakeSerial:
         def __init__(self, port, baudrate, timeout):
