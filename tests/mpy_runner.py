@@ -116,3 +116,38 @@ def run_micropython(script: str, timeout: float = 5.0) -> str:
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}\nscript:\n{script}"
         )
     return result.stdout
+
+
+def run_micropython_background(script: str, *, run_for: float = 3.0) -> None:
+    """Start `script` under micropython as a background process, let it
+    run for `run_for` seconds, then terminate it - for scripts that loop
+    forever by design (e.g. boot.py's accept loop), where a timeout is the
+    expected way the test ends, not a failure. Does not return stdout: a
+    forcibly-terminated process's buffered output isn't reliably
+    available, so tests using this observe behavior through a real side
+    channel (e.g. a socket a client thread connects to during `run_for`),
+    not through captured process output.
+    """
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
+        f.write(script)
+        script_path = f.name
+
+    try:
+        proc = subprocess.Popen(
+            ["micropython", script_path],
+            env={
+                **os.environ,
+                "MICROPYPATH": ":".join([*_DEFAULT_MICROPY_PATHS, str(_TETHER_RUNTIME_SRC)]),
+            },
+        )
+        try:
+            proc.wait(timeout=run_for)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+    finally:
+        Path(script_path).unlink(missing_ok=True)

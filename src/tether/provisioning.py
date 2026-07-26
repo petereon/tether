@@ -15,13 +15,21 @@ from __future__ import annotations
 
 import json
 
+from tether.connection import PROTOCOL_VERSION
 from tether.transports.wifi import DEFAULT_PORT
 
-# Fixed template - never contains credentials (those live in
-# /tether_wifi.json, uploaded separately - see generate_wifi_boot). If
-# /tether_wifi.json is missing, this does nothing and falls straight
+# Fixed template - never contains credentials or the shared secret (those
+# live in /tether_wifi.json, uploaded separately - see generate_wifi_boot).
+# If /tether_wifi.json is missing, this does nothing and falls straight
 # through to the idle REPL: a never-provisioned board behaves exactly as
 # it did before this feature existed.
+#
+# Loops indefinitely once wifi is up, accepting connections one at a time
+# (never concurrently). Every connection starts with a small preamble
+# (JSON, not msgpack - see this module's own note below) selecting a mode
+# and presenting the shared secret if one is configured. As of this
+# version only "status" is implemented; "run" and "upload" are added by
+# later work. An unrecognized mode gets a clean rejection, not a crash.
 _BOOT_PY_TEMPLATE = f"""\
 try:
     import ujson as _json
@@ -48,48 +56,69 @@ if _cfg is not None:
 
     if _wlan.isconnected():
         import usocket as _socket
+        import gc as _gc
+
+        _boot_ms = time.ticks_ms()
+        _MAX_CTRL_FRAME = 65536
+
+        def _recv_exact(_conn, _n):
+            _buf = b""
+            while len(_buf) < _n:
+                _chunk = _conn.recv(_n - len(_buf))
+                if not _chunk:
+                    raise OSError("connection closed")
+                _buf += _chunk
+            return _buf
+
+        def _read_json_frame(_conn):
+            _header = _recv_exact(_conn, 4)
+            _length = int.from_bytes(_header, "big")
+            if _length > _MAX_CTRL_FRAME:
+                raise OSError("control frame too large")
+            _body = _recv_exact(_conn, _length)
+            return _json.loads(_body)
+
+        def _send_json_frame(_conn, _obj):
+            _body = _json.dumps(_obj).encode()
+            _conn.send(len(_body).to_bytes(4, "big") + _body)
+
+        def _handle_status(_conn):
+            _hash = None
+            try:
+                with open("/.tether_hash") as _hf:
+                    _hash = _hf.read()
+            except OSError:
+                pass
+            _send_json_frame(_conn, {{
+                "protocol_version": {PROTOCOL_VERSION},
+                "tether_app_hash": _hash,
+                "free_heap": _gc.mem_free(),
+                "uptime_ms": time.ticks_diff(time.ticks_ms(), _boot_ms),
+                "ip": _wlan.ifconfig()[0],
+            }})
 
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
         _srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         _srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
         _srv.bind(_addr)
-        _srv.listen(1)
-        _conn, _client_addr = _srv.accept()
-        _srv.close()
+        _srv.listen(4)
 
-        try:
-            with open("/tether_app.py") as _f:
-                _tether_app_src = _f.read()
-        except OSError:
-            _tether_app_src = None
-
-        if _tether_app_src is not None:
-            import uasyncio as _asyncio
-
-            # The accepted connection is this boot's only listener - by
-            # design (see docs/superpowers/specs, "Explicitly out of
-            # scope") there is no re-listen once it drops; getting a fresh
-            # one needs a physical reset or a new provision-wifi run. So
-            # once the dispatch loop's stream hits EOF (peer disconnected)
-            # it raises up through here - let that end this boot.py run
-            # quietly rather than as an unhandled exception, since a
-            # dropped wifi client is an expected, not exceptional, way for
-            # a single-shot listener's one connection to end.
+        while True:
+            _conn, _client_addr = _srv.accept()
             try:
-                exec(
-                    _tether_app_src,
-                    {{
-                        "_tether_stream_override": (
-                            _asyncio.StreamReader(_conn),
-                            _asyncio.StreamWriter(_conn, {{}}),
-                        )
-                    }},
-                )
-            except (OSError, EOFError):
-                print(
-                    "tether: wifi client disconnected - boot.py exiting "
-                    "(reset or re-provision for a new connection)"
-                )
+                _preamble = _read_json_frame(_conn)
+                _mode = _preamble.get("mode")
+                _secret = _preamble.get("secret")
+                _expected_secret = _cfg.get("secret")
+                if _expected_secret is not None and _secret != _expected_secret:
+                    _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
+                elif _mode == "status":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_status(_conn)
+                else:
+                    _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
+            except Exception:
+                pass
             finally:
                 try:
                     _conn.close()

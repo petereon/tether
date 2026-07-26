@@ -47,7 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from mpy_runner import requires_micropython, run_micropython
 
-from tether.connection import PROTOCOL_VERSION, generate_bootstrap
+from tether.connection import PROTOCOL_VERSION
 
 
 @requires_micropython
@@ -317,44 +317,155 @@ _sys.modules["uos"] = _fake_uos
 
 
 @requires_micropython
-def test_boot_py_bridges_a_real_socket_into_the_dispatch_loop():
-    # Fakes `network` (no real wifi under the unix port) and monkeypatches
-    # the listen port to something unlikely to collide, then runs the
-    # REAL generated boot.py content against a REAL client connection made
-    # from a background thread using Python's own socket module - proving
-    # the exec()/uasyncio/socket mechanism actually works end-to-end, not
-    # just that the generated text looks plausible.
+def test_boot_py_status_mode_and_preamble_auth():
+    # Verifies the new preamble+accept-loop mechanism end-to-end. run and
+    # upload modes don't exist yet at this point in the plan (Tasks 4-5
+    # add them) - this test also exercises the "unknown mode" branch to
+    # prove the skeleton correctly rejects a mode it doesn't support yet,
+    # and the auth-failure branch, before anything is built on top of it.
+    import json as pc_json
     import socket
+    import struct
     import threading
     import time
 
-    test_port = 18765
+    from mpy_runner import run_micropython_background
+
+    test_port = 18767
     boot_py = (
         generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
         .decode()
         .replace(str(8765), str(test_port))
     )
 
-    sliced_source = "@mcu.export\ndef add(a: int, b: int) -> int:\n    return a + b"
-    tether_app_source = generate_bootstrap(sliced_source, "")
+    length_prefix = struct.Struct(">I")
 
-    client_result: dict[str, bytes] = {}
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
 
-    def run_client() -> None:
-        # Give the micropython process a moment to reach _srv.accept().
-        time.sleep(1.0)
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        # A real MSG_CALL frame for __tether_handshake__: [len:4][type:1][msgpack body]
-        import msgpack
+        send_json(sock, {"mode": "status", "secret": None})
+        results["status_ack"] = read_json(sock)
+        results["status_payload"] = read_json(sock)
+        sock.close()
 
-        from tether.marshalling import encode_frame
+        sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock2, {"mode": "bogus", "secret": None})
+        results["unknown_mode_ack"] = read_json(sock2)
+        sock2.close()
 
-        sock.sendall(encode_frame(1, {"id": 1, "name": "__tether_handshake__", "args": []}))
-        raw_len = sock.recv(4)
-        body_len = int.from_bytes(raw_len, "big")
-        body = sock.recv(body_len)
-        client_result["msg_type"] = body[:1]
-        client_result["payload"] = msgpack.unpackb(body[1:], raw=False)
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}'}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=3.0)
+    client_thread.join(timeout=10.0)
+
+    assert results["status_ack"] == {"ok": True}
+    payload = results["status_payload"]
+    assert payload["protocol_version"] == PROTOCOL_VERSION
+    assert payload["tether_app_hash"] is None
+    assert isinstance(payload["free_heap"], int)
+    assert isinstance(payload["uptime_ms"], int)
+    assert payload["ip"] == "10.0.0.5"
+    assert results["unknown_mode_ack"] == {"ok": False, "error": "unknown mode"}
+
+
+@requires_micropython
+def test_boot_py_rejects_wrong_secret():
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    test_port = 18768
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "status", "secret": "wrong-one"})
+        results["ack"] = read_json(sock)
         sock.close()
 
     client_thread = threading.Thread(target=run_client, daemon=True)
@@ -372,6 +483,8 @@ class _FakeWLAN:
         return True
     def connect(self, *a):
         pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
 
 class _FakeNetwork:
     STA_IF = 0
@@ -379,12 +492,7 @@ class _FakeNetwork:
 
 _sys.modules["network"] = _FakeNetwork
 
-# /tether_wifi.json and /tether_app.py would normally be real files on
-# the device - stand in with in-memory equivalents via a fake `open`.
-_files = {{
-    "/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}',
-    "/tether_app.py": {tether_app_source!r},
-}}
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant", "secret": "the-real-secret"}}'}}
 
 class _FakeFile:
     def __init__(self, content):
@@ -397,18 +505,251 @@ class _FakeFile:
         return False
 
 _real_open = open
-def _fake_open(path, *a, **kw):
+def _fake_open(path, mode="r", *a, **kw):
     if path in _files:
         return _FakeFile(_files[path])
-    return _real_open(path, *a, **kw)
+    raise OSError(2, "no such file")
 import builtins
 builtins.open = _fake_open
 
 {boot_py}
 """
 
-    run_micropython(script, timeout=10.0)
+    run_micropython_background(script, run_for=3.0)
     client_thread.join(timeout=10.0)
 
-    assert client_result.get("msg_type") == b"\x02"  # MSG_RESULT
-    assert client_result.get("payload") == {"id": 1, "value": PROTOCOL_VERSION}
+    assert results["ack"] == {"ok": False, "error": "auth failed"}
+
+
+@requires_micropython
+def test_boot_py_accepts_correct_secret():
+    # Companion to test_boot_py_rejects_wrong_secret: a board configured
+    # with a secret must accept a connection that presents the *matching*
+    # secret, not just reject a mismatched one. Without this, "wrong
+    # secret rejected" alone can't distinguish "auth works" from "auth
+    # always fails closed".
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    test_port = 18769
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "status", "secret": "the-real-secret"})
+        results["ack"] = read_json(sock)
+        results["payload"] = read_json(sock)
+        sock.close()
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant", "secret": "the-real-secret"}}'}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=3.0)
+    client_thread.join(timeout=10.0)
+
+    assert results["ack"] == {"ok": True}
+    payload = results["payload"]
+    assert payload["protocol_version"] == PROTOCOL_VERSION
+    assert payload["ip"] == "10.0.0.5"
+
+
+@requires_micropython
+def test_boot_py_survives_malformed_preamble_and_serves_next_connection():
+    # Regression test for the accept-loop's per-connection exception
+    # handling being too narrow (only `except OSError`). Against the real
+    # micropython interpreter: ujson.loads() on malformed JSON bytes
+    # raises ValueError, and calling .get("mode") on syntactically-valid
+    # but non-dict JSON (e.g. a bare int) raises AttributeError. Neither
+    # was an OSError, so either one used to propagate out of the
+    # `while True:` accept-loop and kill the whole boot.py process - a
+    # single malformed/non-JSON preamble (client bug, port scanner, stray
+    # TCP probe) would permanently take down the listener, requiring a
+    # physical reset. The real proof the loop survives isn't "no
+    # exception was visibly raised" - it's that a SUBSEQUENT,
+    # well-formed connection is still served afterward.
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    test_port = 18770
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def send_raw_frame(sock, body):
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+
+        # 1. Malformed JSON bytes - ujson.loads() raises ValueError.
+        sock1 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_raw_frame(sock1, b"{not valid json at all")
+        sock1.close()
+        time.sleep(0.3)
+
+        # 2. Syntactically valid JSON, but not an object - .get("mode")
+        # raises AttributeError on the parsed int.
+        sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock2, 42)
+        sock2.close()
+        time.sleep(0.3)
+
+        # 3. A subsequent, well-formed connection must still be served -
+        # this is the real proof the accept-loop didn't crash.
+        sock3 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock3, {"mode": "status", "secret": None})
+        results["status_ack"] = read_json(sock3)
+        results["status_payload"] = read_json(sock3)
+        sock3.close()
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}'}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=4.0)
+    client_thread.join(timeout=10.0)
+
+    assert "status_ack" in results, (
+        "no response to the well-formed connection sent AFTER the malformed "
+        "ones - the accept-loop likely crashed and killed the whole process"
+    )
+    assert results["status_ack"] == {"ok": True}
+    payload = results["status_payload"]
+    assert payload["protocol_version"] == PROTOCOL_VERSION
+    assert payload["ip"] == "10.0.0.5"
