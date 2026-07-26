@@ -36,9 +36,20 @@ def generate_bootstrap(sliced_source: str, stubs_source: str) -> str:
     normal serial path, registers every @mcu.export/@mcu.loop function
     plus the protocol handshake handler, and runs the dispatch loop
     forever.
+
+    Clears mcu_decorators._registrations at the very start, before the
+    sliced @mcu.export/@mcu.loop/@pc.export definitions (and their decorator
+    applications) run - without this, repeated exec() of the same generated
+    script within one interpreter process (the wifi accept-loop does this;
+    serial's hardware-reset-based reconnect never does) would accumulate
+    duplicate registrations, harmless for plain handlers (a dict) but not
+    for @mcu.loop (a list Dispatcher._loops appends to - duplicates spawn
+    duplicate background tasks).
     """
     return f"""\
 from mcu_decorators import mcu, pc, registered_mcu_functions
+import mcu_decorators as _tether_mcu_decorators
+_tether_mcu_decorators._registrations.clear()
 import dispatch as _tether_dispatch
 import uasyncio as _tether_asyncio
 import sys as _tether_sys

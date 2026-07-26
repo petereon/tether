@@ -363,6 +363,56 @@ asyncio.run(_run_test())
     assert "read_temp: 21.5" in out
 
 
+@requires_micropython
+def test_generate_bootstrap_clears_mcu_decorators_registry_before_re_exec():
+    # Regression test for a bug the wifi accept-loop (Tasks 3-5) would
+    # otherwise introduce: mcu_decorators._registrations is module-level
+    # state that accumulates across repeated exec() of the same generated
+    # bootstrap within one interpreter process. Runs the exact same
+    # generated bootstrap TWICE in one micropython process (a fake reader
+    # that immediately raises EOFError lets _tether_main() exit quickly
+    # each time, standing in for "the wifi connection just closed") and
+    # asserts mcu_decorators._registrations never grows past what ONE
+    # exec's own decorator applications produce - it must be exactly 1
+    # after both the first AND the second exec, not 1 then 2.
+    sliced_source = "@mcu.loop(interval_ms=50)\ndef tick():\n    pass\n"
+    bootstrap = generate_bootstrap(sliced_source, "")
+
+    script = f"""
+import uasyncio as asyncio
+import mcu_decorators
+
+class _EOFReader:
+    async def readexactly(self, n):
+        raise EOFError("closed")
+
+class _NullWriter:
+    def write(self, data):
+        pass
+    async def drain(self):
+        pass
+
+async def run_once():
+    ns = {{"_tether_stream_override": (_EOFReader(), _NullWriter())}}
+    try:
+        exec({bootstrap!r}, ns)
+    except EOFError:
+        pass
+
+async def main():
+    await run_once()
+    print("after_first:", len(mcu_decorators._registrations))
+    await run_once()
+    print("after_second:", len(mcu_decorators._registrations))
+
+asyncio.run(main())
+"""
+    out = run_micropython(script, timeout=10.0)
+
+    assert "after_first: 1" in out
+    assert "after_second: 1" in out
+
+
 def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int) -> None:
     """Stand-in for an already-running on-device runtime, reachable over a
     real TCP socket: exactly what DESIGN.md's "board must already be
