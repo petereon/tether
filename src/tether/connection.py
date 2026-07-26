@@ -332,19 +332,22 @@ def _connect_mock(
     return board
 
 
-def _upload_if_needed(
-    ser: Any, serial_transport: Any, bootstrap: str, bundle_hash: str, *, timeout: float
-) -> None:
-    existing_hash = serial_transport.read_file(ser, "/.tether_hash", timeout=timeout)
-    if existing_hash is not None and existing_hash.decode() == bundle_hash:
-        return
+def _gather_runtime_bundle(
+    bootstrap: str, bundle_hash: str
+) -> tuple[dict[str, bytes], tuple[str, ...]]:
+    """Every file a fresh board needs: the whole tether_runtime library
+    (dispatch.py, mcu_decorators.py, vendored umsgpack) plus this
+    connection's own sliced app and hash sentinel. Shared between serial's
+    _upload_if_needed and wifi's upload mode (_connect_wifi) - both need
+    the exact same file set, so this is the one place that gathers it.
 
+    Derived from disk rather than hand-listed - a new file landing in
+    tether_runtime/ (e.g. a future umsgpack helper) is picked up
+    automatically instead of silently missing from the upload until an
+    on-device ImportError surfaces it. __init__.py is the one PC-side-only
+    marker file (see its own docstring) and is excluded.
+    """
     runtime_dir = Path(__file__).resolve().parents[1] / "tether_runtime"
-    # Derived from disk rather than hand-listed - a new file landing in
-    # tether_runtime/ (e.g. a future umsgpack helper) is picked up
-    # automatically instead of silently missing from the upload until an
-    # on-device ImportError surfaces it. __init__.py is the one PC-side-only
-    # marker file (see its own docstring) and is excluded.
     runtime_paths = [
         p for p in sorted(runtime_dir.rglob("*.py")) if p != runtime_dir / "__init__.py"
     ]
@@ -360,16 +363,23 @@ def _upload_if_needed(
             }
         )
     )
-    serial_transport.write_files(
-        ser,
-        {
-            **runtime_files,
-            "/tether_app.py": bootstrap.encode(),
-            "/.tether_hash": bundle_hash.encode(),
-        },
-        dirs=runtime_dirs,
-        timeout=timeout,
-    )
+    files = {
+        **runtime_files,
+        "/tether_app.py": bootstrap.encode(),
+        "/.tether_hash": bundle_hash.encode(),
+    }
+    return files, runtime_dirs
+
+
+def _upload_if_needed(
+    ser: Any, serial_transport: Any, bootstrap: str, bundle_hash: str, *, timeout: float
+) -> None:
+    existing_hash = serial_transport.read_file(ser, "/.tether_hash", timeout=timeout)
+    if existing_hash is not None and existing_hash.decode() == bundle_hash:
+        return
+
+    files, runtime_dirs = _gather_runtime_bundle(bootstrap, bundle_hash)
+    serial_transport.write_files(ser, files, dirs=runtime_dirs, timeout=timeout)
 
 
 def _connect_serial(
@@ -492,27 +502,88 @@ def _connect_serial(
 
 def _connect_wifi(
     rest: str,
+    bootstrap: str,
     export_specs: dict[str, Any],
+    exported_names: frozenset[str],
     pc_handlers: dict[str, Callable[..., Any]],
     *,
     timeout: float,
+    secret: str | None = None,
 ) -> BoardHandle:
-    """Connect to an already-running on-device runtime over TCP. No slicing,
-    bundling, or upload here (DESIGN.md § Transports: tether never pushes
-    code over wifi) - export_specs (from the caller's already-executed
-    @mcu.export functions, same as every other scheme) is all this needs to
-    build a working BoardHandle.
+    """Connect over TCP to a boot.py-managed wifi listener. Unlike the
+    original design, this now mirrors _connect_serial's shape: slice,
+    hash-check, upload-if-needed, then run - just with the hash-check
+    piggybacked on a `status`-mode query instead of a direct file read,
+    and upload/run as two separate connections instead of one persistent
+    raw-REPL session (see the design spec for why).
     """
+    import os
+
     from tether.transports import wifi as wifi_transport
 
     host, _, port_str = rest.partition(":")
     port = int(port_str) if port_str else wifi_transport.DEFAULT_PORT
+    resolved_secret = secret if secret is not None else os.environ.get("TETHER_WIFI_SECRET")
+
+    unsliced = export_specs.keys() - exported_names
+    if unsliced:
+        raise RuntimeError(
+            f"{sorted(unsliced)} are decorated with @mcu.export/@mcu.loop but weren't "
+            "found by static analysis of the source - decorated functions must be plain "
+            "top-level `def`/`async def` statements, not conditionally defined "
+            "(DESIGN.md § Standing design constraint)"
+        )
+
+    bundle_hash = _hash_bundle(bootstrap)
     # See _connect_mock's matching comment.
     board: BoardHandle | None = None
 
+    def _query_status(sock: Any) -> dict[str, Any]:
+        wifi_transport.send_preamble(sock, "status", resolved_secret)
+        return wifi_transport.read_json_frame(sock)
+
+    def _upload(sock: Any) -> None:
+        wifi_transport.send_preamble(sock, "upload", resolved_secret)
+        # Full bundle (tether_runtime library + app + hash), same set and
+        # same dirs-sorted-by-depth-by-the-client convention
+        # _upload_if_needed uses for serial - see _gather_runtime_bundle.
+        files, dirs = _gather_runtime_bundle(bootstrap, bundle_hash)
+        manifest = {
+            "dirs": list(dirs),
+            "files": [{"path": path, "size": len(content)} for path, content in files.items()],
+        }
+        wifi_transport.send_json_frame(sock, manifest)
+        for content in files.values():
+            wifi_transport.send_bytes_frame(sock, content)
+        result = wifi_transport.read_json_frame(sock)
+        if not result.get("ok", False):
+            raise RuntimeError(f"wifi upload failed: {result.get('error')}")
+
     def dial() -> Dispatcher:
+        import socket as socket_module
+
+        status_sock = socket_module.create_connection((host, port), timeout=timeout)
+        try:
+            status = _query_status(status_sock)
+        finally:
+            status_sock.close()
+
+        if status.get("tether_app_hash") != bundle_hash:
+            upload_sock = socket_module.create_connection((host, port), timeout=timeout)
+            try:
+                _upload(upload_sock)
+            finally:
+                upload_sock.close()
+
+        # wifi_transport.connect() (not a bare socket_module.create_connection,
+        # unlike status/upload above) - reuses its existing TCP_NODELAY +
+        # blocking-timeout-handoff setup, already correct and
+        # hardware-verified for the long-lived RPC stream this becomes.
+        # The short-lived status/upload connections above don't need that
+        # treatment, so a plain socket is simplest for those.
         stream = wifi_transport.connect(host, port, timeout=timeout)
         try:
+            wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
             return _start_and_handshake(
                 stream,
                 timeout=timeout,
@@ -521,10 +592,6 @@ def _connect_wifi(
                 board=board,
             )
         except BaseException:
-            # Matches _connect_serial's dial(): a failed handshake (wrong
-            # protocol version, no response) must not leak the socket - see
-            # that closure's own comment for why the reader thread itself
-            # (if already started) can't be cleanly stopped regardless.
             stream.close()
             raise
 
@@ -568,11 +635,16 @@ def _connect_ble(
     return board
 
 
-def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
+def connect(address: str, *, timeout: float = 10.0, secret: str | None = None) -> BoardHandle:
     """Slice -> stub -> bundle -> hash-check -> upload -> handshake -> ready.
 
     `address` scheme selects transport:
       "serial:auto" | "serial:/dev/ttyUSB0" | "wifi:<ip>" | "ble:<addr>" | "mock://"
+
+    `secret` (wifi only): the shared secret configured during
+    `tether provision-wifi`. Falls back to the TETHER_WIFI_SECRET
+    environment variable if omitted. Required when the device has one
+    configured (raises WifiAuthError if missing/wrong); ignored otherwise.
 
     Auto-detects the calling file's source (must be called from a real .py
     file) - matches the "single file" pitch: no need to pass your own
@@ -597,7 +669,18 @@ def connect(address: str, *, timeout: float = 10.0) -> BoardHandle:
             timeout=timeout,
         )
     elif scheme == "wifi":
-        board = _connect_wifi(rest, export_specs, pc_handlers, timeout=timeout)
+        sliced = slice_mcu_bound(source, base_dir=base_dir)
+        stubs = generate_pc_stubs(source)
+        bootstrap = generate_bootstrap(sliced.source, stubs.source)
+        board = _connect_wifi(
+            rest,
+            bootstrap,
+            export_specs,
+            sliced.exported_names,
+            pc_handlers,
+            timeout=timeout,
+            secret=secret,
+        )
     elif scheme == "ble":
         board = _connect_ble(rest, export_specs, pc_handlers, timeout=timeout)
     else:

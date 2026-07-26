@@ -7,8 +7,9 @@ import pytest
 
 from tether import mcu, pc
 from tether._context import current_board
-from tether.connection import PROTOCOL_VERSION, connect, generate_bootstrap
+from tether.connection import PROTOCOL_VERSION, _connect_wifi, connect, generate_bootstrap
 from tether.dispatch import Dispatcher
+from tether.slicer import slice_mcu_bound
 from tether.transports.wifi import WifiStream
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -417,14 +418,69 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
     """Stand-in for an already-running on-device runtime, reachable over a
     real TCP socket: exactly what DESIGN.md's "board must already be
     running a bootstrapped runtime" precondition assumes for the wifi
-    transport (chunk 12's actual scope - see transports/wifi.py's module
-    docstring for why this chunk doesn't build the device side of that).
-    Runs a real tether.dispatch.Dispatcher server-side, registered with a
-    handshake handler and one export, over a real accepted connection.
+    transport. Since Task 6, connect("wifi:...") always does
+    status -> upload-if-needed -> run (see _connect_wifi), so this fake
+    device speaks all three steps - it always reports no on-device hash
+    (forcing an upload) and discards whatever gets uploaded, since this
+    test's only concern is "connect() reaches a live device end-to-end",
+    not upload content (that's
+    test_connect_wifi_uploads_when_hash_differs_then_runs's job). Runs a
+    real tether.dispatch.Dispatcher server-side for the run connection,
+    registered with a handshake handler and one export.
     """
-    conn, _addr = sock.accept()
+    import json
+    import struct
 
-    stream = WifiStream(conn)  # reuse the real transport class on the fake device side too
+    length_prefix = struct.Struct(">I")
+
+    def read_json(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += conn.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(conn, obj):
+        body = json.dumps(obj).encode()
+        conn.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_bytes_frame(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        buf = b""
+        while len(buf) < length:
+            buf += conn.recv(length - len(buf))
+        return buf
+
+    # 1. status connection - reports no hash, so the client must upload.
+    conn, _addr = sock.accept()
+    preamble = read_json(conn)
+    assert preamble["mode"] == "status"
+    send_json(conn, {"ok": True})
+    send_json(conn, {"tether_app_hash": None})
+    conn.close()
+
+    # 2. upload connection - receive and discard the manifest + file bytes.
+    conn2, _addr = sock.accept()
+    preamble2 = read_json(conn2)
+    assert preamble2["mode"] == "upload"
+    send_json(conn2, {"ok": True})
+    manifest = read_json(conn2)
+    for file_meta in manifest["files"]:
+        remaining = file_meta["size"]
+        while remaining > 0:
+            remaining -= len(read_bytes_frame(conn2))
+    send_json(conn2, {"ok": True})
+    conn2.close()
+
+    # 3. run connection - ack the preamble, then serve a real Dispatcher.
+    conn3, _addr = sock.accept()
+    preamble3 = read_json(conn3)
+    assert preamble3["mode"] == "run"
+    send_json(conn3, {"ok": True})
+
+    stream = WifiStream(conn3)  # reuse the real transport class on the fake device side too
     dispatcher = Dispatcher(stream, stream)
     dispatcher.register("__tether_handshake__", lambda: handshake_version)
     # Matches the module-level `_mock_read_temp` @mcu.export function
@@ -438,7 +494,7 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
 def test_connect_wifi_reaches_an_already_running_device_over_a_real_tcp_socket():
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
+    listener.listen(4)
     port = listener.getsockname()[1]
     threading.Thread(
         target=_serve_one_device_connection,
@@ -460,3 +516,147 @@ def test_connect_ble_reaches_the_ble_transport_and_fails_loud_without_bleak_inst
     # than silently no-op'ing or hitting the wrong branch.
     with pytest.raises(ModuleNotFoundError, match="bleak"):
         connect("ble:00:11:22:33:44:55", timeout=1.0)
+
+
+def test_connect_wifi_uploads_when_hash_differs_then_runs():
+    import json
+    import socket
+    import struct
+    import threading
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(sock, obj):
+        body = json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def recv_exact(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def read_bytes_frame(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        return recv_exact(sock, length)
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(4)
+    port = server_sock.getsockname()[1]
+
+    received_files: dict[str, bytes] = {}
+    received_dirs: list = []
+
+    def fake_device():
+        # 1. status connection - reports no hash, so the client must upload.
+        conn, _ = server_sock.accept()
+        preamble = read_json(conn)
+        assert preamble["mode"] == "status"
+        send_json(conn, {"ok": True})
+        send_json(
+            conn,
+            {
+                "protocol_version": 1,
+                "tether_app_hash": None,
+                "free_heap": 100000,
+                "uptime_ms": 500,
+                "ip": "127.0.0.1",
+            },
+        )
+        conn.close()
+
+        # 2. upload connection - receive the manifest, then each file's bytes.
+        conn2, _ = server_sock.accept()
+        preamble2 = read_json(conn2)
+        assert preamble2["mode"] == "upload"
+        send_json(conn2, {"ok": True})
+        manifest = read_json(conn2)
+        received_dirs.extend(manifest["dirs"])
+        for file_meta in manifest["files"]:
+            remaining = file_meta["size"]
+            content = b""
+            while remaining > 0:
+                chunk = read_bytes_frame(conn2)
+                content += chunk
+                remaining -= len(chunk)
+            received_files[file_meta["path"]] = content
+        send_json(conn2, {"ok": True})
+        conn2.close()
+
+        # 3. run connection - ack the preamble, then answer the handshake.
+        conn3, _ = server_sock.accept()
+        preamble3 = read_json(conn3)
+        assert preamble3["mode"] == "run"
+        send_json(conn3, {"ok": True})
+
+        import msgpack
+
+        header = conn3.recv(4)
+        body_len = int.from_bytes(header, "big")
+        body = conn3.recv(body_len)
+        request = msgpack.unpackb(body[1:], raw=False)
+        assert request["name"] == "__tether_handshake__"
+
+        from tether.marshalling import encode_frame
+
+        conn3.sendall(encode_frame(2, {"id": request["id"], "value": PROTOCOL_VERSION}))
+        # Keep the connection open briefly so BoardHandle construction
+        # completes before the test tears down - the reader thread inside
+        # Dispatcher.start() needs a live socket to not immediately see EOF.
+        conn3.settimeout(2.0)
+        try:
+            conn3.recv(1)
+        except OSError:
+            pass
+        conn3.close()
+
+    server_thread = threading.Thread(target=fake_device, daemon=True)
+    server_thread.start()
+
+    source = (
+        "from tether import mcu, pc\n\n"
+        "@mcu.export\n"
+        "def add(a: int, b: int) -> int:\n"
+        "    return a + b\n"
+    )
+    export_specs = {"add": object()}  # exact value unused by this path; presence is what matters
+    pc_handlers: dict = {}
+
+    sliced = slice_mcu_bound(source)
+    bootstrap = generate_bootstrap(sliced.source, "")
+
+    board = _connect_wifi(
+        f"127.0.0.1:{port}",
+        bootstrap,
+        export_specs,
+        sliced.exported_names,
+        pc_handlers,
+        timeout=5.0,
+    )
+
+    server_thread.join(timeout=5.0)
+    # Full bundle, not just tether_app.py - the design spec explicitly
+    # requires wifi upload to push the whole tether_runtime library too
+    # (dispatch.py, mcu_decorators.py, vendored umsgpack), same as serial's
+    # _upload_if_needed already does, so "wifi never needs serial again
+    # after the first provision" is actually true.
+    assert received_files["/tether_app.py"] == bootstrap.encode()
+    assert "/.tether_hash" in received_files
+    assert "/dispatch.py" in received_files
+    assert "/mcu_decorators.py" in received_files
+    assert "/umsgpack/__init__.py" in received_files
+    assert received_dirs == ["/umsgpack"]
+    assert board is not None
