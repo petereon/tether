@@ -47,7 +47,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from mpy_runner import requires_micropython, run_micropython
 
-from tether.connection import PROTOCOL_VERSION
+from tether.connection import PROTOCOL_VERSION, generate_bootstrap
 
 
 @requires_micropython
@@ -753,3 +753,133 @@ builtins.open = _fake_open
     payload = results["status_payload"]
     assert payload["protocol_version"] == PROTOCOL_VERSION
     assert payload["ip"] == "10.0.0.5"
+
+
+@requires_micropython
+def test_boot_py_run_mode_survives_a_reconnect_without_a_reset():
+    # The core proof this task exists for: two SUCCESSIVE run-mode
+    # connections against the same boot.py process, neither needing a
+    # physical reset - this directly resolves the original wifi design's
+    # deferred "no re-listen" limitation. (The mcu_decorators registry
+    # duplication risk this reconnect pattern would otherwise hit is
+    # separately, directly covered by Task 2's dedicated unit test - this
+    # test's job is proving the reconnect itself works end-to-end, not
+    # re-proving that specific mechanism.)
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    import msgpack
+    from mpy_runner import run_micropython_background
+
+    from tether.marshalling import encode_frame
+
+    test_port = 18769
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    sliced_source = "@mcu.export\ndef add(a: int, b: int) -> int:\n    return a + b"
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    def do_one_run_session():
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "run", "secret": None})
+        ack = read_json(sock)
+        assert ack == {"ok": True}, ack
+
+        sock.sendall(encode_frame(1, {"id": 1, "name": "__tether_handshake__", "args": []}))
+        raw_len = sock.recv(4)
+        body_len = int.from_bytes(raw_len, "big")
+        body = sock.recv(body_len)
+        msg_type = body[:1]
+        payload = msgpack.unpackb(body[1:], raw=False)
+        sock.close()
+        return msg_type, payload
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+        results["first"] = do_one_run_session()
+        # boot.py's loop needs a moment to close the first connection and
+        # get back to accept() - a short pause avoids a spurious connection
+        # refusal racing that turnaround.
+        time.sleep(0.5)
+        results["second"] = do_one_run_session()
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{
+    "/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}',
+    "/tether_app.py": {tether_app_source!r},
+}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=4.0)
+    client_thread.join(timeout=10.0)
+
+    for label in ("first", "second"):
+        msg_type, payload = results[label]
+        assert msg_type == b"\x02", (label, msg_type)  # MSG_RESULT
+        assert payload == {"id": 1, "value": PROTOCOL_VERSION}, (label, payload)

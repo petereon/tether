@@ -97,6 +97,32 @@ if _cfg is not None:
                 "ip": _wlan.ifconfig()[0],
             }})
 
+        def _handle_run(_conn):
+            try:
+                with open("/tether_app.py") as _f:
+                    _tether_app_src = _f.read()
+            except OSError:
+                _tether_app_src = None
+
+            if _tether_app_src is not None:
+                import uasyncio as _asyncio
+
+                try:
+                    exec(
+                        _tether_app_src,
+                        {{
+                            "_tether_stream_override": (
+                                _asyncio.StreamReader(_conn),
+                                _asyncio.StreamWriter(_conn, {{}}),
+                            )
+                        }},
+                    )
+                except (OSError, EOFError):
+                    print(
+                        "tether: wifi client disconnected - run session "
+                        "ending (reconnect any time, no reset needed)"
+                    )
+
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
         _srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         _srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -115,6 +141,9 @@ if _cfg is not None:
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
                     _handle_status(_conn)
+                elif _mode == "run":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_run(_conn)
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
             except Exception:
