@@ -15,12 +15,22 @@ chunk.
 
 from __future__ import annotations
 
+import json
 import socket
+import struct
 from typing import Any
 
 DEFAULT_PORT = 8765
 
 _RECV_CHUNK = 65536
+
+_LENGTH_PREFIX = struct.Struct(">I")
+
+# Same resource-safety bound as the RPC layer's MAX_FRAME_SIZE
+# (tether/marshalling) - a declared length this large would risk buffering
+# an unbounded amount of attacker/bug-controlled data before anything is
+# validated, same risk shape regardless of what's inside the frame.
+MAX_CONTROL_FRAME_SIZE = 1 << 16  # 64 KiB
 
 
 class WifiStream:
@@ -43,6 +53,71 @@ class WifiStream:
 
     def close(self) -> None:
         self._sock.close()
+
+
+def _recv_exact(sock: Any, n: int) -> bytes:
+    chunks = []
+    remaining = n
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise OSError("connection closed while reading a frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_json_frame(sock: Any, payload: dict[str, Any]) -> None:
+    """Send `[4-byte length][utf-8 json body]`. Used for the wifi
+    preamble/status/upload control channel - deliberately not the msgpack
+    frame format the RPC layer (tether.marshalling) uses, since msgpack
+    decoding depends on the vendored umsgpack.py, which may not exist yet
+    on a board this control channel is partly responsible for provisioning
+    in the first place (see the design spec's 2026-07-26 correction).
+    """
+    body = json.dumps(payload).encode("utf-8")
+    sock.sendall(_LENGTH_PREFIX.pack(len(body)) + body)
+
+
+def read_json_frame(sock: Any) -> dict[str, Any]:
+    header = _recv_exact(sock, _LENGTH_PREFIX.size)
+    (length,) = _LENGTH_PREFIX.unpack(header)
+    if length > MAX_CONTROL_FRAME_SIZE:
+        raise OSError(f"control frame too large: declared {length} bytes")
+    body = _recv_exact(sock, length)
+    return json.loads(body.decode("utf-8"))
+
+
+def send_bytes_frame(sock: Any, data: bytes) -> None:
+    """Send `[4-byte length][raw bytes]` - used for upload mode's file
+    content, which is not JSON-wrapped (JSON can't carry arbitrary binary
+    cleanly, and there's no need to make it).
+    """
+    sock.sendall(_LENGTH_PREFIX.pack(len(data)) + data)
+
+
+def read_bytes_frame(sock: Any) -> bytes:
+    header = _recv_exact(sock, _LENGTH_PREFIX.size)
+    (length,) = _LENGTH_PREFIX.unpack(header)
+    if length > MAX_CONTROL_FRAME_SIZE:
+        raise OSError(f"control frame too large: declared {length} bytes")
+    return _recv_exact(sock, length)
+
+
+def send_preamble(sock: Any, mode: str, secret: str | None) -> None:
+    """Send the connection preamble (mode + shared secret) and wait for the
+    device's ack. Raises WifiAuthError if the device rejects it - every
+    mode gets an explicit ack/nack before any mode-specific work begins,
+    including `run` (one extra round trip, worth it so a bad secret always
+    surfaces as a clear WifiAuthError rather than a confusing downstream
+    failure specific to whichever mode was requested).
+    """
+    from tether.errors import WifiAuthError
+
+    send_json_frame(sock, {"mode": mode, "secret": secret})
+    response = read_json_frame(sock)
+    if not response.get("ok", False):
+        raise WifiAuthError(response.get("error") or "connection rejected by device")
 
 
 def connect(host: str, port: int = DEFAULT_PORT, *, timeout: float = 10.0) -> WifiStream:

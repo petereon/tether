@@ -31,3 +31,9 @@ class MCUDisconnectedError(TetherError):
 
 class ProtocolVersionError(TetherError):
     """PC-side library and on-device runtime speak incompatible protocol versions."""
+
+
+class WifiAuthError(TetherError):
+    """The wifi listener rejected this connection's shared secret (or its
+    absence) during the mode-selection preamble.
+    """
