@@ -117,7 +117,7 @@ if _cfg is not None:
                     _handle_status(_conn)
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
-            except OSError:
+            except Exception:
                 pass
             finally:
                 try:
