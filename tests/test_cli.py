@@ -469,19 +469,23 @@ def _patch_fake_serial(monkeypatch):
 
 def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
     _patch_fake_serial(monkeypatch)
-    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    calls = []
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
     monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     written = {}
 
     def fake_write_files(ser, files, **kwargs):
+        calls.append("write")
         written.update(files)
 
     monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
-    monkeypatch.setattr(
-        "tether.transports.serial.run_python",
-        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
-    )
+
+    def fake_run_python(ser, code, timeout=5.0):
+        calls.append("run_python")
+        return (b"aa:bb:cc:dd:ee:ff\n", b"")
+
+    monkeypatch.setattr("tether.transports.serial.run_python", fake_run_python)
 
     result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
 
@@ -489,6 +493,17 @@ def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
     assert set(written.keys()) == {"/boot.py", "/tether_ble.json"}
     assert "Shared secret" in result.output
     assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    # Final-review finding (F2). run_python enters the raw REPL via a Ctrl-C
+    # interrupt, which kills whatever boot.py is running - so the MAC read
+    # must happen BEFORE the final reset, leaving reset_board the last
+    # serial operation exactly as provision-wifi does. Reversed (the
+    # original order) the board is left advertising with nothing servicing
+    # its BLE session loop, and every later connect attempt hangs until a
+    # physical power cycle.
+    assert calls == ["reset", "write", "run_python", "reset"], (
+        "provision-ble must reset before write (known state) and reset LAST, "
+        "after every raw-REPL operation, so the new boot.py is left running"
+    )
 
 
 def test_provision_ble_warns_if_wifi_already_provisioned(monkeypatch):
@@ -567,8 +582,10 @@ def test_status_ble_addr_tries_ble_first_non_destructively(monkeypatch):
             calls.append(("close",))
 
     class _FakeChannel:
-        def __init__(self, stream):
-            pass
+        def __init__(self, stream, *, timeout=None):
+            # Final-review finding (F1): status must bound its BLE reads -
+            # a board that connects but never answers used to hang here.
+            calls.append(("channel_timeout", timeout))
 
         def send_preamble(self, mode, secret):
             calls.append(("preamble", mode))
@@ -595,6 +612,8 @@ def test_status_ble_addr_tries_ble_first_non_destructively(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
     assert ("reset_board",) not in calls
+    timeouts = [call[1] for call in calls if call[0] == "channel_timeout"]
+    assert timeouts and all(t is not None for t in timeouts), calls
 
 
 def test_status_ble_addr_falls_back_to_serial_when_ble_unreachable(monkeypatch):
@@ -618,3 +637,37 @@ def test_status_ble_addr_falls_back_to_serial_when_ble_unreachable(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "not currently connected" in result.output.lower()
+
+
+def test_status_ble_addr_without_bleak_installed_fails_loud_without_resetting(monkeypatch):
+    # Final-review finding (F9). `bleak` is an optional extra (tether[ble]).
+    # Its ModuleNotFoundError used to be swallowed by the same
+    # `except Exception` that means "device unreachable, fall back to
+    # serial" - so a missing dependency silently took the destructive
+    # raw-REPL path, hardware-resetting the board. Avoiding exactly that
+    # reset is why the two-tier BLE/serial status design exists.
+    calls = []
+
+    def raise_missing_bleak(addr, timeout=5.0):
+        raise ModuleNotFoundError("No module named 'bleak'")
+
+    monkeypatch.setattr("tether.transports.ble.connect", raise_missing_bleak)
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board", lambda ser: calls.append("reset_board")
+    )
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (
+            b'{"provisioned": true, "connected": false, "ip": null}',
+            b"",
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--port", "/dev/ttyUSB0", "--ble-addr", "AA:BB:CC:DD:EE:FF"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "tether[ble]" in result.output
+    assert calls == [], "a missing optional dependency must never reset the board"

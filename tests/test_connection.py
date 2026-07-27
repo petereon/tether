@@ -1198,3 +1198,151 @@ def test_connect_wifi_respects_timeout_when_run_mode_preamble_is_never_acked():
     # proves this raised because the timeout fired, not because the device
     # eventually responded or the test got lucky on timing.
     assert elapsed < 5.0, f"mcu.connect() took {elapsed:.1f}s to raise - timeout wasn't respected"
+
+
+def test_connect_ble_fails_fast_when_the_device_connects_but_never_answers():
+    # Final-review finding (F1). A board that accepts the BLE link and then
+    # goes silent used to hang _connect_ble forever (BleStream.read was an
+    # unbounded queue.get with no timeout anywhere above it) - the exact
+    # hang wifi's own preamble ack read was already fixed for. `timeout`
+    # must reach the control exchange.
+    import sys
+    import time
+    import types
+    from unittest.mock import patch
+
+    from tether.connection import _connect_ble
+
+    class _SilentBleakClient:
+        """Connects, subscribes, accepts writes - and never notifies
+        anything back. The "device is up but its session loop is wedged"
+        case, which no connect-level timeout alone can catch.
+        """
+
+        mtu_size = 200
+
+        def __init__(self, address, disconnected_callback=None):
+            self.address = address
+
+        async def connect(self, timeout=10.0):
+            pass
+
+        async def start_notify(self, char_uuid, callback):
+            pass
+
+        async def write_gatt_char(self, char_uuid, data, response=True):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    fake_bleak = types.ModuleType("bleak")
+    fake_bleak.BleakClient = _SilentBleakClient
+
+    started = time.monotonic()
+    with (
+        patch.dict(sys.modules, {"bleak": fake_bleak}),
+        pytest.raises(OSError, match="timed out"),
+    ):
+        _connect_ble("AA:BB:CC:DD:EE:FF", "print('hi')\n", {}, frozenset(), {}, timeout=0.3)
+    assert time.monotonic() - started < 5.0, "connect() hung well past its own timeout"
+
+
+def test_connect_ble_refuses_to_strand_control_bytes_at_the_run_handover():
+    # Final-review finding (F8). The device side explicitly seeds its
+    # run-mode reader with _conn.take_buffer() (provisioning.py) so nothing
+    # it over-read during the synchronous preamble exchange is lost. The PC
+    # side has no equivalent drain - it hands the raw stream to the
+    # Dispatcher, so anything left in the control channel's buffer would be
+    # silently dropped and the handshake would hang with no diagnosis. The
+    # buffer is provably empty today; the assertion is what keeps it that
+    # way if either side's chunking ever changes.
+    import json
+    import sys
+    import types
+    from unittest.mock import patch
+
+    from tether.connection import _connect_ble, _hash_bundle
+
+    bootstrap = "print('hi')\n"
+    bundle_hash = _hash_bundle(bootstrap)
+
+    class _CoalescingDevice:
+        """Answers status normally (hash already matches, so no upload),
+        then packs the run-mode ack and trailing bytes into ONE
+        notification - exactly the shape a chunking change could produce,
+        and the shape that strands bytes in the channel's buffer.
+        """
+
+        def __init__(self, client):
+            self._client = client
+            self._buffer = b""
+
+        @staticmethod
+        def _frame(obj):
+            body = json.dumps(obj).encode()
+            return len(body).to_bytes(4, "big") + body
+
+        def feed(self, data):
+            self._buffer += bytes(data)
+            while len(self._buffer) >= 4:
+                length = int.from_bytes(self._buffer[:4], "big")
+                if len(self._buffer) < 4 + length:
+                    return
+                body = self._buffer[4 : 4 + length]
+                self._buffer = self._buffer[4 + length :]
+                self._handle(json.loads(body))
+
+        def _handle(self, preamble):
+            notify = self._client._notify_cb
+            ack = self._frame({"ok": True})
+            if preamble["mode"] == "run":
+                # ONE notification carrying the ack AND bytes that belong
+                # to the Dispatcher - the control channel reads the ack out
+                # of it and strands the rest in its own buffer.
+                notify(None, bytearray(ack + b"stray-rpc-bytes"))
+                return
+            notify(None, bytearray(ack))
+            if preamble["mode"] == "status":
+                notify(
+                    None,
+                    bytearray(
+                        self._frame(
+                            {
+                                "protocol_version": PROTOCOL_VERSION,
+                                "tether_app_hash": bundle_hash,
+                                "free_heap": 100000,
+                                "uptime_ms": 500,
+                                "ip": "aa:bb:cc:dd:ee:ff",
+                            }
+                        )
+                    ),
+                )
+
+    class _FakeBleakClient:
+        mtu_size = 200
+
+        def __init__(self, address, disconnected_callback=None):
+            self._notify_cb = None
+            self._device = _CoalescingDevice(self)
+
+        async def connect(self, timeout=10.0):
+            pass
+
+        async def start_notify(self, char_uuid, callback):
+            self._notify_cb = callback
+
+        async def write_gatt_char(self, char_uuid, data, response=True):
+            self._device.feed(data)
+
+        async def disconnect(self):
+            pass
+
+    fake_bleak = types.ModuleType("bleak")
+    fake_bleak.BleakClient = _FakeBleakClient
+
+    with (
+        patch.dict(sys.modules, {"bleak": fake_bleak}),
+        pytest.raises(AssertionError, match="run-mode handover"),
+    ):
+        _connect_ble("AA:BB:CC:DD:EE:FF", bootstrap, {}, frozenset(), {}, timeout=2.0)

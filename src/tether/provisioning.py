@@ -356,6 +356,21 @@ if _cfg is not None:
     # How long to wait for a requested disconnect's IRQ to confirm the link
     # is down before falling back on the advertise-retry loop.
     _DISCONNECT_WAIT_MS = 2000
+    # gatts_notify() can fail transiently on a real stack (NimBLE raises an
+    # ENOMEM-class OSError when its mbuf pool is momentarily exhausted by a
+    # burst of notifications - a multi-chunk status payload or upload
+    # result is exactly such a burst). Retry a few times with a short pause
+    # so one transient failure doesn't fail the whole session; see
+    # _BleConn.send.
+    _NOTIFY_ATTEMPTS = 4
+    _NOTIFY_RETRY_MS = 20
+    # Give a nack a moment to actually go out before dropping the link.
+    # gatts_notify() only *queues* an ATT notification and there is no
+    # completion event for notifications (unlike indications), so an
+    # immediate gap_disconnect() can tear the link down before the bytes
+    # transmit - the client would then see a bare connection-closed OSError
+    # instead of the intended WifiAuthError.
+    _NACK_FLUSH_MS = 100
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "    ")}
     _ble = _bluetooth.BLE()
@@ -397,8 +412,17 @@ if _cfg is not None:
     ((_write_handle[0], _notify_handle[0]),) = _ble.gatts_register_services((_service,))
     # The default GATT characteristic buffer is 20 bytes - anything larger
     # a central writes would be silently truncated, corrupting every frame
-    # once the MTU is negotiated up. Sized past the largest MTU a central
-    # can negotiate so one ATT write always lands whole.
+    # once the MTU is negotiated up.
+    #
+    # This size and the MTU are ONE coupled decision, not two independent
+    # ones: 512 does not in fact cover the largest ATT MTU a central can
+    # negotiate (517, i.e. a 514-byte single-write payload). It is safe
+    # only because nothing here ever calls _ble.config(mtu=...), so the
+    # on-device MTU stays at its low default and no single write can come
+    # close. If a future change raises the MTU (to make bundle uploads
+    # faster, say), this buffer size must be re-reviewed in the same
+    # change - with append=True below, a write that overflows the buffer
+    # truncates silently rather than erroring.
     #
     # append=True is MicroPython's documented mitigation for the
     # multi-write-before-read race: _bt_irq only runs when the scheduler
@@ -431,9 +455,40 @@ if _cfg is not None:
         def send(self, _data):
             _usable = max(_mtu[0] - 3, 1)
             for _i in range(0, len(_data), _usable):
-                _ble.gatts_notify(
-                    _conn_handle[0], _notify_handle[0], _data[_i : _i + _usable]
-                )
+                _chunk = _data[_i : _i + _usable]
+                _attempt = 0
+                while True:
+                    _h = _conn_handle[0]
+                    if _h is None:
+                        # The central is already gone. Raise the same
+                        # OSError a dead socket's send() would, so the
+                        # shared mode handlers (which catch OSError, not
+                        # TypeError) treat a BLE disconnect exactly as
+                        # they treat wifi's - notably _handle_run, whose
+                        # friendly "reconnect any time" message is
+                        # otherwise lost when an @mcu.loop task tries to
+                        # notify after the central has left.
+                        raise OSError("ble disconnected")
+                    try:
+                        _ble.gatts_notify(_h, _notify_handle[0], _chunk)
+                        break
+                    except OSError:
+                        # Transient (ENOMEM-class) - back off briefly and
+                        # retry rather than failing the whole session on
+                        # the first hiccup of a notification burst. The
+                        # sleep also lets the scheduler drain the stack's
+                        # own queued work, which is what frees the buffers.
+                        _attempt += 1
+                        if _attempt >= _NOTIFY_ATTEMPTS:
+                            raise
+                        time.sleep_ms(_NOTIFY_RETRY_MS)
+                    except Exception:
+                        # Anything that isn't an OSError - e.g. the
+                        # TypeError gatts_notify raises if the handle was
+                        # cleared by a disconnect IRQ landing between the
+                        # check above and this call - is translated to the
+                        # OSError every caller above is written against.
+                        raise OSError("ble notify failed")
 
         def take_buffer(self):
             _result, self._buffer = self._buffer, b""
@@ -488,12 +543,25 @@ if _cfg is not None:
         moment it returns is what makes the re-advertise above fail. The
         wait is bounded - if the IRQ never arrives, the advertise retry
         loop is the backstop rather than hanging here forever.
+
+        Nothing in here may raise: this runs OUTSIDE the per-session
+        try/except below, so an escaping exception kills the whole session
+        loop and leaves the board unreachable until a physical reset. Two
+        things guard that. The handle is read ONCE, into a local: reading
+        _conn_handle[0] a second time for the gap_disconnect() call leaves
+        a window where a scheduler-delivered CENTRAL_DISCONNECT IRQ (which
+        clears it) turns that call into gap_disconnect(None) - a TypeError,
+        which `except OSError` would not catch. And the except is
+        Exception, not OSError, so a stack that rejects a stale handle some
+        other way is equally survivable - the same discipline
+        _start_advertising above already applies.
         \"\"\"
-        if _conn_handle[0] is None:
+        _handle = _conn_handle[0]
+        if _handle is None:
             return
         try:
-            _ble.gap_disconnect(_conn_handle[0])
-        except OSError:
+            _ble.gap_disconnect(_handle)
+        except Exception:
             pass
         _deadline = time.ticks_add(time.ticks_ms(), _DISCONNECT_WAIT_MS)
         while _conn_handle[0] is not None and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
@@ -519,6 +587,9 @@ if _cfg is not None:
                 _expected_secret = _cfg.get("secret")
                 if _expected_secret is not None and _secret != _expected_secret:
                     _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
+                    # Let the nack actually transmit before the disconnect
+                    # below tears the link down - see _NACK_FLUSH_MS.
+                    time.sleep_ms(_NACK_FLUSH_MS)
                     break
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
@@ -532,6 +603,9 @@ if _cfg is not None:
                     break
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
+                    # Same flush-before-disconnect reasoning as the auth
+                    # nack above.
+                    time.sleep_ms(_NACK_FLUSH_MS)
                     break
         except Exception:
             pass
@@ -540,7 +614,15 @@ if _cfg is not None:
         # the session is over (run finished, auth failed, unknown mode, or
         # the central vanished). Re-advertising is the next iteration's
         # first act, once this confirms the link is actually down.
-        _end_session()
+        #
+        # Belt and braces around _end_session's own internal hardening
+        # (see its docstring): this call site sits outside the per-session
+        # try/except above, and NOTHING here is allowed to kill the loop -
+        # an unreachable board needs a physical reset to recover.
+        try:
+            _end_session()
+        except Exception:
+            pass
 """
 
 

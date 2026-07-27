@@ -76,6 +76,27 @@ class _FakeBLE:
         # this many ms later. 0 delivers it inline.
         self.disconnect_delay_ms = 0
         self.advertise_errors = 0
+        # Makes the NEXT gap_disconnect() raise TypeError instead of
+        # working, modelling what real MicroPython does when the conn
+        # handle it is passed has already been cleared by a disconnect
+        # IRQ (`can't convert NoneType to int` - not an OSError, so a
+        # too-narrow except clause on the device would let it escape).
+        self.fail_next_disconnect = False
+        # >0 makes that many upcoming gatts_notify() calls raise an
+        # ENOMEM-class OSError before one succeeds - what NimBLE does when
+        # its mbuf pool is momentarily exhausted by a burst of
+        # notifications. notify_errors counts how many actually fired.
+        self.notify_failures = 0
+        self.notify_errors = 0
+        # While True, every gatts_notify() raises TypeError - the residual
+        # post-disconnect case a "is the handle None?" pre-check cannot
+        # catch, because the IRQ can land between that check and the call.
+        self.notify_type_error = False
+        # ticks_ms() of each successful notify / each gap_disconnect call,
+        # so a test can assert the device paced them apart rather than
+        # racing a queued notification against the link teardown.
+        self.notify_ticks = []
+        self.disconnect_ticks = []
 
     def active(self, _on=None):
         if _on is not None:
@@ -106,6 +127,10 @@ class _FakeBLE:
         # away; the link is not down until CENTRAL_DISCONNECT lands. With
         # disconnect_delay_ms set, the fake reproduces that gap on a real
         # thread rather than delivering the IRQ inline.
+        self.disconnect_ticks.append(time.ticks_ms())
+        if self.fail_next_disconnect:
+            self.fail_next_disconnect = False
+            raise TypeError("can't convert NoneType to int")
         self.disconnects.append(_conn_handle)
         if self.disconnect_delay_ms:
             _delay = self.disconnect_delay_ms
@@ -149,8 +174,16 @@ class _FakeBLE:
             self._values[_value_handle] = bytes(_data)
 
     def gatts_notify(self, _conn_handle, _value_handle, _data):
-        if _conn_handle is None:
-            raise OSError("not connected")
+        if _conn_handle is None or self.notify_type_error:
+            # TypeError, not OSError: the real call converts the handle to
+            # an int, and None simply is not one. The distinction is the
+            # whole point - the device's own except clauses differ.
+            raise TypeError("can't convert NoneType to int")
+        if self.notify_failures:
+            self.notify_failures -= 1
+            self.notify_errors += 1
+            raise OSError("no mem buffers available")
+        self.notify_ticks.append(time.ticks_ms())
         self.notifications.append((_conn_handle, _value_handle, bytes(_data)))
 
     def gatts_set_buffer(self, _value_handle, _size, _append=False):

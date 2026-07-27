@@ -694,7 +694,16 @@ def _connect_ble(
         stream = ble_transport.connect(rest, timeout=timeout)
         last_stream = stream
         try:
-            channel = ble_transport.BleControlChannel(stream)
+            # timeout=timeout: every read in the control exchange below
+            # (the three preamble acks, the status payload, the upload
+            # result) must be bounded - a board that stays connected but
+            # never answers has to fail loud instead of hanging forever,
+            # the same hazard wifi's switch_to_blocking=False closes for
+            # its own preamble ack. It stops at the channel: the raw
+            # `stream` handed to _start_and_handshake below keeps
+            # BleStream's unbounded-blocking read(), which is what the
+            # long-lived Dispatcher needs.
+            channel = ble_transport.BleControlChannel(stream, timeout=timeout)
 
             channel.send_preamble("status", resolved_secret)
             status = channel.read_json_frame()
@@ -718,6 +727,23 @@ def _connect_ble(
                     raise RuntimeError(f"BLE upload failed: {result.get('error')}")
 
             channel.send_preamble("run", resolved_secret)
+            # Cross-file invariant with the device side, which explicitly
+            # seeds its run-mode reader with _conn.take_buffer()
+            # (provisioning.py's _ble_make_streams) so nothing it
+            # over-read during the synchronous preamble exchange is lost
+            # at this same handover. There is no PC-side equivalent: the
+            # raw `stream` goes to the Dispatcher, so any bytes still
+            # sitting in the channel's leftover buffer would be silently
+            # dropped and the handshake would hang. Provably empty today
+            # (the device sends each control frame in its own
+            # notification and nothing unsolicited after the run ack),
+            # but a chunking change on either side could break that
+            # silently - assert rather than corrupt.
+            assert not channel._buffer, (
+                f"BLE control channel still holds {len(channel._buffer)} unread byte(s) at "
+                "the run-mode handover - they would be lost handing the raw stream to the "
+                "Dispatcher (the device side drains its own buffer here via take_buffer())"
+            )
             return _start_and_handshake(
                 stream,
                 timeout=timeout,

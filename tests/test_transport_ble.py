@@ -185,3 +185,53 @@ def test_send_preamble_succeeds_on_ack():
     stream.on_notify(None, bytearray(len(ack).to_bytes(4, "big") + ack))
 
     channel.send_preamble("status", "right-secret")  # must not raise
+
+
+def test_stream_read_with_a_timeout_raises_oserror_not_queue_empty():
+    # Final-review finding (F1). Callers above this module (BleControlChannel,
+    # Dispatcher) are written against the OSError/empty-bytes contract the
+    # serial and wifi streams already use - letting queue.Empty escape would
+    # sail straight through every `except OSError` in the stack.
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+
+    with pytest.raises(OSError, match="timed out"):
+        stream.read(0.01)
+
+
+def test_control_channel_read_times_out_instead_of_hanging_forever():
+    # Final-review finding (F1). Every control-exchange read used to be an
+    # unbounded queue.get(): a device that stayed connected but never
+    # answered hung send_preamble/read_json_frame/read_bytes_frame forever -
+    # the same hang wifi's own preamble ack read was already fixed for.
+    import time
+
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream, timeout=0.05)
+
+    started = time.monotonic()
+    with pytest.raises(OSError, match="timed out"):
+        channel.read_json_frame()
+    assert time.monotonic() - started < 2.0
+
+
+def test_stream_read_without_a_timeout_still_blocks_for_the_dispatcher():
+    # The other half of F1's fix: the bound belongs to the control channel,
+    # not the stream. Once the control exchange is over the same stream
+    # becomes the long-lived RPC stream, where "nothing for N seconds" is a
+    # normal idle session and only an empty read means disconnected (the
+    # contract Dispatcher._run_reader relies on).
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    BleControlChannel(stream, timeout=0.01)  # a bounded channel over it
+
+    received: list[bytes] = []
+    reader = threading.Thread(target=lambda: received.append(stream.read()), daemon=True)
+    reader.start()
+    reader.join(timeout=0.3)
+    assert reader.is_alive(), "read() must keep blocking, not inherit the channel's timeout"
+
+    stream.on_notify(None, bytearray(b"late-but-real"))
+    reader.join(timeout=2.0)
+    assert received == [b"late-but-real"]

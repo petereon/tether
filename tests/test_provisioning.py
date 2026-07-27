@@ -1858,6 +1858,7 @@ time.sleep_ms(300)
 print("total_notify_chunks:", len(_ble.notifications))
 print("device_dropped_link:", _ble.disconnects)
 print("readvertising:", _ble.advertising)
+print("nack_flush_ms:", time.ticks_diff(_ble.disconnect_ticks[0], _ble.notify_ticks[-1]))
 """
 
     combined = combine_boot_py_with_driver(
@@ -1872,6 +1873,15 @@ print("readvertising:", _ble.advertising)
     assert "total_notify_chunks: 1" in out, out
     assert "device_dropped_link: [0]" in out, out
     assert "readvertising: True" in out, out
+
+    # Final-review finding (F3). gatts_notify() only *queues* an ATT
+    # notification and there is no completion event for notifications, so
+    # disconnecting the instant after sending the nack can tear the link
+    # down before those bytes ever transmit - the client then sees a bare
+    # connection-closed OSError instead of the WifiAuthError this branch
+    # exists to produce. The device must pace the two apart.
+    flush_ms = int(out.split("nack_flush_ms:")[1].split()[0])
+    assert flush_ms >= 50, f"nack was not given time to flush before the disconnect: {flush_ms}ms"
 
 
 @requires_micropython
@@ -2143,3 +2153,193 @@ print("hash:", _c.read_json_frame()["tether_app_hash"])
     assert "append_mode: True" in out, out
     assert "ack: {'ok': True}" in out, out
     assert "hash: burst-ok" in out, out
+
+
+@requires_micropython
+def test_ble_boot_unknown_mode_nack_flushes_before_ending_the_session():
+    # Final-review finding (F3), the second nack branch. Same hazard as the
+    # auth-failure nack above: an unrecognized mode is answered with an
+    # {"ok": False} frame the client is meant to read as a clean rejection,
+    # which is lost if the link drops before the queued notification goes
+    # out. This branch had no test of its own at all before.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+print("reply:", _c.send_preamble("teleport", None))
+time.sleep_ms(300)
+print("device_dropped_link:", _ble.disconnects)
+print("nack_flush_ms:", time.ticks_diff(_ble.disconnect_ticks[0], _ble.notify_ticks[-1]))
+"""
+
+    combined = combine_boot_py_with_driver(boot_py, driver, files={"/tether_ble.json": "{}"})
+    out = run_micropython(combined, timeout=10.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "reply: {'ok': False, 'error': 'unknown mode'}" in out, out
+    assert "device_dropped_link: [0]" in out, out
+    flush_ms = int(out.split("nack_flush_ms:")[1].split()[0])
+    assert flush_ms >= 50, f"nack was not given time to flush before the disconnect: {flush_ms}ms"
+
+
+@requires_micropython
+def test_ble_boot_survives_a_gap_disconnect_that_raises_a_non_oserror():
+    # Final-review finding (F4). _end_session() runs OUTSIDE the per-session
+    # try/except, so anything it lets escape kills the whole session loop and
+    # the board is unreachable over BLE until a physical power cycle. The
+    # concrete route: a scheduler-delivered CENTRAL_DISCONNECT IRQ landing
+    # between _end_session's None-check and its gap_disconnect() call turns
+    # that call into gap_disconnect(None), which raises TypeError - not
+    # caught by the old `except OSError`.
+    #
+    # The fake raises that exact TypeError on the next gap_disconnect. The
+    # link therefore stays up from the stack's point of view, so the central
+    # drops it itself afterwards (the realistic recovery: the board failed to
+    # hang up, the peer left anyway) and the board must get back to serving.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+_ble.fail_next_disconnect = True  # the device's own hang-up will raise
+
+print("rejected:", _c.send_preamble("status", "wrong-secret"))
+time.sleep_ms(300)
+_c.disconnect()  # the central goes away on its own
+
+_deadline = time.ticks_add(time.ticks_ms(), 3000)
+while not _ble.advertising and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
+    time.sleep_ms(20)
+print("readvertising:", _ble.advertising)
+
+_c2 = Central(_ble, conn_handle=1)
+_c2.connect()
+print("second_ack:", _c2.send_preamble("status", "s3cr3t"))
+print("second_hash:", _c2.read_json_frame()["tether_app_hash"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "s3cr3t"}', "/.tether_hash": "still-alive"},
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "rejected: {'ok': False, 'error': 'auth failed'}" in out, out
+    assert "readvertising: True" in out, out
+    assert "second_ack: {'ok': True}" in out, out
+    assert "second_hash: still-alive" in out, out
+
+
+@requires_micropython
+def test_ble_boot_retries_a_transient_notify_failure_instead_of_dropping_the_session():
+    # Final-review finding (F5). Real ESP32/NimBLE raises an ENOMEM-class
+    # OSError from gatts_notify() when its mbuf pool is momentarily exhausted
+    # by a burst of notifications - which a multi-chunk status payload or
+    # upload result is. Without a retry, one transient failure aborts the
+    # whole session (the exception escapes to the loop's silent
+    # `except Exception: pass`) and the client just sees the link drop.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+_ble.notify_failures = 2  # the next two notifications fail, then recover
+
+print("ack:", _c.send_preamble("status", "s3cr3t"))
+print("hash:", _c.read_json_frame()["tether_app_hash"])
+print("notify_errors:", _ble.notify_errors)
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "s3cr3t"}', "/.tether_hash": "survived-enomem"},
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "ack: {'ok': True}" in out, out
+    assert "hash: survived-enomem" in out, out
+    # The failures really happened - the test would pass vacuously if the
+    # fake had never raised.
+    assert "notify_errors: 2" in out, out
+
+
+@requires_micropython
+def test_ble_boot_translates_a_non_oserror_notify_failure_into_an_oserror():
+    # Final-review finding (F10). The shared mode handlers
+    # (_MODE_HANDLER_FUNCTIONS_SRC, byte-identical between wifi and BLE)
+    # are written against a socket's contract: a send to a dead peer raises
+    # OSError. BLE breaks that - gatts_notify against a conn handle the
+    # stack has already invalidated raises TypeError, which their
+    # `except OSError` clauses do not catch. Rather than widen a clause
+    # wifi also depends on, _BleConn.send translates non-OSError notify
+    # failures to OSError, so BLE presents the same contract wifi does.
+    #
+    # Observable here through _handle_upload, which reports a failed upload
+    # over the same connection and swallows OSError from that report (there
+    # is nothing useful left to do). With the translation it returns
+    # normally and the session survives to serve the next preamble on the
+    # SAME connection; without it, TypeError escapes into the session
+    # loop's `except Exception: pass` and the link is dropped instead.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+print("upload_ack:", _c.send_preamble("upload", "s3cr3t"))
+
+# Every notification from here on raises TypeError, as it would against a
+# handle the stack invalidated. The device is about to need one: its
+# end-of-upload reply.
+_ble.notify_type_error = True
+_c.send_json_frame({"dirs": [], "files": [{"path": "/tether_app.py", "size": 5}]})
+_c.send_bytes_frame(b"hello")
+time.sleep_ms(300)
+_ble.notify_type_error = False
+
+# Only reachable if the failed reply left the session intact.
+print("later_ack:", _c.send_preamble("status", "s3cr3t"))
+print("later_hash:", _c.read_json_frame()["tether_app_hash"])
+print("written_app:", _files["/tether_app.py"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py, driver, files={"/tether_ble.json": '{"secret": "s3cr3t"}'}
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "upload_ack: {'ok': True}" in out, out
+    # The session lived on, over the same connection, after a notify failure
+    # the shared handler was only ever written to tolerate as an OSError.
+    assert "later_ack: {'ok': True}" in out, out
+    # The upload itself really happened (and its hash sentinel is correctly
+    # left absent, since the client never got a success reply).
+    assert "written_app: b'hello'" in out, out
+    assert "later_hash: None" in out, out

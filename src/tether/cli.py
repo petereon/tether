@@ -193,13 +193,22 @@ def provision_ble_command(port: str | None, danger_unauthenticated: bool) -> Non
         serial_transport.reset_board(ser)
         _check_other_transport_provisioned(ser, "/tether_wifi.json", "wifi")
         serial_transport.write_files(ser, files)
-        serial_transport.reset_board(ser)
+        # Read the MAC back BEFORE the final reset, not after: run_python
+        # enters the raw REPL via a Ctrl-C interrupt, which would kill a
+        # just-started BLE session loop outright (KeyboardInterrupt is a
+        # BaseException in MicroPython, so the loop's own `except
+        # Exception` never sees it) and leave the board advertising with
+        # nothing servicing it. The MAC is a hardware property, unaffected
+        # by which boot.py is running, so reading it here costs nothing -
+        # and this keeps reset_board() the LAST serial operation, exactly
+        # as provision-wifi does.
         addr_stdout, _ = serial_transport.run_python(
             ser,
             b"import bluetooth\nb=bluetooth.BLE()\nb.active(True)\n"
             b'print(":".join("{:02x}".format(x) for x in b.config("mac")[1]))\n',
             timeout=5.0,
         )
+        serial_transport.reset_board(ser)
 
     click.echo(f"Provisioned {resolved_port} for BLE. Board is restarting.")
     click.echo(f"BLE address: {addr_stdout.decode().strip()}")
@@ -258,8 +267,24 @@ def status_command(
         )
         payload = None
         stream = None
+        # Bounds both the connect attempt and every read of the status
+        # exchange below - a board that is connected but silent must not
+        # hang this command forever (matches the wifi branch's own 3s
+        # create_connection timeout just below).
+        ble_timeout = 5.0
         try:
-            stream = ble_transport.connect(ble_addr, timeout=5.0)
+            stream = ble_transport.connect(ble_addr, timeout=ble_timeout)
+        except ModuleNotFoundError as exc:
+            # `bleak` is an optional extra. Letting this fall into the
+            # general handler below would silently drop through to the
+            # raw-REPL fallback, which RESETS the board - the exact
+            # destructive behaviour --ble-addr exists to avoid. A missing
+            # dependency is a user setup problem, not an unreachable
+            # device.
+            raise click.ClickException(
+                f"--ble-addr needs the optional BLE dependency: {exc}. "
+                "Install it with `pip install 'tether[ble]'`."
+            ) from None
         except Exception:  # noqa: BLE001 - bleak/connect() can raise a range of
             # exception types (BleakError, OSError, TimeoutError, ...) for an
             # unreachable/absent device; any of them means "fall back to
@@ -268,7 +293,7 @@ def status_command(
         if stream is not None:
             try:
                 try:
-                    channel = ble_transport.BleControlChannel(stream)
+                    channel = ble_transport.BleControlChannel(stream, timeout=ble_timeout)
                     channel.send_preamble("status", resolved_ble_secret)
                     payload = channel.read_json_frame()
                 except WifiAuthError:
@@ -283,7 +308,7 @@ def status_command(
             finally:
                 stream.close()
             if payload is not None:
-                click.echo(f"Provisioned and connected. Address: {payload['ip']}")
+                click.echo(f"Provisioned and connected. Address: {payload.get('ip')}")
                 return
 
     if ip:
