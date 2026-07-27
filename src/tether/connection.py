@@ -644,23 +644,80 @@ def _connect_wifi(
 
 def _connect_ble(
     rest: str,
+    bootstrap: str,
     export_specs: dict[str, Any],
+    exported_names: frozenset[str],
     pc_handlers: dict[str, Callable[..., Any]],
     *,
     timeout: float,
+    secret: str | None = None,
 ) -> BoardHandle:
-    """Connect to an already-running on-device runtime over BLE. Same shape
-    as _connect_wifi (no slicing/bundling/upload - DESIGN.md gives BLE "the
-    same bootstrap requirement as wifi").
+    """Connect over BLE to a boot.py-managed peripheral. Mirrors
+    _connect_wifi's slice -> hash-check -> upload-if-needed -> run shape,
+    but reuses ONE BLE connection across all three (see the design's
+    one-connection decision - BLE connection setup is too costly to redo
+    per mode, unlike wifi's cheap TCP handshake). transports/ble.py's
+    BleControlChannel provides the length-prefixed framing over that one
+    connection's BleStream.
     """
+    import os
+
     from tether.transports import ble as ble_transport
 
-    # See _connect_mock's matching comment.
+    resolved_secret = secret if secret is not None else os.environ.get("TETHER_BLE_SECRET")
+
+    unsliced = export_specs.keys() - exported_names
+    if unsliced:
+        raise RuntimeError(
+            f"{sorted(unsliced)} are decorated with @mcu.export/@mcu.loop but weren't "
+            "found by static analysis of the source - decorated functions must be plain "
+            "top-level `def`/`async def` statements, not conditionally defined "
+            "(DESIGN.md § Standing design constraint)"
+        )
+
+    bundle_hash = _hash_bundle(bootstrap)
     board: BoardHandle | None = None
+    # Unlike wifi's per-mode connections, BLE's dial() opens exactly ONE
+    # BleStream per call and drives status -> upload-if-needed -> run
+    # entirely over it. On reconnect(), the OLD stream must still be
+    # closed first - same reasoning as wifi's last_stream (see
+    # _connect_wifi), just simpler here since there's only ever one
+    # stream per dial() call, not up to three.
+    last_stream: Any | None = None
 
     def dial() -> Dispatcher:
+        nonlocal last_stream
+        if last_stream is not None:
+            last_stream.close()
+            last_stream = None
+
         stream = ble_transport.connect(rest, timeout=timeout)
+        last_stream = stream
         try:
+            channel = ble_transport.BleControlChannel(stream)
+
+            channel.send_preamble("status", resolved_secret)
+            status = channel.read_json_frame()
+
+            if status.get("tether_app_hash") != bundle_hash:
+                channel.send_preamble("upload", resolved_secret)
+                files, dirs = _gather_runtime_bundle(bootstrap, bundle_hash)
+                manifest = {
+                    "dirs": list(dirs),
+                    "files": [
+                        {"path": path, "size": len(content)} for path, content in files.items()
+                    ],
+                }
+                channel.send_json_frame(manifest)
+                max_chunk = ble_transport.MAX_CONTROL_FRAME_SIZE
+                for content in files.values():
+                    for offset in range(0, len(content), max_chunk):
+                        channel.send_bytes_frame(content[offset : offset + max_chunk])
+                result = channel.read_json_frame()
+                if not result.get("ok", False):
+                    raise RuntimeError(f"BLE upload failed: {result.get('error')}")
+
+            channel.send_preamble("run", resolved_secret)
             return _start_and_handshake(
                 stream,
                 timeout=timeout,
@@ -669,9 +726,8 @@ def _connect_ble(
                 board=board,
             )
         except BaseException:
-            # Matches _connect_serial/_connect_wifi's dial(): a failed
-            # handshake must not leak the connection.
             stream.close()
+            last_stream = None
             raise
 
     board = BoardHandle(dial(), export_specs, dial=dial)
@@ -684,9 +740,10 @@ def connect(address: str, *, timeout: float = 10.0, secret: str | None = None) -
     `address` scheme selects transport:
       "serial:auto" | "serial:/dev/ttyUSB0" | "wifi:<ip>" | "ble:<addr>" | "mock://"
 
-    `secret` (wifi only): the shared secret configured during
-    `tether provision-wifi`. Falls back to the TETHER_WIFI_SECRET
-    environment variable if omitted. Required when the device has one
+    `secret` (wifi and BLE): the shared secret configured during
+    `tether provision-wifi`. Falls back to the TETHER_WIFI_SECRET or
+    TETHER_BLE_SECRET environment variable if omitted (whichever matches
+    the transport `address` selects). Required when the device has one
     configured (raises WifiAuthError if missing/wrong); ignored otherwise.
 
     Auto-detects the calling file's source (must be called from a real .py
@@ -725,7 +782,18 @@ def connect(address: str, *, timeout: float = 10.0, secret: str | None = None) -
             secret=secret,
         )
     elif scheme == "ble":
-        board = _connect_ble(rest, export_specs, pc_handlers, timeout=timeout)
+        sliced = slice_mcu_bound(source, base_dir=base_dir)
+        stubs = generate_pc_stubs(source)
+        bootstrap = generate_bootstrap(sliced.source, stubs.source)
+        board = _connect_ble(
+            rest,
+            bootstrap,
+            export_specs,
+            sliced.exported_names,
+            pc_handlers,
+            timeout=timeout,
+            secret=secret,
+        )
     else:
         raise NotImplementedError(f"transport scheme {scheme!r} is not implemented yet")
 
