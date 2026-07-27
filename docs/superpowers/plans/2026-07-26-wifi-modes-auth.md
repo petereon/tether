@@ -344,6 +344,7 @@ Change to:
 ```python
 from mcu_decorators import mcu, pc, registered_mcu_functions
 import mcu_decorators as _tether_mcu_decorators
+
 _tether_mcu_decorators._registrations.clear()
 import dispatch as _tether_dispatch
 ```
@@ -988,7 +989,17 @@ Expected: FAIL — `KeyError: 'first'` (or similar), since `run` mode isn't wire
 
 In `src/tether/provisioning.py`, add `_handle_run` inside `_BOOT_PY_TEMPLATE`'s f-string, right after `_handle_status`'s definition (before the `_addr = _socket.getaddrinfo(...)` line):
 
-```python
+Note: shown as a `text` fence, not `python` — it's a literal fragment
+quoted at its real (deeply-indented) position inside `_BOOT_PY_TEMPLATE`'s
+f-string, where `{{`/`}}` are the f-string escapes for a literal single
+`{`/`}` in the generated on-device script. Tagging this `python` would
+make `ruff format` (which formats fenced Python blocks in Markdown too)
+parse `{{...}}` as nested set/dict literals and reformat it into
+something that no longer matches the actual source — confirmed the hard
+way in an earlier unscoped `ruff format .` run; kept as `text` since then
+specifically to avoid repeating that corruption.
+
+```text
         def _handle_run(_conn):
             try:
                 with open("/tether_app.py") as _f:
@@ -1534,7 +1545,9 @@ def _upload_if_needed(
 Replace it with a shared helper plus a thinner `_upload_if_needed` that calls it:
 
 ```python
-def _gather_runtime_bundle(bootstrap: str, bundle_hash: str) -> tuple[dict[str, bytes], tuple[str, ...]]:
+def _gather_runtime_bundle(
+    bootstrap: str, bundle_hash: str
+) -> tuple[dict[str, bytes], tuple[str, ...]]:
     """Every file a fresh board needs: the whole tether_runtime library
     (dispatch.py, mcu_decorators.py, vendored umsgpack) plus this
     connection's own sliced app and hash sentinel. Shared between serial's

@@ -58,6 +58,7 @@ Unchanged bridging mechanism (`exec(_tether_app_src, {"_tether_stream_override":
    ```python
    from mcu_decorators import mcu, pc, registered_mcu_functions
    import mcu_decorators as _tether_mcu_decorators
+
    _tether_mcu_decorators._registrations.clear()
    ```
 
