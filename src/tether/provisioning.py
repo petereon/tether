@@ -123,6 +123,28 @@ if _cfg is not None:
                         "tether: wifi client disconnected - run session "
                         "ending (reconnect any time, no reset needed)"
                     )
+                finally:
+                    # The dominant duplication mechanism (found during final
+                    # review, distinct from and more serious than the
+                    # mcu_decorators registry fix above): MicroPython's
+                    # uasyncio task queue is a process-global structure, and
+                    # asyncio.run() returning/raising does NOT drain tasks
+                    # queued via asyncio.create_task() inside it - which is
+                    # exactly what Dispatcher.run() does for every
+                    # @mcu.loop function. Without this, a previous run-mode
+                    # session's loop task(s) stay alive in the global queue
+                    # and get resumed alongside the new session's own task
+                    # the next time asyncio.run() is called here - an
+                    # accumulating, not replacing, duplicate every
+                    # reconnect. new_event_loop() resets that global queue
+                    # between sessions, whether this session ended via the
+                    # expected disconnect exception or any other way.
+                    # Verified against the real interpreter: without this,
+                    # three successive sessions' sampled tick counts grew
+                    # non-linearly (each session ticking faster than the
+                    # last, from N accumulating duplicate loop tasks); with
+                    # it, each session's tick count stays roughly constant.
+                    _asyncio.new_event_loop()
 
         def _handle_upload(_conn):
             try:

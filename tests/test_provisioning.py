@@ -917,6 +917,204 @@ builtins.open = _fake_open
 
 
 @requires_micropython
+def test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects():
+    # Final-review finding: the dominant duplication mechanism isn't the
+    # mcu_decorators registry (Task 2's fix, verified separately) - it's
+    # that MicroPython's uasyncio task queue is a process-global structure,
+    # and asyncio.run() returning/raising does NOT drain tasks queued via
+    # asyncio.create_task() inside it (Dispatcher.run() does exactly that
+    # for every @mcu.loop function). So each fresh run-mode exec() leaves
+    # the PREVIOUS session's @mcu.loop task(s) still alive in the global
+    # queue, resumed alongside the new session's own task the next time
+    # asyncio.run() is called - an accumulating, not replacing, duplicate.
+    #
+    # Observed via a counter stored as an attribute on the `mcu_decorators`
+    # module object itself - like `_registrations`, that module is only
+    # ever *imported* (not re-exec'd) within one boot.py process, so the
+    # attribute persists across successive run-mode exec()s, exactly the
+    # same persistence property that causes the underlying bug. Any
+    # leftover, not-yet-drained task from an earlier session still holds a
+    # reference to this same singleton module object and keeps incrementing
+    # the same counter, so accumulation is directly observable from the PC
+    # side by calling a plain @mcu.export getter after each session's
+    # sampling window - no reliance on reading anything from a closed
+    # connection's own dead namespace.
+    import socket
+    import struct
+    import threading
+    import time
+
+    import msgpack
+    from mpy_runner import run_micropython_background
+
+    from tether.marshalling import encode_frame
+
+    test_port = 18771
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    sliced_source = """\
+import mcu_decorators as _test_mod
+
+if not hasattr(_test_mod, "_tick_total"):
+    _test_mod._tick_total = 0
+
+
+@mcu.loop(interval_ms=100)
+def tick():
+    _test_mod._tick_total += 1
+
+
+@mcu.export
+def get_tick_total() -> int:
+    return _test_mod._tick_total
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        import json as pc_json
+
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        import json as pc_json
+
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    def read_result_frame(sock):
+        raw_len = sock.recv(4)
+        body_len = int.from_bytes(raw_len, "big")
+        body = b""
+        while len(body) < body_len:
+            body += sock.recv(body_len - len(body))
+        msg_type = body[:1]
+        payload = msgpack.unpackb(body[1:], raw=False)
+        return msg_type, payload
+
+    sample_window = 1.5  # ~15 ticks/session at interval_ms=100, generous re: jitter
+
+    def do_one_run_session(req_id):
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "run", "secret": None})
+        ack = read_json(sock)
+        assert ack == {"ok": True}, ack
+
+        sock.sendall(encode_frame(1, {"id": req_id, "name": "__tether_handshake__", "args": []}))
+        msg_type, payload = read_result_frame(sock)
+        assert msg_type == b"\x02", (msg_type, payload)  # MSG_RESULT
+
+        # Let the loop task(s) - however many are actually alive - tick for
+        # a fixed sampling window before asking for the running total.
+        time.sleep(sample_window)
+
+        sock.sendall(encode_frame(1, {"id": req_id + 1, "name": "get_tick_total", "args": []}))
+        msg_type, payload = read_result_frame(sock)
+        assert msg_type == b"\x02", (msg_type, payload)  # MSG_RESULT
+        sock.close()
+        return payload["value"]
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+        results["first"] = do_one_run_session(1)
+        time.sleep(0.5)
+        results["second"] = do_one_run_session(3)
+        time.sleep(0.5)
+        results["third"] = do_one_run_session(5)
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{
+    "/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}',
+    "/tether_app.py": {tether_app_source!r},
+}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=9.0)
+    client_thread.join(timeout=15.0)
+
+    first, second, third = results["first"], results["second"], results["third"]
+    delta1 = first
+    delta2 = second - first
+    delta3 = third - second
+
+    # Sanity: ticks are actually firing at roughly the expected rate each
+    # session (not zero - that would mean the loop never ran at all, a
+    # different bug this test isn't about).
+    assert delta1 > 0, results
+    assert delta2 > 0, results
+    assert delta3 > 0, results
+
+    # The actual regression check: broken behavior accumulates one more
+    # concurrently-running duplicate task per reconnect, so delta2 ~= 2x
+    # delta1 and delta3 ~= 3x delta1 (reviewer's real measurement: 19/58/117,
+    # i.e. deltas 19/39/59). Fixed behavior keeps each session's delta
+    # roughly constant (reviewer's real measurement: 19/38/57 -> deltas
+    # 19/19/19). 1.6x comfortably separates "roughly constant, plus
+    # scheduling jitter" from "accumulating an extra duplicate task" without
+    # being so tight that timing jitter alone could trip it.
+    assert delta3 < delta1 * 1.6, (
+        f"loop tick count is accumulating across reconnects, not staying "
+        f"constant per session: deltas were {delta1}, {delta2}, {delta3} "
+        f"(totals {first}, {second}, {third})"
+    )
+
+
+@requires_micropython
 def test_boot_py_upload_mode_writes_files_verified_via_status():
     # Verifies upload mode via the same channel a real client would use to
     # confirm it worked: upload a file + its hash, then reconnect in
