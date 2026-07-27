@@ -107,6 +107,7 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     def fake_write_files(ser, files, **kwargs):
         calls.append("write")
@@ -146,6 +147,7 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     written = {}
 
@@ -183,6 +185,7 @@ def test_provision_wifi_prints_the_generated_secret(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     written = {}
 
@@ -219,6 +222,7 @@ def test_provision_wifi_danger_unauthenticated_omits_secret_and_warns(monkeypatc
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     written = {}
 
@@ -450,3 +454,167 @@ def test_status_command_reports_not_provisioned(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "not provisioned" in result.output.lower()
+
+
+def _patch_fake_serial(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+
+
+def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+
+    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert set(written.keys()) == {"/boot.py", "/tether_ble.json"}
+    assert "Shared secret" in result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+
+
+def test_provision_ble_warns_if_wifi_already_provisioned(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+
+    def fake_read_file(ser, path, timeout=10.0):
+        return b'{"ssid": "x", "password": "y"}' if path == "/tether_wifi.json" else None
+
+    monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
+
+    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "overwrite" in result.output.lower()
+    assert "wifi" in result.output.lower()
+
+
+def test_provision_wifi_warns_if_ble_already_provisioned(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+
+    def fake_read_file(ser, path, timeout=10.0):
+        return b'{"secret": "x"}' if path == "/tether_ble.json" else None
+
+    monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "overwrite" in result.output.lower()
+    assert "ble" in result.output.lower()
+
+
+def test_provision_ble_danger_unauthenticated_prints_no_secret(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+
+    result = CliRunner().invoke(
+        main, ["provision-ble", "--port", "/dev/ttyUSB0", "--danger-unauthenticated"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Shared secret" not in result.output
+    assert "WARNING" in result.output
+
+
+def test_status_ble_addr_tries_ble_first_non_destructively(monkeypatch):
+    calls = []
+
+    class _FakeStream:
+        def close(self):
+            calls.append(("close",))
+
+    class _FakeChannel:
+        def __init__(self, stream):
+            pass
+
+        def send_preamble(self, mode, secret):
+            calls.append(("preamble", mode))
+
+        def read_json_frame(self):
+            return {
+                "protocol_version": 1,
+                "tether_app_hash": "abc123",
+                "free_heap": 50000,
+                "uptime_ms": 1234,
+                "ip": "aa:bb:cc:dd:ee:ff",
+            }
+
+    monkeypatch.setattr("tether.transports.ble.connect", lambda addr, timeout=5.0: _FakeStream())
+    monkeypatch.setattr("tether.transports.ble.BleControlChannel", _FakeChannel)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board", lambda ser: calls.append(("reset_board",))
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--ble-addr", "AA:BB:CC:DD:EE:FF", "--ble-secret", "s3cr3t"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    assert ("reset_board",) not in calls
+
+
+def test_status_ble_addr_falls_back_to_serial_when_ble_unreachable(monkeypatch):
+    def raise_unreachable(addr, timeout=5.0):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("tether.transports.ble.connect", raise_unreachable)
+
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    status = {"provisioned": True, "connected": False, "ip": None}
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (json.dumps(status).encode(), b""),
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--port", "/dev/ttyUSB0", "--ble-addr", "AA:BB:CC:DD:EE:FF"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "not currently connected" in result.output.lower()

@@ -84,6 +84,24 @@ def devices_command() -> None:
         click.echo(device)
 
 
+def _check_other_transport_provisioned(ser: Any, other_config_path: str, other_name: str) -> None:
+    """Print a warning (does not block) if `other_config_path` already
+    exists on the board - provisioning this transport will overwrite the
+    board's single boot.py slot, silently orphaning the other transport's
+    credentials file. Matches --danger-unauthenticated's non-blocking
+    precedent - scripted provisioning shouldn't hang on a prompt.
+    """
+    from tether.transports import serial as serial_transport
+
+    existing = serial_transport.read_file(ser, other_config_path, timeout=5.0)
+    if existing is not None:
+        click.echo(
+            f"WARNING: {other_name} is currently provisioned on this board - "
+            f"this will overwrite its boot.py and disable {other_name} connectivity "
+            f"(its credentials file is left in place but nothing will read it anymore)."
+        )
+
+
 @main.command("provision-wifi")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option("--ssid", required=True, help="WiFi network name.")
@@ -127,6 +145,7 @@ def provision_wifi_command(
 
     with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
+        _check_other_transport_provisioned(ser, "/tether_ble.json", "BLE")
         serial_transport.write_files(ser, files)
         serial_transport.reset_board(ser)
 
@@ -139,6 +158,59 @@ def provision_wifi_command(
     click.echo("Run `tether status` in a few seconds to check connectivity.")
 
 
+@main.command("provision-ble")
+@click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
+@click.option(
+    "--danger-unauthenticated",
+    is_flag=True,
+    default=False,
+    help="Skip generating a shared secret - the BLE listener accepts any connection.",
+)
+def provision_ble_command(port: str | None, danger_unauthenticated: bool) -> None:
+    """Upload a boot.py that advertises tether's BLE service and makes
+    the board reachable over tether's BLE transport on every boot.
+
+    Note: this uploads boot.py + BLE config only - the program that
+    actually runs when a BLE client connects (tether_app.py) is uploaded
+    separately, over BLE itself, the first time `mcu.connect("ble:<addr>")`
+    is called (or over a normal serial `mcu.connect(...)` session, which
+    still works too).
+    """
+    from tether import provisioning
+    from tether.transports import serial as serial_transport
+
+    resolved_port = _resolve_port(port)
+
+    if danger_unauthenticated:
+        click.echo(
+            "WARNING: --danger-unauthenticated - this board's BLE listener will "
+            "accept connections from anyone in range, no secret required."
+        )
+
+    files = provisioning.generate_ble_boot(danger_unauthenticated=danger_unauthenticated)
+
+    with _open_board(resolved_port) as ser:
+        serial_transport.reset_board(ser)
+        _check_other_transport_provisioned(ser, "/tether_wifi.json", "wifi")
+        serial_transport.write_files(ser, files)
+        serial_transport.reset_board(ser)
+        addr_stdout, _ = serial_transport.run_python(
+            ser,
+            b"import bluetooth\nb=bluetooth.BLE()\nb.active(True)\n"
+            b'print(":".join("{:02x}".format(x) for x in b.config("mac")[1]))\n',
+            timeout=5.0,
+        )
+
+    click.echo(f"Provisioned {resolved_port} for BLE. Board is restarting.")
+    click.echo(f"BLE address: {addr_stdout.decode().strip()}")
+    if not danger_unauthenticated:
+        import json
+
+        config = json.loads(files["/tether_ble.json"])
+        click.echo(f"Shared secret (save this - needed to connect): {config['secret']}")
+    click.echo("Run `tether status --ble-addr <address>` in a few seconds to check connectivity.")
+
+
 @main.command("status")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option(
@@ -147,14 +219,27 @@ def provision_wifi_command(
     help="Device IP (if known) - tried first, over wifi, before falling back to serial.",
 )
 @click.option("--secret", default=None, help="Shared secret, if the device requires one.")
-def status_command(port: str | None, ip: str | None, secret: str | None) -> None:
-    """Check whether a board is wifi-provisioned and currently connected.
+@click.option(
+    "--ble-addr",
+    default=None,
+    help="Device BLE address (if known) - tried first, over BLE, before falling back to serial.",
+)
+@click.option("--ble-secret", default=None, help="BLE shared secret, if the device requires one.")
+def status_command(
+    port: str | None,
+    ip: str | None,
+    secret: str | None,
+    ble_addr: str | None,
+    ble_secret: str | None,
+) -> None:
+    """Check whether a board is wifi- or BLE-provisioned and currently connected.
 
-    Tries a direct, non-destructive wifi query first if --ip is given (no
-    reset, no interruption). Falls back to the existing raw-REPL
-    diagnostic (which does reset the board) only if the wifi socket
-    itself is unreachable - meaning wifi never came up in the first
-    place, not that the board is merely busy.
+    Tries a direct, non-destructive query first if --ble-addr or --ip is
+    given (no reset, no interruption) - BLE is tried first if both are
+    given. Falls back to the existing raw-REPL diagnostic (which does
+    reset the board) only if neither socket/BLE connection is reachable -
+    meaning the transport never came up in the first place, not that the
+    board is merely busy.
     """
     import json
     import os
@@ -164,6 +249,42 @@ def status_command(port: str | None, ip: str | None, secret: str | None) -> None
     from tether.errors import WifiAuthError
     from tether.transports import serial as serial_transport
     from tether.transports import wifi as wifi_transport
+
+    if ble_addr:
+        from tether.transports import ble as ble_transport
+
+        resolved_ble_secret = (
+            ble_secret if ble_secret is not None else os.environ.get("TETHER_BLE_SECRET")
+        )
+        payload = None
+        stream = None
+        try:
+            stream = ble_transport.connect(ble_addr, timeout=5.0)
+        except Exception:  # noqa: BLE001 - bleak/connect() can raise a range of
+            # exception types (BleakError, OSError, TimeoutError, ...) for an
+            # unreachable/absent device; any of them means "fall back to
+            # serial", not a bug to surface.
+            stream = None
+        if stream is not None:
+            try:
+                try:
+                    channel = ble_transport.BleControlChannel(stream)
+                    channel.send_preamble("status", resolved_ble_secret)
+                    payload = channel.read_json_frame()
+                except WifiAuthError:
+                    raise click.ClickException(
+                        f"BLE auth failed for {ble_addr} - check --ble-secret/TETHER_BLE_SECRET"
+                    ) from None
+                except OSError:
+                    # device became unreachable mid-exchange - fall through
+                    # to the raw-REPL fallback below, same as a failed
+                    # connect.
+                    payload = None
+            finally:
+                stream.close()
+            if payload is not None:
+                click.echo(f"Provisioned and connected. Address: {payload['ip']}")
+                return
 
     if ip:
         resolved_secret = secret if secret is not None else os.environ.get("TETHER_WIFI_SECRET")
