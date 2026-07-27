@@ -676,6 +676,166 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
     assert board is not None
 
 
+def test_connect_ble_uploads_when_hash_differs_then_runs_over_one_connection():
+    import json
+    import sys
+    import types
+    from unittest.mock import patch
+
+    from tether.connection import _connect_ble
+    from tether.slicer import slice_mcu_bound
+
+    source = """
+from tether import mcu
+
+@mcu.export
+def add(a: int, b: int) -> int:
+    return a + b
+"""
+    sliced = slice_mcu_bound(source, base_dir=Path("."))
+    bootstrap = generate_bootstrap(sliced.source, "")
+    # SliceResult (slicer/__init__.py) has no `export_specs` field - only
+    # `source`/`exported_names` - matching the existing
+    # test_connect_wifi_uploads_when_hash_differs_then_runs test's own
+    # pattern above: `_connect_ble`'s unsliced-decorator check only reads
+    # export_specs.keys(), so a minimal hand-built dict is sufficient here.
+    export_specs = {"add": object()}  # exact value unused by this path; presence is what matters
+
+    received_modes = []
+
+    class _FakeDevice:
+        """Stateful fake device: parses length-prefixed JSON/byte frames
+        accumulated across write_gatt_char calls and pushes responses
+        back via the client's registered notify callback - mirrors the
+        real on-device BLE session loop's mode dispatch (one connection,
+        sequential preambles). Driven synchronously: write_gatt_char
+        calls happen on the fake client's own event-loop thread, the
+        same thread queue.Queue.put (inside on_notify) is safe to call
+        from directly, no cross-thread handoff needed here.
+
+        Simplification versus the real device: each file's content is
+        assumed to arrive in exactly one bytes-frame (true for this
+        test's tiny single-function source) - multi-frame chunking
+        fidelity is already covered by Task 1's BleControlChannel tests
+        and Task 3's on-device tests, not re-verified here.
+        """
+
+        def __init__(self, client, received_modes):
+            self._client = client
+            self._received_modes = received_modes
+            self._buffer = b""
+            self._state = "await_preamble"
+            self._pending_files: list[dict] = []
+
+        def feed(self, data: bytes) -> None:
+            self._buffer += bytes(data)
+            self._drain()
+
+        def _notify(self, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            frame = len(body).to_bytes(4, "big") + body
+            self._client._pending_notify_cb(None, bytearray(frame))
+
+        def _notify_raw(self, data: bytes) -> None:
+            self._client._pending_notify_cb(None, bytearray(data))
+
+        def _drain(self) -> None:
+            while len(self._buffer) >= 4:
+                length = int.from_bytes(self._buffer[:4], "big")
+                if len(self._buffer) < 4 + length:
+                    return
+                body = self._buffer[4 : 4 + length]
+                self._buffer = self._buffer[4 + length :]
+                self._handle_frame(body)
+
+        def _handle_frame(self, body: bytes) -> None:
+            if self._state == "await_preamble":
+                preamble = json.loads(body)
+                mode = preamble["mode"]
+                self._received_modes.append(mode)
+                self._notify({"ok": True})
+                if mode == "status":
+                    self._notify(
+                        {
+                            "protocol_version": PROTOCOL_VERSION,
+                            "tether_app_hash": None,
+                            "free_heap": 100000,
+                            "uptime_ms": 500,
+                            "ip": "aa:bb:cc:dd:ee:ff",
+                        }
+                    )
+                elif mode == "upload":
+                    self._state = "await_manifest"
+                elif mode == "run":
+                    self._state = "await_handshake"
+            elif self._state == "await_manifest":
+                manifest = json.loads(body)
+                self._pending_files = list(manifest["files"])
+                self._state = "await_file_content" if self._pending_files else "await_preamble"
+                if not self._pending_files:
+                    self._notify({"ok": True})
+            elif self._state == "await_file_content":
+                self._pending_files.pop(0)  # one frame == one file, see class docstring
+                if self._pending_files:
+                    return  # still expecting more files' content frames
+                self._notify({"ok": True})
+                self._state = "await_preamble"
+            elif self._state == "await_handshake":
+                import msgpack
+
+                request = msgpack.unpackb(body[1:], raw=False)
+                assert request["name"] == "__tether_handshake__"
+                from tether.marshalling import encode_frame
+
+                self._notify_raw(encode_frame(2, {"id": request["id"], "value": PROTOCOL_VERSION}))
+                self._state = "done"
+
+    class _FakeBleakClient:
+        mtu_size = 200
+
+        def __init__(self, address, disconnected_callback=None):
+            self.address = address
+            self._disconnected_callback = disconnected_callback
+            self._pending_notify_cb = None
+            self.connected = False
+            self._device = _FakeDevice(self, received_modes)
+
+        async def connect(self, timeout=10.0):
+            self.connected = True
+
+        async def start_notify(self, char_uuid, callback):
+            self._pending_notify_cb = callback
+
+        async def write_gatt_char(self, char_uuid, data, response=True):
+            self._device.feed(data)
+
+        async def disconnect(self):
+            self.connected = False
+
+    # This dev environment/CI genuinely has no `bleak` installed (see
+    # test_transport_ble.py's test_connect_fails_loud_when_bleak_is_not_installed)
+    # - patch("bleak.BleakClient", ...) can't traverse into a module that
+    # doesn't exist. Inject a fake `bleak` module into sys.modules instead,
+    # so transports/ble.py's lazy `import bleak` (inside its connect())
+    # resolves to it, matching the brief's Step 2 hint to adjust the patch
+    # target to wherever that import actually happens.
+    fake_bleak = types.ModuleType("bleak")
+    fake_bleak.BleakClient = _FakeBleakClient
+    with patch.dict(sys.modules, {"bleak": fake_bleak}):
+        board = _connect_ble(
+            "AA:BB:CC:DD:EE:FF",
+            bootstrap,
+            export_specs,
+            sliced.exported_names,
+            {},
+            timeout=5.0,
+            secret="test-secret",
+        )
+
+    assert received_modes == ["status", "upload", "run"]
+    assert board is not None
+
+
 def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
     # Final-review finding: _upload() sent one send_bytes_frame per file
     # unconditionally, even though the whole control channel's invariant
