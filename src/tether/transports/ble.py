@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import queue
+import struct
 import threading
 from typing import Any
 
@@ -134,6 +136,78 @@ class BleStream:
         # syscall justifies leaving that thread alive once disconnected) -
         # stop it so close() doesn't leak a thread on every call.
         self._loop.call_soon_threadsafe(self._loop.stop)
+
+
+_LENGTH_PREFIX = struct.Struct(">I")
+
+# Same resource-safety bound as wifi's control channel (transports/wifi.py)
+# and the RPC layer's MAX_FRAME_SIZE - a declared length this large would
+# risk buffering an unbounded amount of attacker/bug-controlled data before
+# anything is validated.
+MAX_CONTROL_FRAME_SIZE = 1 << 16  # 64 KiB
+
+
+class BleControlChannel:
+    """Length-prefixed JSON/bytes framing over an already-connected
+    BleStream, for the preamble/status/upload control protocol - mirrors
+    transports/wifi.py's free-function helpers, but stateful:
+    BleStream.read() returns whatever one GATT notification happened to
+    carry (not a caller-chosen byte count, unlike socket.recv(n)), so
+    leftover bytes from one frame must persist into the next read - this
+    class holds that buffer.
+
+    One instance per BleStream, reused across every preamble on that
+    connection - status -> upload -> run all share it (see the design's
+    one-connection decision: BLE connection setup is too costly to redo
+    per mode, unlike wifi's cheap TCP handshake).
+    """
+
+    def __init__(self, stream: BleStream) -> None:
+        self._stream = stream
+        self._buffer = b""
+
+    def _recv_exact(self, n: int) -> bytes:
+        while len(self._buffer) < n:
+            chunk = self._stream.read()
+            if not chunk:
+                raise OSError("connection closed while reading a frame")
+            self._buffer += chunk
+        result, self._buffer = self._buffer[:n], self._buffer[n:]
+        return result
+
+    def send_json_frame(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body)
+
+    def read_json_frame(self) -> dict[str, Any]:
+        header = self._recv_exact(_LENGTH_PREFIX.size)
+        (length,) = _LENGTH_PREFIX.unpack(header)
+        if length > MAX_CONTROL_FRAME_SIZE:
+            raise OSError(f"control frame too large: declared {length} bytes")
+        body = self._recv_exact(length)
+        return json.loads(body.decode("utf-8"))
+
+    def send_bytes_frame(self, data: bytes) -> None:
+        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data)
+
+    def read_bytes_frame(self) -> bytes:
+        header = self._recv_exact(_LENGTH_PREFIX.size)
+        (length,) = _LENGTH_PREFIX.unpack(header)
+        if length > MAX_CONTROL_FRAME_SIZE:
+            raise OSError(f"control frame too large: declared {length} bytes")
+        return self._recv_exact(length)
+
+    def send_preamble(self, mode: str, secret: str | None) -> None:
+        """Send the connection preamble (mode + shared secret) and wait
+        for the device's ack. Raises WifiAuthError if the device rejects
+        it - matches wifi's send_preamble exactly (see transports/wifi.py).
+        """
+        from tether.errors import WifiAuthError
+
+        self.send_json_frame({"mode": mode, "secret": secret})
+        response = self.read_json_frame()
+        if not response.get("ok", False):
+            raise WifiAuthError(response.get("error") or "connection rejected by device")
 
 
 def connect(address: str, *, timeout: float = DEFAULT_TIMEOUT) -> BleStream:

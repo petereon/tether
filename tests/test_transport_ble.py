@@ -3,7 +3,8 @@ import threading
 
 import pytest
 
-from tether.transports.ble import BleStream, connect
+from tether.errors import WifiAuthError
+from tether.transports.ble import BleControlChannel, BleStream, connect
 
 _WRITE_CHAR = "write-char-uuid"
 
@@ -85,3 +86,102 @@ def test_connect_fails_loud_when_bleak_is_not_installed():
     # precedent for pyserial.
     with pytest.raises(ModuleNotFoundError, match="bleak"):
         connect("00:11:22:33:44:55", timeout=1.0)
+
+
+def test_control_channel_reads_a_json_frame_split_across_multiple_notifications():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    body = b'{"ok": true, "ip": "10.0.0.5"}'
+    header = len(body).to_bytes(4, "big")
+    # Simulate the notification arriving in two separate chunks, neither
+    # aligned to the frame boundary - exactly what a real MTU-chunked
+    # notification stream can do.
+    stream.on_notify(None, bytearray(header + body[:5]))
+    stream.on_notify(None, bytearray(body[5:]))
+
+    assert channel.read_json_frame() == {"ok": True, "ip": "10.0.0.5"}
+
+
+def test_control_channel_leftover_bytes_carry_into_the_next_frame():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    first = b'{"a": 1}'
+    second = b'{"b": 2}'
+    # Both frames' bytes arrive in one single notification - the reader
+    # must not discard the second frame's bytes while parsing the first.
+    combined = len(first).to_bytes(4, "big") + first + len(second).to_bytes(4, "big") + second
+    stream.on_notify(None, bytearray(combined))
+
+    assert channel.read_json_frame() == {"a": 1}
+    assert channel.read_json_frame() == {"b": 2}
+
+
+def test_control_channel_send_json_frame_writes_length_prefixed_body():
+    client = _FakeBleakClient(mtu_size=100)
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    channel.send_json_frame({"mode": "status", "secret": None})
+
+    body = b'{"mode": "status", "secret": null}'
+    assert b"".join(client.writes) == len(body).to_bytes(4, "big") + body
+
+
+def test_control_channel_read_bytes_frame_returns_raw_bytes_not_json_decoded():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    payload = b"\x00\x01\xff not valid json"
+    stream.on_notify(None, bytearray(len(payload).to_bytes(4, "big") + payload))
+
+    assert channel.read_bytes_frame() == payload
+
+
+def test_control_channel_read_json_frame_rejects_oversized_declared_length():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    stream.on_notify(None, bytearray((1 << 20).to_bytes(4, "big")))
+
+    with pytest.raises(OSError, match="too large"):
+        channel.read_json_frame()
+
+
+def test_control_channel_read_json_frame_raises_on_closed_connection():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    stream.signal_closed()
+
+    with pytest.raises(OSError, match="closed"):
+        channel.read_json_frame()
+
+
+def test_send_preamble_raises_wifi_auth_error_on_nack():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    nack = b'{"ok": false, "error": "auth failed"}'
+    stream.on_notify(None, bytearray(len(nack).to_bytes(4, "big") + nack))
+
+    with pytest.raises(WifiAuthError, match="auth failed"):
+        channel.send_preamble("status", "wrong-secret")
+
+
+def test_send_preamble_succeeds_on_ack():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    ack = b'{"ok": true}'
+    stream.on_notify(None, bytearray(len(ack).to_bytes(4, "big") + ack))
+
+    channel.send_preamble("status", "right-secret")  # must not raise
