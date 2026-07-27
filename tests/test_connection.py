@@ -936,3 +936,91 @@ def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
     device_thread.join(timeout=15.0)
     assert results["first_run_conn_closed"] is True, results
     assert results["accepted"] == 6, results
+
+
+def test_connect_wifi_respects_timeout_when_run_mode_preamble_is_never_acked():
+    # Final-review finding: wifi_transport.connect() sets
+    # sock.settimeout(None) (correct for the live Dispatcher phase) BEFORE
+    # send_preamble() does its own blocking ack read. A device that accepts
+    # the TCP connection but never answers the preamble (busy, hung, or
+    # exactly the Fix-5 deadlock scenario before that fix landed) made
+    # mcu.connect() hang forever instead of respecting the `timeout`
+    # parameter.
+    #
+    # Fake device answers status/upload normally (reporting a hash that
+    # already matches, so the client skips straight to the run connection)
+    # but then, on the run connection, reads the preamble frame and simply
+    # never responds - exactly "accepts the connection but never acks".
+    # Bounded via pytest's own default test timeout behavior: if this
+    # regresses back to an unbounded hang, this test will just hang too -
+    # that's the point (an actual regression here SHOULD make this test
+    # visibly stuck, not silently pass) - but the assertion below is what
+    # proves correctness when the fix is in place: a small timeout raises
+    # within a bounded time, comfortably inside any reasonable suite
+    # timeout.
+    import json
+    import struct
+    import threading
+    import time
+
+    from tether.connection import _hash_bundle
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += conn.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(conn, obj):
+        body = json.dumps(obj).encode()
+        conn.sendall(length_prefix.pack(len(body)) + body)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+
+    bootstrap = "irrelevant bootstrap content"
+    bundle_hash = _hash_bundle(bootstrap)
+
+    def fake_device():
+        # status - report the matching hash so the client skips upload
+        # entirely and goes straight to the run connection.
+        conn, _addr = listener.accept()
+        assert read_json(conn)["mode"] == "status"
+        send_json(conn, {"ok": True})
+        send_json(conn, {"tether_app_hash": bundle_hash})
+        conn.close()
+
+        # run - accept the connection, read the preamble, then do
+        # nothing: no ack, no close. Exactly the scenario the fix must
+        # bound.
+        conn2, _addr = listener.accept()
+        read_json(conn2)  # the preamble frame itself
+        time.sleep(10.0)  # outlives the test's own bounded timeout below
+        conn2.close()
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    started = time.monotonic()
+    with pytest.raises(Exception):  # noqa: B017 - any exception is correct; a hang is the failure
+        _connect_wifi(
+            f"127.0.0.1:{port}",
+            bootstrap,
+            {},
+            frozenset(),
+            {},
+            timeout=1.5,
+        )
+    elapsed = time.monotonic() - started
+
+    # Generous upper bound (well under the fake device's own 10s sleep, and
+    # comfortably above the 1.5s timeout to absorb scheduling slack) -
+    # proves this raised because the timeout fired, not because the device
+    # eventually responded or the test got lucky on timing.
+    assert elapsed < 5.0, f"mcu.connect() took {elapsed:.1f}s to raise - timeout wasn't respected"

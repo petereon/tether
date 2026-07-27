@@ -616,10 +616,16 @@ def _connect_wifi(
         # hardware-verified for the long-lived RPC stream this becomes.
         # The short-lived status/upload connections above don't need that
         # treatment, so a plain socket is simplest for those.
-        stream = wifi_transport.connect(host, port, timeout=timeout)
+        # switch_to_blocking=False: the preamble ack read below must still
+        # respect `timeout` (a device that accepts the connection but never
+        # acks must not hang forever) - only switch to blocking (no
+        # timeout) once the preamble exchange itself is done and the stream
+        # is about to be handed to the long-lived Dispatcher.
+        stream = wifi_transport.connect(host, port, timeout=timeout, switch_to_blocking=False)
         last_stream = stream
         try:
             wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
+            stream._sock.settimeout(None)
             return _start_and_handshake(
                 stream,
                 timeout=timeout,

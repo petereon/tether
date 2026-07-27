@@ -120,8 +120,28 @@ def send_preamble(sock: Any, mode: str, secret: str | None) -> None:
         raise WifiAuthError(response.get("error") or "connection rejected by device")
 
 
-def connect(host: str, port: int = DEFAULT_PORT, *, timeout: float = 10.0) -> WifiStream:
-    """Open a TCP connection to an already-listening on-device runtime."""
+def connect(
+    host: str, port: int = DEFAULT_PORT, *, timeout: float = 10.0, switch_to_blocking: bool = True
+) -> WifiStream:
+    """Open a TCP connection to an already-listening on-device runtime.
+
+    `switch_to_blocking`: when True (the default), the socket is switched
+    to blocking (no timeout) before this returns - correct once the caller
+    is about to hand the stream to the long-lived Dispatcher, matching
+    transports/serial.py's `ser.timeout = None` handoff: the background
+    reader thread's "empty read means disconnected" contract needs reads
+    that block for real data, not ones that wake on an idle timeout with
+    nothing to report.
+
+    Pass False when the caller still has synchronous, bounded work to do
+    on this socket before that handoff (e.g. wifi's run-mode preamble
+    exchange - send_preamble()'s own blocking ack read must still respect
+    `timeout`, not block forever on a device that accepts the connection
+    but never acks) - the socket keeps `timeout` as its active timeout
+    until the caller explicitly switches it to blocking itself (see
+    connection.py's _connect_wifi dial(), which does exactly that,
+    immediately before the stream is handed to _start_and_handshake).
+    """
     sock = socket.create_connection((host, port), timeout=timeout)
     # This is a synchronous request/response RPC protocol sending small
     # msgpack frames one at a time (DESIGN.md § Wire protocol) - without
@@ -130,11 +150,7 @@ def connect(host: str, port: int = DEFAULT_PORT, *, timeout: float = 10.0) -> Wi
     # peer's delayed-ACK timer (classically ~40ms) on every single call.
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     # create_connection's timeout only governs the connect() syscall itself
-    # but persists as the socket's ongoing recv() timeout afterwards -
-    # switched to blocking for the dispatch phase, matching
-    # transports/serial.py's `ser.timeout = None` handoff: the background
-    # reader thread's "empty read means disconnected" contract needs reads
-    # that block for real data, not ones that wake on an idle timeout with
-    # nothing to report.
-    sock.settimeout(None)
+    # but persists as the socket's ongoing recv() timeout afterwards.
+    if switch_to_blocking:
+        sock.settimeout(None)
     return WifiStream(sock)
