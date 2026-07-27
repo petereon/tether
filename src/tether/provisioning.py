@@ -353,6 +353,9 @@ if _cfg is not None:
     _MAX_CTRL_FRAME = 65536
     _ADV_PAYLOAD = {_BLE_ADV_PAYLOAD!r}
     _ADV_INTERVAL_US = 100000
+    # How long to wait for a requested disconnect's IRQ to confirm the link
+    # is down before falling back on the advertise-retry loop.
+    _DISCONNECT_WAIT_MS = 2000
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "    ")}
     _ble = _bluetooth.BLE()
@@ -396,7 +399,16 @@ if _cfg is not None:
     # a central writes would be silently truncated, corrupting every frame
     # once the MTU is negotiated up. Sized past the largest MTU a central
     # can negotiate so one ATT write always lands whole.
-    _ble.gatts_set_buffer(_write_handle[0], 512)
+    #
+    # append=True is MicroPython's documented mitigation for the
+    # multi-write-before-read race: _bt_irq only runs when the scheduler
+    # gets round to it, so a fast central can land a second write first.
+    # Without append that second write overwrites the first and the frame
+    # is silently corrupted; with it, writes accumulate and gatts_read
+    # drains them in order. A burst then produces one IRQ per write but
+    # only the first read returns data - the rest return b"", which both
+    # queue consumers below treat as a harmless no-op.
+    _ble.gatts_set_buffer(_write_handle[0], 512, True)
 
     class _BleConn:
         \"\"\"Adapts an IRQ-fed byte queue + gatts_notify() to the plain
@@ -454,9 +466,48 @@ if _cfg is not None:
 
         return _BleAsyncReader(), _BleAsyncWriter()
 
-    _ble.gap_advertise(_ADV_INTERVAL_US, _ADV_PAYLOAD)
+    def _start_advertising():
+        \"\"\"True once the board is actually advertising again. NimBLE
+        refuses to start advertising while a connection is still up, so
+        this can legitimately fail for a few ms after a disconnect has
+        been requested but before its IRQ lands. The caller retries
+        instead of treating it as fatal: an unguarded raise here would
+        escape the per-session try/except below and kill the whole accept
+        loop, leaving the board unreachable until a physical reset.
+        \"\"\"
+        try:
+            _ble.gap_advertise(_ADV_INTERVAL_US, _ADV_PAYLOAD)
+            return True
+        except OSError:
+            return False
+
+    def _end_session():
+        \"\"\"Drop the current link and wait for the CENTRAL_DISCONNECT IRQ
+        to confirm it is really down. gap_disconnect() only *requests* a
+        disconnect and returns immediately; treating the link as gone the
+        moment it returns is what makes the re-advertise above fail. The
+        wait is bounded - if the IRQ never arrives, the advertise retry
+        loop is the backstop rather than hanging here forever.
+        \"\"\"
+        if _conn_handle[0] is None:
+            return
+        try:
+            _ble.gap_disconnect(_conn_handle[0])
+        except OSError:
+            pass
+        _deadline = time.ticks_add(time.ticks_ms(), _DISCONNECT_WAIT_MS)
+        while _conn_handle[0] is not None and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
+            time.sleep_ms(10)
 
     while True:
+        # Re-establish a known-good advertising state before serving
+        # anything. Also the guard against starting a spurious session on
+        # a link that is still tearing down: while the old connection is
+        # up this keeps retrying rather than falling through to the
+        # wait-for-connection loop, which _conn_handle[0] alone would let
+        # pass the instant a stale handle was still set.
+        while not _start_advertising():
+            time.sleep_ms(50)
         while _conn_handle[0] is None:
             time.sleep_ms(20)
         _conn = _BleConn()
@@ -487,13 +538,9 @@ if _cfg is not None:
         # status/upload fall through the if/elif chain and loop naturally to
         # read the next preamble on this same connection; getting here means
         # the session is over (run finished, auth failed, unknown mode, or
-        # the central vanished) - drop the link and advertise again.
-        if _conn_handle[0] is not None:
-            try:
-                _ble.gap_disconnect(_conn_handle[0])
-            except OSError:
-                pass
-        _ble.gap_advertise(_ADV_INTERVAL_US, _ADV_PAYLOAD)
+        # the central vanished). Re-advertising is the next iteration's
+        # first act, once this confirms the link is actually down.
+        _end_session()
 """
 
 

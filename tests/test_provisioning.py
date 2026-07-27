@@ -2046,3 +2046,100 @@ def test_ble_advertising_payload_is_a_legal_gap_payload():
         offset += 1 + length
     assert offset == len(_BLE_ADV_PAYLOAD)
     assert ad_types == [0x01, 0x09, 0x07]  # flags, complete local name, 128-bit UUIDs
+
+
+@requires_micropython
+def test_ble_boot_survives_a_slow_disconnect_and_serves_the_next_connection():
+    # Review finding (Important 1). gap_disconnect() is asynchronous on
+    # real hardware: it only *requests* a disconnect. Re-advertising before
+    # the CENTRAL_DISCONNECT IRQ confirms the link is down makes NimBLE
+    # raise OSError - and that call sits outside the per-session
+    # try/except, so an unguarded raise there kills the whole accept loop
+    # and the board is unreachable over BLE until a physical reset.
+    #
+    # The fake models this: gap_advertise() raises while a link is up, and
+    # disconnect_delay_ms delivers the disconnect IRQ late, on a real
+    # thread, exactly as hardware would.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_ble.disconnect_delay_ms = 300  # the IRQ lands well after gap_disconnect()
+
+_c = Central(_ble)
+_c.connect()
+print("rejected:", _c.send_preamble("status", "wrong-secret"))
+
+# The board must get itself back to advertising on its own.
+_deadline = time.ticks_add(time.ticks_ms(), 3000)
+while not _ble.advertising and time.ticks_diff(_deadline, time.ticks_ms()) > 0:
+    time.sleep_ms(20)
+print("readvertising:", _ble.advertising)
+print("advertise_errors:", _ble.advertise_errors)
+
+# A second, independent connection is only servable if the accept loop
+# actually survived the first session's teardown.
+_c2 = Central(_ble, conn_handle=1)
+_c2.connect()
+print("second_ack:", _c2.send_preamble("status", "s3cr3t"))
+print("second_hash:", _c2.read_json_frame()["tether_app_hash"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "s3cr3t"}', "/.tether_hash": "still-alive"},
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "rejected: {'ok': False, 'error': 'auth failed'}" in out, out
+    assert "readvertising: True" in out, out
+    # The device waited for the disconnect IRQ rather than racing it, so it
+    # never even attempted an advertise that NimBLE would have rejected.
+    assert "advertise_errors: 0" in out, out
+    assert "second_ack: {'ok': True}" in out, out
+    assert "second_hash: still-alive" in out, out
+
+
+@requires_micropython
+def test_ble_boot_reassembles_writes_that_all_land_before_the_read_handler():
+    # Review finding (Important 2). _bt_irq runs when MicroPython's
+    # scheduler gets round to it, so a fast central can land several ATT
+    # writes before the device reads the first. gatts_set_buffer(...,
+    # append=True) is MicroPython's documented mitigation; without it every
+    # write but the last is destroyed unread and the frame is silently
+    # corrupted. A tiny MTU makes even a short preamble span three writes.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble, mtu=23)  # BLE's pre-negotiation minimum: 20 usable bytes
+_c.connect()
+
+# Every chunk lands before the device's read handler runs even once.
+_c.send_json_frame_burst({"mode": "status", "secret": "s3cr3t"})
+print("append_mode:", _ble._append[WRITE_VALUE_HANDLE])
+print("ack:", _c.read_json_frame())
+print("hash:", _c.read_json_frame()["tether_app_hash"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "s3cr3t"}', "/.tether_hash": "burst-ok"},
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "append_mode: True" in out, out
+    assert "ack: {'ok': True}" in out, out
+    assert "hash: burst-ok" in out, out

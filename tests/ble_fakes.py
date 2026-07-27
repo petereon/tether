@@ -42,6 +42,10 @@ WRITE_VALUE_HANDLE = 100
 NOTIFY_VALUE_HANDLE = 101
 
 FAKE_BLUETOOTH_MODULE_SRC = '''
+import _thread
+import time
+
+
 class _FakeBLE:
     """Matches the surface of MicroPython's `bluetooth.BLE` that
     _BLE_BOOT_TEMPLATE uses, including the IRQ event numbering from
@@ -60,9 +64,18 @@ class _FakeBLE:
         self.disconnects = []  # conn_handles the device itself dropped
         self._values = {}
         self._buffer_sizes = {}
+        self._append = {}
         self.advertising = False
         self.adv_payload = None
         self.active_state = False
+        # None once the link is genuinely down. Distinct from whatever the
+        # device *thinks*, which only updates when the disconnect IRQ lands.
+        self.connected_handle = None
+        # >0 makes gap_disconnect() asynchronous, like real hardware: the
+        # call returns immediately and the CENTRAL_DISCONNECT IRQ arrives
+        # this many ms later. 0 delivers it inline.
+        self.disconnect_delay_ms = 0
+        self.advertise_errors = 0
 
     def active(self, _on=None):
         if _on is not None:
@@ -78,17 +91,38 @@ class _FakeBLE:
         raise ValueError(_key)
 
     def gap_advertise(self, _interval_us, _adv_data=None):
+        # NimBLE refuses to start advertising while a connection is still
+        # up. This is the whole reason the device must wait for the
+        # disconnect IRQ rather than trusting gap_disconnect()'s return.
+        if _interval_us is not None and self.connected_handle is not None:
+            self.advertise_errors += 1
+            raise OSError("cannot advertise with an active connection")
         self.advertising = _interval_us is not None
         if _adv_data is not None:
             self.adv_payload = bytes(_adv_data)
 
     def gap_disconnect(self, _conn_handle):
-        # The real call schedules a disconnect whose completion surfaces as
-        # a CENTRAL_DISCONNECT IRQ; the fake delivers it inline.
+        # The real call only *requests* a disconnect and returns straight
+        # away; the link is not down until CENTRAL_DISCONNECT lands. With
+        # disconnect_delay_ms set, the fake reproduces that gap on a real
+        # thread rather than delivering the IRQ inline.
         self.disconnects.append(_conn_handle)
+        if self.disconnect_delay_ms:
+            _delay = self.disconnect_delay_ms
+
+            def _deliver_later():
+                time.sleep_ms(_delay)
+                self._deliver_disconnect(_conn_handle)
+
+            _thread.start_new_thread(_deliver_later, ())
+        else:
+            self._deliver_disconnect(_conn_handle)
+        return True
+
+    def _deliver_disconnect(self, _conn_handle):
+        self.connected_handle = None
         if self._irq_handler is not None:
             self._irq_handler(self._IRQ_CENTRAL_DISCONNECT, (_conn_handle, 0, b""))
-        return True
 
     def gatts_register_services(self, _services):
         # Real API returns one tuple of value handles per service, in
@@ -98,10 +132,21 @@ class _FakeBLE:
         return ((100, 101),)
 
     def gatts_read(self, _value_handle):
-        return self._values.get(_value_handle, b"")
+        _value = self._values.get(_value_handle, b"")
+        if self._append.get(_value_handle):
+            # In append mode the buffer is drained by the read, so a burst
+            # of writes is handed over exactly once, in order.
+            self._values[_value_handle] = b""
+        return _value
 
     def gatts_write(self, _value_handle, _data):
-        self._values[_value_handle] = bytes(_data)
+        if self._append.get(_value_handle):
+            self._values[_value_handle] = self._values.get(_value_handle, b"") + bytes(_data)
+        else:
+            # Without append, a second write before the first is read
+            # simply destroys it - the race gatts_set_buffer(append=True)
+            # exists to close.
+            self._values[_value_handle] = bytes(_data)
 
     def gatts_notify(self, _conn_handle, _value_handle, _data):
         if _conn_handle is None:
@@ -110,13 +155,16 @@ class _FakeBLE:
 
     def gatts_set_buffer(self, _value_handle, _size, _append=False):
         self._buffer_sizes[_value_handle] = _size
+        self._append[_value_handle] = _append
 
     # --- test-driver-only helpers, not part of the real API ---
     def _simulate_connect(self, _conn_handle):
+        self.connected_handle = _conn_handle
+        self.advertising = False  # a real link stops advertising
         self._irq_handler(self._IRQ_CENTRAL_CONNECT, (_conn_handle, 0, b""))
 
     def _simulate_disconnect(self, _conn_handle):
-        self._irq_handler(self._IRQ_CENTRAL_DISCONNECT, (_conn_handle, 0, b""))
+        self._deliver_disconnect(_conn_handle)
 
     def _simulate_mtu(self, _conn_handle, _mtu):
         self._irq_handler(self._IRQ_MTU_EXCHANGED, (_conn_handle, _mtu))
@@ -128,6 +176,17 @@ class _FakeBLE:
         # IRQ just announced" ordering.
         self.gatts_write(_value_handle, _data)
         self._irq_handler(self._IRQ_GATTS_WRITE, (_conn_handle, _value_handle))
+
+    def _simulate_write_burst(self, _conn_handle, _value_handle, _chunks):
+        """Every ATT write lands before the device's scheduled read handler
+        gets to run even once - the multi-write-before-read race that
+        gatts_set_buffer(append=True) exists to mitigate. Without append,
+        all but the last chunk are destroyed before anything reads them.
+        """
+        for _chunk in _chunks:
+            self.gatts_write(_value_handle, _chunk)
+        for _chunk in _chunks:
+            self._irq_handler(self._IRQ_GATTS_WRITE, (_conn_handle, _value_handle))
 
 
 class _FakeUUID:
@@ -255,7 +314,9 @@ class Central:
         self._ble = ble
         self._conn = conn_handle
         self._mtu = mtu
-        self._read_pos = 0
+        # Start after whatever a previous connection already produced, so a
+        # second Central against the same fake reads only its own replies.
+        self._read_pos = len(ble.notifications)
         self._buf = b""
 
     def connect(self):
@@ -270,9 +331,20 @@ class Central:
         for _i in range(0, len(data), _usable):
             self._ble._simulate_write(self._conn, WRITE_VALUE_HANDLE, data[_i : _i + _usable])
 
+    def write_burst(self, data):
+        # Same bytes as write(), but every ATT write lands before the
+        # device reads any of them - see _FakeBLE._simulate_write_burst.
+        _usable = max(self._mtu - 3, 1)
+        _chunks = [data[_i : _i + _usable] for _i in range(0, len(data), _usable)]
+        self._ble._simulate_write_burst(self._conn, WRITE_VALUE_HANDLE, _chunks)
+
     def send_json_frame(self, obj):
         _body = _cjson.dumps(obj).encode()
         self.write(len(_body).to_bytes(4, "big") + _body)
+
+    def send_json_frame_burst(self, obj):
+        _body = _cjson.dumps(obj).encode()
+        self.write_burst(len(_body).to_bytes(4, "big") + _body)
 
     def send_bytes_frame(self, data):
         self.write(len(data).to_bytes(4, "big") + data)
