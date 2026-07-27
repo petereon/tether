@@ -161,23 +161,36 @@ def status_command(port: str | None, ip: str | None, secret: str | None) -> None
     import socket
 
     from tether import provisioning
+    from tether.errors import WifiAuthError
     from tether.transports import serial as serial_transport
     from tether.transports import wifi as wifi_transport
 
     if ip:
         resolved_secret = secret if secret is not None else os.environ.get("TETHER_WIFI_SECRET")
+        payload = None
         try:
             sock = socket.create_connection((ip, wifi_transport.DEFAULT_PORT), timeout=3.0)
         except OSError:
             sock = None
         if sock is not None:
             try:
-                wifi_transport.send_preamble(sock, "status", resolved_secret)
-                payload = wifi_transport.read_json_frame(sock)
+                try:
+                    wifi_transport.send_preamble(sock, "status", resolved_secret)
+                    payload = wifi_transport.read_json_frame(sock)
+                except WifiAuthError:
+                    raise click.ClickException(
+                        f"wifi auth failed for {ip} - check --secret/TETHER_WIFI_SECRET"
+                    ) from None
+                except OSError:
+                    # device became unreachable mid-exchange - fall through
+                    # to the raw-REPL fallback below, same as a failed
+                    # connect.
+                    payload = None
             finally:
                 sock.close()
-            click.echo(f"Provisioned and connected. IP: {payload['ip']}")
-            return
+            if payload is not None:
+                click.echo(f"Provisioned and connected. IP: {payload['ip']}")
+                return
 
     resolved_port = _resolve_port(port)
     with _open_board(resolved_port) as ser:

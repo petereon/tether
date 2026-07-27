@@ -317,6 +317,41 @@ def test_status_command_falls_back_to_raw_repl_when_wifi_socket_unreachable(monk
     assert "not currently connected" in result.output.lower()
 
 
+def test_status_command_wifi_auth_failure_gives_clean_error_no_fallback(monkeypatch):
+    # A wrong/missing shared secret must produce a clear, user-facing
+    # click.ClickException - not an unhandled traceback, and not a silent
+    # fallback to the raw-REPL path (that would reset a perfectly healthy
+    # board just because the wrong secret was supplied).
+    from tether.errors import WifiAuthError
+
+    calls = []
+
+    class _FakeSocket:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_send_preamble(sock, mode, secret):
+        raise WifiAuthError("auth failed")
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **kw: _FakeSocket())
+    monkeypatch.setattr("tether.transports.wifi.send_preamble", fake_send_preamble)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board",
+        lambda ser: calls.append(("reset_board",)),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "192.168.1.50"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, (SystemExit, click.ClickException))
+    assert "192.168.1.50" in result.output
+    assert "secret" in result.output.lower()
+    assert ("reset_board",) not in calls
+
+
 def test_status_command_reports_connected_with_ip(monkeypatch):
     calls = []
 
