@@ -11,6 +11,7 @@ from tether.errors import (
     ProtocolVersionError,
     RemoteError,
     TetherError,
+    WifiAuthError,
 )
 
 # DESIGN.md's own architecture doc (and every example) documents
@@ -31,6 +32,7 @@ __all__ = [
     "ProtocolVersionError",
     "RemoteError",
     "TetherError",
+    "WifiAuthError",
     "connect",
     "mcu",
     "pc",

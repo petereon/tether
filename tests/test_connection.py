@@ -250,6 +250,20 @@ def test_mcu_connect_is_the_public_api_design_md_documents():
     assert board._mock_read_temp() == 21.5
 
 
+def test_wifi_auth_error_is_importable_from_the_top_level_tether_package():
+    # Final-review finding: `from tether import WifiAuthError` raised
+    # ImportError, while RemoteError, MCUTimeoutError,
+    # MCUDisconnectedError, and ProtocolVersionError all work fine this
+    # way (tether/__init__.py re-exports them). connect()'s own docstring
+    # tells users to expect WifiAuthError on a bad/missing secret, so it
+    # needs to be a properly public, importable exception like its
+    # siblings, not something reachable only via tether.errors directly.
+    from tether import WifiAuthError as top_level_wifi_auth_error
+    from tether.errors import WifiAuthError as errors_module_wifi_auth_error
+
+    assert top_level_wifi_auth_error is errors_module_wifi_auth_error
+
+
 def test_connect_mock_board_handle_rejects_unknown_attribute():
     board = connect("mock://")
     with pytest.raises(AttributeError):
