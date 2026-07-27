@@ -148,6 +148,26 @@ if _cfg is not None:
 
         def _handle_upload(_conn):
             try:
+                # Invalidate the OLD hash sentinel FIRST, before writing any
+                # file - .tether_hash is written last on success (matching
+                # serial's own ordering: a hash file present means "this
+                # bundle is complete and self-consistent"), but nothing
+                # previously invalidated the old one if an upload failed
+                # partway (wifi drop, flash exhaustion, an oversized/
+                # malformed chunk). Left stale, the old hash would still
+                # "match" on a future status-based hash-check, so a broken/
+                # truncated bundle would silently never get re-uploaded.
+                # With this, a failed upload always leaves the sentinel
+                # absent - a subsequent status query correctly reports
+                # tether_app_hash: None, signaling "needs upload" - rather
+                # than stale.
+                try:
+                    import uos as _uos
+
+                    _uos.remove("/.tether_hash")
+                except OSError:
+                    pass
+
                 _manifest = _read_json_frame(_conn)
                 for _d in _manifest.get("dirs", []):
                     try:

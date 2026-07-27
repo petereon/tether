@@ -1396,3 +1396,166 @@ builtins.open = _fake_open
 
     assert results["upload_ack"] == {"ok": True}
     assert results["upload_result"]["ok"] is False, results["upload_result"]
+
+
+@requires_micropython
+def test_boot_py_invalidates_stale_hash_when_an_upload_fails_partway():
+    # Final-review finding: .tether_hash was written last on a successful
+    # upload (correct), but nothing invalidated the OLD one first. If an
+    # upload fails partway (a wifi drop, flash exhaustion, Fix 3's oversize
+    # case before that fix), the device was left with a partially-written
+    # bundle but a hash sentinel still asserting the OLD bundle is intact -
+    # so the next connect() would see a hash "match" and skip re-uploading,
+    # then run mode would exec a broken/truncated file.
+    #
+    # Simulates a failed upload using the same chunk-overflow trigger Fix
+    # 3's device-side guard test uses (a chunk bigger than the declared
+    # remaining size for the file being written), with a pre-existing
+    # /.tether_hash already on the fake filesystem standing in for "a
+    # previous successful upload happened". Asserts a follow-up status
+    # query reports tether_app_hash: None, not the old value - proving the
+    # sentinel was invalidated up front, not left stale by the failure.
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    test_port = 18773
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    def send_bytes(sock, data):
+        sock.sendall(length_prefix.pack(len(data)) + data)
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "upload", "secret": None})
+        results["upload_ack"] = read_json(sock)
+
+        # Same failure trigger as Fix 3's device-side guard test: a chunk
+        # bigger than the file's own declared size.
+        send_json(
+            sock,
+            {"dirs": [], "files": [{"path": "/tether_app.py", "size": 5}]},
+        )
+        send_bytes(sock, b"0123456789")
+        results["upload_result"] = read_json(sock)
+        sock.close()
+
+        time.sleep(0.5)
+        sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock2, {"mode": "status", "secret": None})
+        results["status_ack"] = read_json(sock2)
+        results["status_payload"] = read_json(sock2)
+        sock2.close()
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{
+    "/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}',
+    "/.tether_hash": "old-hash-from-a-previous-successful-upload",
+}}
+
+class _FakeUos:
+    def remove(self, path):
+        if path in _files:
+            del _files[path]
+        else:
+            raise OSError(2, "no such file")
+    def mkdir(self, path):
+        pass
+
+_sys.modules["uos"] = _FakeUos()
+
+class _FakeReadFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+class _FakeWriteFile:
+    def __init__(self, path):
+        self._path = path
+        self._buf = b""
+    def write(self, data):
+        self._buf += data
+        return len(data)
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        _files[self._path] = self._buf
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if mode == "wb":
+        return _FakeWriteFile(path)
+    if path in _files:
+        content = _files[path]
+        if isinstance(content, bytes):
+            content = content.decode()
+        return _FakeReadFile(content)
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=4.0)
+    client_thread.join(timeout=10.0)
+
+    assert results["upload_ack"] == {"ok": True}
+    assert results["upload_result"]["ok"] is False, results["upload_result"]
+    assert results["status_ack"] == {"ok": True}
+    assert results["status_payload"]["tether_app_hash"] is None, results["status_payload"]
