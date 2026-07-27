@@ -13,7 +13,7 @@ This design builds BLE's on-device half from scratch and gives it full behaviora
 
 Full parity with wifi: same three modes (`run`/`upload`/`status`), same shared-secret auth model (with `--danger-unauthenticated`), same hash-check-skip-upload semantics, same "loop forever, one connection at a time, no reset needed to reconnect" shape. The parts that differ are strictly the ones BLE's transport model forces to differ: framing (MTU-chunked GATT writes/notifications instead of a raw socket stream), provisioning UX (no network credentials to configure — provisioning still exists as an explicit step, but only to write the shared secret and put boot.py into BLE-peripheral mode), and address discovery (the board's own BLE MAC, printed at provision time, instead of a DHCP-assigned IP).
 
-Wifi and BLE are independent: separate secret, separate provisioning command, separate on-device config file. Provisioning one does not touch or require the other.
+Wifi and BLE are independent in secret/config: separate secret, separate provisioning command, separate on-device config file. They are **not** independent at the `boot.py` level — MicroPython auto-runs exactly one `/boot.py` per board, so provisioning one transport necessarily overwrites the other's boot.py if both were ever provisioned on the same board. This design keeps wifi and BLE mutually exclusive rather than merging them into one concurrent boot.py (see "Provisioning CLI" for the exact handling, and "Alternatives considered" for why concurrent support was rejected for now).
 
 ## On-device architecture
 
@@ -23,9 +23,11 @@ New on-device shape, mirroring wifi's `boot.py` loop exactly:
 
 1. Bring up the BLE radio, register tether's GATT service (`SERVICE_UUID`/`WRITE_CHAR_UUID`/`NOTIFY_CHAR_UUID` — already fixed by the PC-side `ble.py`, reused unchanged so the two sides agree on what to look for).
 2. Start advertising.
-3. `while True:` — wait for a central to connect (blocking read off the IRQ queue) → read one preamble frame off the write characteristic (same length-prefixed JSON shape as wifi: `{"mode": ..., "secret": ...}`) → check secret → branch on mode → handle to completion → on disconnect, resume advertising → loop back to step 3.
+3. `while True:` — wait for a central to connect (blocking read off the IRQ queue) → **session loop:** read one preamble frame off the write characteristic (same length-prefixed JSON shape as wifi: `{"mode": ..., "secret": ...}`) → check secret → branch on mode → on `status`/`upload` completion, loop back to read another preamble **on the same still-open connection**; on `run` (which blocks until the client disconnects or the session errors), on auth failure, or on an unrecognized mode, end the session → disconnect → resume advertising → loop back to step 3.
 
-Sequential only, same as wifi: one central at a time, matching both the wifi design's decision and ESP32 BLE peripherals' own practical limit (`ble.py`'s PC-side docstring already notes this). No same-connection mode pivot — `upload` and `run` are always separate connections, exactly like wifi.
+Sequential only, same as wifi: one central at a time, matching both the wifi design's decision and ESP32 BLE peripherals' own practical limit (`ble.py`'s PC-side docstring already notes this).
+
+**Deliberate divergence from wifi: one BLE connection is reused across `status` → `upload` → `run`, instead of wifi's "always separate connections."** BLE connection setup (advertising discovery, link establishment, MTU negotiation) is meaningfully more expensive than a TCP handshake — doing it two or three times per `mcu.connect()` call (once per mode, matching wifi's model literally) would cost real, recurring latency and battery on hardware BLE exists specifically to be cheap on. `status` and `upload` therefore chain into a next preamble on the same connection when they complete successfully; only `run` (or an auth failure, or an unrecognized mode) ends the connection. This does NOT change wifi's own `boot.py` or protocol at all — it's a BLE-only shape, motivated purely by BLE's different cost profile, and doesn't touch `_handle_run`/`_handle_upload`/`_handle_status` themselves (see "Protocol reuse" below): only the surrounding session loop differs from wifi's per-connection-one-mode accept loop.
 
 ## Protocol reuse
 
@@ -46,6 +48,7 @@ New `tether provision-ble` command, serial-only, mirroring `provision-wifi`'s sh
 - Writes the BLE boot.py template, resets the board.
 - Reads back the board's own BLE MAC address (`bluetooth.BLE().config('mac')`) over the same serial session used to provision it, and prints it alongside the secret — the same "prints what you need to connect" UX wifi's `provision-wifi` already has for the IP.
 - `--danger-unauthenticated`: same semantics as wifi's flag — no secret generated or stored, loud warning printed, no interactive confirmation block (scriptable).
+- **boot.py conflict handling:** before writing, `provision-ble` checks whether `/tether_wifi.json` already exists on the board (a quick serial file check) and, if so, prints a clear warning that this will overwrite wifi's `boot.py` and disable wifi connectivity (the credentials file itself is left in place, but nothing will read it anymore) — then proceeds anyway, no interactive block (matches `--danger-unauthenticated`'s non-blocking precedent; scripted provisioning shouldn't hang on a prompt). `provision-wifi` gets the symmetric check against `/tether_ble.json`. A board runs wifi *or* BLE at a time in this version, not both — see "Explicitly out of scope."
 
 `mcu.connect("ble:<addr>", secret=...)` gains the same `secret` kwarg wifi's `connect()` has, falling back to a `TETHER_BLE_SECRET` environment variable (separate from `TETHER_WIFI_SECRET`) if omitted. Same "no PC-side persistent secret store" decision as wifi, for the same reasons.
 
@@ -75,11 +78,13 @@ Same rigor and same structure as the wifi plan:
 
 **Always-on BLE advertising (no explicit provisioning step).** Rejected: removes the natural place to configure/rotate the shared secret and makes BLE peripheral mode non-opt-in on every board by default — a bigger default security/battery surface than this project wants to force on every generated `boot.py`.
 
+**Concurrent wifi + BLE on one board** (a single `boot.py` running both a wifi accept-loop and a BLE session-loop at once, via e.g. `asyncio.gather`). Rejected for this design: real capability gain, but meaningfully bigger scope — shared `run`-mode state across two transports, doubled testing surface, and neither transport's boot.py logic was designed with a concurrent sibling in mind. Mutual exclusivity (see "Provisioning CLI") is the deliberate, simpler choice for now.
+
 ## Explicitly out of scope
 
 - **BLE pairing/bonding** (OS/platform-level Bluetooth security, encrypted links, MITM protection). This design reuses the same preamble-shared-secret model wifi uses instead — deliberately not touching the platform pairing story. Same accepted tradeoff wifi's spec already made explicit for its own auth: "keep casual snoopers and accidental cross-connects out," not a defense against a sophisticated adversary.
 - **BLE scanning/discovery** via `tether devices` or otherwise. `provision-ble` printing the address is the only discovery mechanism.
-- **Concurrent/simultaneous BLE connections.** Sequential only, same as wifi.
-- **A same-connection upload→run pivot.** Always two separate connections, same as wifi.
+- **Concurrent/simultaneous BLE connections** (more than one central at a time). Sequential only, same as wifi.
+- **Concurrent wifi + BLE on one board.** Mutually exclusive — see "Scope decision" and "Provisioning CLI." A board runs one or the other.
 - **Real cryptography** (encrypted GATT, challenge-response auth). Same plaintext-preshared-token tradeoff as wifi, for the same reasons.
-- **Sharing a secret/config file between wifi and BLE.** Independent provisioning, independent secrets, independent files.
+- **Sharing a secret/config file between wifi and BLE.** Independent secrets, independent files — only their `boot.py` slot is a shared, mutually-exclusive resource.
