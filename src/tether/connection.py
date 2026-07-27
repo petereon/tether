@@ -537,6 +537,17 @@ def _connect_wifi(
     bundle_hash = _hash_bundle(bootstrap)
     # See _connect_mock's matching comment.
     board: BoardHandle | None = None
+    # Tracks the most recently created run-mode WifiStream across repeated
+    # dial() calls (i.e. across reconnect()s) - boot.py's accept-loop is
+    # strictly sequential (one connection fully handled before the next
+    # accept()), so calling board.reconnect() while the OLD connection is
+    # still open (never explicitly closed by the caller first) leaves the
+    # device's _handle_run blocked forever reading from the stale
+    # connection - it never gets back to accept() to serve the new one.
+    # Closing it here, at the very start of the next dial(), makes
+    # reconnect() implicitly close-then-reconnect rather than assuming the
+    # caller already closed the old one.
+    last_stream: Any | None = None
 
     def _query_status(sock: Any) -> dict[str, Any]:
         wifi_transport.send_preamble(sock, "status", resolved_secret)
@@ -575,7 +586,16 @@ def _connect_wifi(
             raise RuntimeError(f"wifi upload failed: {result.get('error')}")
 
     def dial() -> Dispatcher:
+        nonlocal last_stream
         import socket as socket_module
+
+        # Close the PREVIOUS run-mode connection (if any) FIRST, before
+        # opening any new connection (status/upload/run) - see last_stream's
+        # own comment above. A no-op on the very first dial() call (nothing
+        # to close yet).
+        if last_stream is not None:
+            last_stream.close()
+            last_stream = None
 
         status_sock = socket_module.create_connection((host, port), timeout=timeout)
         try:
@@ -597,6 +617,7 @@ def _connect_wifi(
         # The short-lived status/upload connections above don't need that
         # treatment, so a plain socket is simplest for those.
         stream = wifi_transport.connect(host, port, timeout=timeout)
+        last_stream = stream
         try:
             wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
             return _start_and_handshake(
@@ -608,6 +629,7 @@ def _connect_wifi(
             )
         except BaseException:
             stream.close()
+            last_stream = None
             raise
 
     board = BoardHandle(dial(), export_specs, dial=dial)

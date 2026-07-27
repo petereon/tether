@@ -801,3 +801,138 @@ def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
         f"got chunk sizes {chunk_sizes}"
     )
     assert board is not None
+
+
+def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
+    # Final-review finding: _connect_wifi's dial() never closed the
+    # PREVIOUS run-mode WifiStream before opening a new one. boot.py's
+    # accept-loop is strictly sequential (one connection fully handled
+    # before the next accept()) - calling board.reconnect() while the old
+    # connection is still open (not explicitly closed by the caller first)
+    # left the device's _handle_run blocked forever reading from the stale
+    # connection, so it never got back to accept() to serve the new one -
+    # a hang/timeout on the reconnect attempt.
+    #
+    # Hand-rolled fake device over a real socket (matching this file's
+    # other wifi tests), tracking accept() count and whether the FIRST
+    # run-mode connection was ever actually seen to close - a still-broken
+    # PC side would leave it open forever, so the device's own wait for
+    # that close is itself bounded (not an indefinite block) so a
+    # regression here produces a clean test failure, not a hung test
+    # process. Answers RPC calls manually (no real server-side Dispatcher)
+    # so the same function that answers calls also owns the socket for the
+    # close-detection read that follows - no second reader thread to race.
+    import json
+    import struct
+    import threading
+
+    import msgpack
+
+    from tether.marshalling import encode_frame
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += conn.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(conn, obj):
+        body = json.dumps(obj).encode()
+        conn.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_bytes_frame(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        buf = b""
+        while len(buf) < length:
+            buf += conn.recv(length - len(buf))
+        return buf
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+
+    results: dict = {"accepted": 0, "first_run_conn_closed": None}
+
+    def serve_status_and_upload_then_open_run_conn():
+        conn, _addr = listener.accept()
+        results["accepted"] += 1
+        assert read_json(conn)["mode"] == "status"
+        send_json(conn, {"ok": True})
+        send_json(conn, {"tether_app_hash": None})  # always force a re-upload, keeps this simple
+        conn.close()
+
+        conn2, _addr = listener.accept()
+        results["accepted"] += 1
+        assert read_json(conn2)["mode"] == "upload"
+        send_json(conn2, {"ok": True})
+        manifest = read_json(conn2)
+        for file_meta in manifest["files"]:
+            remaining = file_meta["size"]
+            while remaining > 0:
+                remaining -= len(read_bytes_frame(conn2))
+        send_json(conn2, {"ok": True})
+        conn2.close()
+
+        conn3, _addr = listener.accept()
+        results["accepted"] += 1
+        assert read_json(conn3)["mode"] == "run"
+        send_json(conn3, {"ok": True})
+        return conn3
+
+    def serve_run_connection_until_closed(conn, *, wait_for_close_timeout):
+        """Answers any RPC calls (handshake, _mock_read_temp) that arrive,
+        then, once the peer stops sending anything, waits (bounded) to see
+        the connection actually close. Returns True if it did, False if the
+        wait timed out first - a still-broken PC side never closes this
+        connection, so this is exactly how the bug would manifest.
+        """
+        conn.settimeout(wait_for_close_timeout)
+        while True:
+            try:
+                header = conn.recv(4)
+            except OSError:
+                return False
+            if not header:
+                return True
+            body_len = int.from_bytes(header, "big")
+            body = conn.recv(body_len)
+            request = msgpack.unpackb(body[1:], raw=False)
+            value = {"__tether_handshake__": PROTOCOL_VERSION, "_mock_read_temp": 21.5}.get(
+                request["name"]
+            )
+            conn.sendall(encode_frame(2, {"id": request["id"], "value": value}))
+
+    def fake_device():
+        first_run_conn = serve_status_and_upload_then_open_run_conn()
+        closed = serve_run_connection_until_closed(first_run_conn, wait_for_close_timeout=6.0)
+        results["first_run_conn_closed"] = closed
+        first_run_conn.close()
+
+        if not closed:
+            # A real device would be stuck here forever - nothing more to
+            # prove; the main thread's board.reconnect() call already
+            # timed out/failed by this point.
+            return
+
+        second_run_conn = serve_status_and_upload_then_open_run_conn()
+        serve_run_connection_until_closed(second_run_conn, wait_for_close_timeout=2.0)
+        second_run_conn.close()
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    board = connect(f"wifi:127.0.0.1:{port}", timeout=3.0)
+    assert board._mock_read_temp() == 21.5
+
+    board.reconnect()  # must not hang/timeout - this is the fix under test
+    assert board._mock_read_temp() == 21.5
+
+    device_thread.join(timeout=15.0)
+    assert results["first_run_conn_closed"] is True, results
+    assert results["accepted"] == 6, results
