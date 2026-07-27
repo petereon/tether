@@ -883,3 +883,150 @@ builtins.open = _fake_open
         msg_type, payload = results[label]
         assert msg_type == b"\x02", (label, msg_type)  # MSG_RESULT
         assert payload == {"id": 1, "value": PROTOCOL_VERSION}, (label, payload)
+
+
+@requires_micropython
+def test_boot_py_upload_mode_writes_files_verified_via_status():
+    # Verifies upload mode via the same channel a real client would use to
+    # confirm it worked: upload a file + its hash, then reconnect in
+    # status mode and check the reported hash matches - proving the round
+    # trip through the actual on-device write path, not just "the ok
+    # response came back".
+    import json as pc_json
+    import socket
+    import struct
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    test_port = 18770
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    def send_bytes(sock, data):
+        sock.sendall(length_prefix.pack(len(data)) + data)
+
+    app_content = b"print('this is the uploaded tether_app.py')\n"
+    hash_content = b"deadbeef-fake-hash"
+
+    results = {}
+
+    def run_client():
+        time.sleep(0.5)
+
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock, {"mode": "upload", "secret": None})
+        results["upload_ack"] = read_json(sock)
+
+        send_json(
+            sock,
+            {
+                "dirs": [],
+                "files": [
+                    {"path": "/tether_app.py", "size": len(app_content)},
+                    {"path": "/.tether_hash", "size": len(hash_content)},
+                ],
+            },
+        )
+        send_bytes(sock, app_content)
+        send_bytes(sock, hash_content)
+        results["upload_result"] = read_json(sock)
+        sock.close()
+
+        time.sleep(0.5)
+        sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        send_json(sock2, {"mode": "status", "secret": None})
+        results["status_ack"] = read_json(sock2)
+        results["status_payload"] = read_json(sock2)
+        sock2.close()
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}'}}
+
+class _FakeReadFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+class _FakeWriteFile:
+    def __init__(self, path):
+        self._path = path
+        self._buf = b""
+    def write(self, data):
+        self._buf += data
+        return len(data)
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        _files[self._path] = self._buf
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if mode == "wb":
+        return _FakeWriteFile(path)
+    if path in _files:
+        content = _files[path]
+        if isinstance(content, bytes):
+            content = content.decode()
+        return _FakeReadFile(content)
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=4.0)
+    client_thread.join(timeout=10.0)
+
+    assert results["upload_ack"] == {"ok": True}
+    assert results["upload_result"] == {"ok": True}, results["upload_result"]
+    assert results["status_ack"] == {"ok": True}
+    assert results["status_payload"]["tether_app_hash"] == hash_content.decode()

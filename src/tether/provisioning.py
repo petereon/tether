@@ -27,9 +27,9 @@ from tether.transports.wifi import DEFAULT_PORT
 # Loops indefinitely once wifi is up, accepting connections one at a time
 # (never concurrently). Every connection starts with a small preamble
 # (JSON, not msgpack - see this module's own note below) selecting a mode
-# and presenting the shared secret if one is configured. As of this
-# version only "status" is implemented; "run" and "upload" are added by
-# later work. An unrecognized mode gets a clean rejection, not a crash.
+# and presenting the shared secret if one is configured. All three modes
+# - "status", "run", and "upload" - are implemented. An unrecognized mode
+# gets a clean rejection, not a crash.
 _BOOT_PY_TEMPLATE = f"""\
 try:
     import ujson as _json
@@ -123,6 +123,36 @@ if _cfg is not None:
                         "ending (reconnect any time, no reset needed)"
                     )
 
+        def _handle_upload(_conn):
+            try:
+                _manifest = _read_json_frame(_conn)
+                for _d in _manifest.get("dirs", []):
+                    try:
+                        import uos as _uos
+
+                        _uos.mkdir(_d)
+                    except OSError:
+                        pass
+                for _file_meta in _manifest.get("files", []):
+                    _path = _file_meta["path"]
+                    _size = _file_meta["size"]
+                    _remaining = _size
+                    with open(_path, "wb") as _wf:
+                        while _remaining > 0:
+                            _header = _recv_exact(_conn, 4)
+                            _chunk_len = int.from_bytes(_header, "big")
+                            if _chunk_len > _MAX_CTRL_FRAME:
+                                raise OSError("upload chunk too large")
+                            _chunk_data = _recv_exact(_conn, _chunk_len)
+                            _wf.write(_chunk_data)
+                            _remaining -= len(_chunk_data)
+                _send_json_frame(_conn, {{"ok": True}})
+            except Exception as _exc:
+                try:
+                    _send_json_frame(_conn, {{"ok": False, "error": str(_exc)}})
+                except OSError:
+                    pass
+
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
         _srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
         _srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
@@ -144,6 +174,9 @@ if _cfg is not None:
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
                     _handle_run(_conn)
+                elif _mode == "upload":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_upload(_conn)
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
             except Exception:
