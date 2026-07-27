@@ -15,9 +15,167 @@ from __future__ import annotations
 
 import json
 import secrets
+import textwrap
 
 from tether.connection import PROTOCOL_VERSION
 from tether.transports.wifi import DEFAULT_PORT
+
+# Shared between wifi's _BOOT_PY_TEMPLATE and BLE's _BLE_BOOT_TEMPLATE
+# (provisioning.py) - the mode-handling logic itself (status/upload/run)
+# does not depend on which transport delivered the connection, only on
+# the connection object exposing .recv(n)/.send(data) matching a real
+# socket's contract (see each template's own _conn adapter). _handle_run
+# is the one exception: it takes an extra _make_streams(_conn) parameter
+# instead of hardcoding uasyncio.StreamReader/Writer(_conn) directly,
+# since that constructor requires a real socket at the native level,
+# which a BLE connection fundamentally isn't - wifi's _make_streams wraps
+# a real socket (trivial); BLE's constructs a custom async adapter (see
+# _BLE_BOOT_TEMPLATE).
+#
+# Zero-indented here; each template embeds it via textwrap.indent() at
+# its own nesting depth, so this text is never duplicated or hand-kept
+# in sync between the two call sites.
+_MODE_HANDLER_FUNCTIONS_SRC = f"""\
+def _recv_exact(_conn, _n):
+    _buf = b""
+    while len(_buf) < _n:
+        _chunk = _conn.recv(_n - len(_buf))
+        if not _chunk:
+            raise OSError("connection closed")
+        _buf += _chunk
+    return _buf
+
+def _read_json_frame(_conn):
+    _header = _recv_exact(_conn, 4)
+    _length = int.from_bytes(_header, "big")
+    if _length > _MAX_CTRL_FRAME:
+        raise OSError("control frame too large")
+    _body = _recv_exact(_conn, _length)
+    return _json.loads(_body)
+
+def _send_json_frame(_conn, _obj):
+    _body = _json.dumps(_obj).encode()
+    _conn.send(len(_body).to_bytes(4, "big") + _body)
+
+def _handle_status(_conn, _get_addr):
+    _hash = None
+    try:
+        with open("/.tether_hash") as _hf:
+            _hash = _hf.read()
+    except OSError:
+        pass
+    _send_json_frame(_conn, {{
+        "protocol_version": {PROTOCOL_VERSION},
+        "tether_app_hash": _hash,
+        "free_heap": _gc.mem_free(),
+        "uptime_ms": time.ticks_diff(time.ticks_ms(), _boot_ms),
+        "ip": _get_addr(),
+    }})
+
+def _handle_run(_conn, _make_streams):
+    try:
+        with open("/tether_app.py") as _f:
+            _tether_app_src = _f.read()
+    except OSError:
+        _tether_app_src = None
+
+    if _tether_app_src is not None:
+        import uasyncio as _asyncio
+
+        _reader, _writer = _make_streams(_conn)
+        try:
+            exec(
+                _tether_app_src,
+                {{"_tether_stream_override": (_reader, _writer)}},
+            )
+        except (OSError, EOFError):
+            print(
+                "tether: client disconnected - run session ending "
+                "(reconnect any time, no reset needed)"
+            )
+        finally:
+            # The dominant duplication mechanism (found during final
+            # review, distinct from and more serious than the
+            # mcu_decorators registry fix above): MicroPython's
+            # uasyncio task queue is a process-global structure, and
+            # asyncio.run() returning/raising does NOT drain tasks
+            # queued via asyncio.create_task() inside it - which is
+            # exactly what Dispatcher.run() does for every
+            # @mcu.loop function. Without this, a previous run-mode
+            # session's loop task(s) stay alive in the global queue
+            # and get resumed alongside the new session's own task
+            # the next time asyncio.run() is called here - an
+            # accumulating, not replacing, duplicate every
+            # reconnect. new_event_loop() resets that global queue
+            # between sessions, whether this session ended via the
+            # expected disconnect exception or any other way.
+            # Verified against the real interpreter: without this,
+            # three successive sessions' sampled tick counts grew
+            # non-linearly (each session ticking faster than the
+            # last, from N accumulating duplicate loop tasks); with
+            # it, each session's tick count stays roughly constant.
+            _asyncio.new_event_loop()
+
+def _handle_upload(_conn):
+    try:
+        # Invalidate the OLD hash sentinel FIRST, before writing any
+        # file - .tether_hash is written last on success (matching
+        # serial's own ordering: a hash file present means "this
+        # bundle is complete and self-consistent"), but nothing
+        # previously invalidated the old one if an upload failed
+        # partway (wifi drop, flash exhaustion, an oversized/
+        # malformed chunk). Left stale, the old hash would still
+        # "match" on a future status-based hash-check, so a broken/
+        # truncated bundle would silently never get re-uploaded.
+        # With this, a failed upload always leaves the sentinel
+        # absent - a subsequent status query correctly reports
+        # tether_app_hash: None, signaling "needs upload" - rather
+        # than stale.
+        try:
+            import uos as _uos
+
+            _uos.remove("/.tether_hash")
+        except OSError:
+            pass
+
+        _manifest = _read_json_frame(_conn)
+        for _d in _manifest.get("dirs", []):
+            try:
+                import uos as _uos
+
+                _uos.mkdir(_d)
+            except OSError:
+                pass
+        for _file_meta in _manifest.get("files", []):
+            _path = _file_meta["path"]
+            _size = _file_meta["size"]
+            _remaining = _size
+            with open(_path, "wb") as _wf:
+                while _remaining > 0:
+                    _header = _recv_exact(_conn, 4)
+                    _chunk_len = int.from_bytes(_header, "big")
+                    if _chunk_len > _MAX_CTRL_FRAME:
+                        raise OSError("upload chunk too large")
+                    # A chunk bigger than what's still declared-
+                    # remaining for THIS file must be rejected
+                    # immediately, not written anyway - otherwise
+                    # _remaining goes negative and, in a multi-file
+                    # upload, an oversized chunk would spill into
+                    # what should have been the next file's own
+                    # frames. A compliant chunked client (PC-side
+                    # _upload()) never sends a chunk like this.
+                    if _chunk_len > _remaining:
+                        raise OSError("upload chunk exceeds declared file size")
+                    _chunk_data = _recv_exact(_conn, _chunk_len)
+                    _wf.write(_chunk_data)
+                    _remaining -= len(_chunk_data)
+        _send_json_frame(_conn, {{"ok": True}})
+    except Exception as _exc:
+        try:
+            _send_json_frame(_conn, {{"ok": False, "error": str(_exc)}})
+        except OSError:
+            pass
+"""
 
 # Fixed template - never contains credentials or the shared secret (those
 # live in /tether_wifi.json, uploaded separately - see generate_wifi_boot).
@@ -62,149 +220,11 @@ if _cfg is not None:
         _boot_ms = time.ticks_ms()
         _MAX_CTRL_FRAME = 65536
 
-        def _recv_exact(_conn, _n):
-            _buf = b""
-            while len(_buf) < _n:
-                _chunk = _conn.recv(_n - len(_buf))
-                if not _chunk:
-                    raise OSError("connection closed")
-                _buf += _chunk
-            return _buf
+{textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "        ")}
+        def _wifi_make_streams(_conn):
+            import uasyncio as _asyncio
 
-        def _read_json_frame(_conn):
-            _header = _recv_exact(_conn, 4)
-            _length = int.from_bytes(_header, "big")
-            if _length > _MAX_CTRL_FRAME:
-                raise OSError("control frame too large")
-            _body = _recv_exact(_conn, _length)
-            return _json.loads(_body)
-
-        def _send_json_frame(_conn, _obj):
-            _body = _json.dumps(_obj).encode()
-            _conn.send(len(_body).to_bytes(4, "big") + _body)
-
-        def _handle_status(_conn):
-            _hash = None
-            try:
-                with open("/.tether_hash") as _hf:
-                    _hash = _hf.read()
-            except OSError:
-                pass
-            _send_json_frame(_conn, {{
-                "protocol_version": {PROTOCOL_VERSION},
-                "tether_app_hash": _hash,
-                "free_heap": _gc.mem_free(),
-                "uptime_ms": time.ticks_diff(time.ticks_ms(), _boot_ms),
-                "ip": _wlan.ifconfig()[0],
-            }})
-
-        def _handle_run(_conn):
-            try:
-                with open("/tether_app.py") as _f:
-                    _tether_app_src = _f.read()
-            except OSError:
-                _tether_app_src = None
-
-            if _tether_app_src is not None:
-                import uasyncio as _asyncio
-
-                try:
-                    exec(
-                        _tether_app_src,
-                        {{
-                            "_tether_stream_override": (
-                                _asyncio.StreamReader(_conn),
-                                _asyncio.StreamWriter(_conn, {{}}),
-                            )
-                        }},
-                    )
-                except (OSError, EOFError):
-                    print(
-                        "tether: wifi client disconnected - run session "
-                        "ending (reconnect any time, no reset needed)"
-                    )
-                finally:
-                    # The dominant duplication mechanism (found during final
-                    # review, distinct from and more serious than the
-                    # mcu_decorators registry fix above): MicroPython's
-                    # uasyncio task queue is a process-global structure, and
-                    # asyncio.run() returning/raising does NOT drain tasks
-                    # queued via asyncio.create_task() inside it - which is
-                    # exactly what Dispatcher.run() does for every
-                    # @mcu.loop function. Without this, a previous run-mode
-                    # session's loop task(s) stay alive in the global queue
-                    # and get resumed alongside the new session's own task
-                    # the next time asyncio.run() is called here - an
-                    # accumulating, not replacing, duplicate every
-                    # reconnect. new_event_loop() resets that global queue
-                    # between sessions, whether this session ended via the
-                    # expected disconnect exception or any other way.
-                    # Verified against the real interpreter: without this,
-                    # three successive sessions' sampled tick counts grew
-                    # non-linearly (each session ticking faster than the
-                    # last, from N accumulating duplicate loop tasks); with
-                    # it, each session's tick count stays roughly constant.
-                    _asyncio.new_event_loop()
-
-        def _handle_upload(_conn):
-            try:
-                # Invalidate the OLD hash sentinel FIRST, before writing any
-                # file - .tether_hash is written last on success (matching
-                # serial's own ordering: a hash file present means "this
-                # bundle is complete and self-consistent"), but nothing
-                # previously invalidated the old one if an upload failed
-                # partway (wifi drop, flash exhaustion, an oversized/
-                # malformed chunk). Left stale, the old hash would still
-                # "match" on a future status-based hash-check, so a broken/
-                # truncated bundle would silently never get re-uploaded.
-                # With this, a failed upload always leaves the sentinel
-                # absent - a subsequent status query correctly reports
-                # tether_app_hash: None, signaling "needs upload" - rather
-                # than stale.
-                try:
-                    import uos as _uos
-
-                    _uos.remove("/.tether_hash")
-                except OSError:
-                    pass
-
-                _manifest = _read_json_frame(_conn)
-                for _d in _manifest.get("dirs", []):
-                    try:
-                        import uos as _uos
-
-                        _uos.mkdir(_d)
-                    except OSError:
-                        pass
-                for _file_meta in _manifest.get("files", []):
-                    _path = _file_meta["path"]
-                    _size = _file_meta["size"]
-                    _remaining = _size
-                    with open(_path, "wb") as _wf:
-                        while _remaining > 0:
-                            _header = _recv_exact(_conn, 4)
-                            _chunk_len = int.from_bytes(_header, "big")
-                            if _chunk_len > _MAX_CTRL_FRAME:
-                                raise OSError("upload chunk too large")
-                            # A chunk bigger than what's still declared-
-                            # remaining for THIS file must be rejected
-                            # immediately, not written anyway - otherwise
-                            # _remaining goes negative and, in a multi-file
-                            # upload, an oversized chunk would spill into
-                            # what should have been the next file's own
-                            # frames. A compliant chunked client (PC-side
-                            # _upload()) never sends a chunk like this.
-                            if _chunk_len > _remaining:
-                                raise OSError("upload chunk exceeds declared file size")
-                            _chunk_data = _recv_exact(_conn, _chunk_len)
-                            _wf.write(_chunk_data)
-                            _remaining -= len(_chunk_data)
-                _send_json_frame(_conn, {{"ok": True}})
-            except Exception as _exc:
-                try:
-                    _send_json_frame(_conn, {{"ok": False, "error": str(_exc)}})
-                except OSError:
-                    pass
+            return _asyncio.StreamReader(_conn), _asyncio.StreamWriter(_conn, {{}})
 
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
         _srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -223,10 +243,10 @@ if _cfg is not None:
                     _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_status(_conn)
+                    _handle_status(_conn, lambda: _wlan.ifconfig()[0])
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_run(_conn)
+                    _handle_run(_conn, _wifi_make_streams)
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
                     _handle_upload(_conn)
