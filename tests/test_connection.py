@@ -660,3 +660,144 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
     assert "/umsgpack/__init__.py" in received_files
     assert received_dirs == ["/umsgpack"]
     assert board is not None
+
+
+def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
+    # Final-review finding: _upload() sent one send_bytes_frame per file
+    # unconditionally, even though the whole control channel's invariant
+    # (design spec) is "no single frame ever needs to hold more than
+    # MAX_FRAME_SIZE bytes" and the device side already loops reading
+    # chunks per file. A ~64KiB+ app file used to fail with "upload chunk
+    # too large" on the device side (its own MAX_CONTROL_FRAME_SIZE guard
+    # correctly rejecting an oversized single frame) and left a truncated
+    # write behind. This test uses a `bootstrap` string bigger than
+    # MAX_CONTROL_FRAME_SIZE directly (bypassing the slicer - the size of
+    # the *content*, not how it was produced, is what this test is about)
+    # and asserts the client actually splits it into multiple frames, none
+    # of which exceeds the bound, while the reassembled content on the
+    # device side is still byte-for-byte correct.
+    import json
+    import socket
+    import struct
+    import threading
+
+    from tether.transports.wifi import MAX_CONTROL_FRAME_SIZE
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(sock, obj):
+        body = json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def recv_exact(sock, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("closed")
+            buf += chunk
+        return buf
+
+    def read_bytes_frame_capturing_chunk_sizes(sock, chunk_sizes):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        chunk_sizes.append(length)
+        return recv_exact(sock, length)
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(4)
+    port = server_sock.getsockname()[1]
+
+    received_files: dict[str, bytes] = {}
+    chunk_sizes: list[int] = []
+
+    def fake_device():
+        conn, _ = server_sock.accept()
+        assert read_json(conn)["mode"] == "status"
+        send_json(conn, {"ok": True})
+        send_json(
+            conn,
+            {
+                "protocol_version": 1,
+                "tether_app_hash": None,
+                "free_heap": 100000,
+                "uptime_ms": 500,
+                "ip": "127.0.0.1",
+            },
+        )
+        conn.close()
+
+        conn2, _ = server_sock.accept()
+        assert read_json(conn2)["mode"] == "upload"
+        send_json(conn2, {"ok": True})
+        manifest = read_json(conn2)
+        for file_meta in manifest["files"]:
+            remaining = file_meta["size"]
+            content = b""
+            while remaining > 0:
+                chunk = read_bytes_frame_capturing_chunk_sizes(conn2, chunk_sizes)
+                content += chunk
+                remaining -= len(chunk)
+            received_files[file_meta["path"]] = content
+        send_json(conn2, {"ok": True})
+        conn2.close()
+
+        conn3, _ = server_sock.accept()
+        assert read_json(conn3)["mode"] == "run"
+        send_json(conn3, {"ok": True})
+
+        import msgpack
+
+        header = conn3.recv(4)
+        body_len = int.from_bytes(header, "big")
+        body = conn3.recv(body_len)
+        request = msgpack.unpackb(body[1:], raw=False)
+        assert request["name"] == "__tether_handshake__"
+
+        from tether.marshalling import encode_frame
+
+        conn3.sendall(encode_frame(2, {"id": request["id"], "value": PROTOCOL_VERSION}))
+        conn3.settimeout(2.0)
+        try:
+            conn3.recv(1)
+        except OSError:
+            pass
+        conn3.close()
+
+    server_thread = threading.Thread(target=fake_device, daemon=True)
+    server_thread.start()
+
+    # Bigger than MAX_CONTROL_FRAME_SIZE (65536) by a non-round amount, so a
+    # correct chunker must emit at least 2 chunks and the final chunk must
+    # be a partial, non-65536-sized remainder - exercising both the "full
+    # chunk" and "last partial chunk" cases in one file.
+    big_bootstrap = "x" * (MAX_CONTROL_FRAME_SIZE + 12345)
+
+    board = _connect_wifi(
+        f"127.0.0.1:{port}",
+        big_bootstrap,
+        {},
+        frozenset(),
+        {},
+        timeout=5.0,
+    )
+
+    server_thread.join(timeout=5.0)
+
+    assert received_files["/tether_app.py"] == big_bootstrap.encode()
+    assert chunk_sizes, "expected at least one bytes-frame chunk to have been sent"
+    assert all(size <= MAX_CONTROL_FRAME_SIZE for size in chunk_sizes), chunk_sizes
+    assert len(chunk_sizes) >= 2, (
+        "expected the oversized file to be split into multiple frames, "
+        f"got chunk sizes {chunk_sizes}"
+    )
+    assert board is not None

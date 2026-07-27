@@ -553,8 +553,23 @@ def _connect_wifi(
             "files": [{"path": path, "size": len(content)} for path, content in files.items()],
         }
         wifi_transport.send_json_frame(sock, manifest)
+        # Split each file's content into slices no larger than
+        # MAX_CONTROL_FRAME_SIZE (64 KiB) - the whole control channel's
+        # invariant (design spec) is "no single frame ever needs to hold
+        # more than MAX_FRAME_SIZE bytes", and the device side
+        # (_handle_upload in provisioning.py) already loops reading chunks
+        # per file expecting exactly this; sending one giant frame per file
+        # regardless of size used to make any file over 64 KiB fail with
+        # "upload chunk too large" on the device side (its own frame-size
+        # guard correctly rejecting the oversized single frame it received).
+        # range(0, 0, max_chunk) is empty, so a zero-byte file correctly
+        # gets zero frames - matching the device side's own `while
+        # _remaining > 0:` loop (provisioning.py's _handle_upload), which
+        # likewise reads no frames at all for a declared size of 0.
+        max_chunk = wifi_transport.MAX_CONTROL_FRAME_SIZE
         for content in files.values():
-            wifi_transport.send_bytes_frame(sock, content)
+            for offset in range(0, len(content), max_chunk):
+                wifi_transport.send_bytes_frame(sock, content[offset : offset + max_chunk])
         result = wifi_transport.read_json_frame(sock)
         if not result.get("ok", False):
             raise RuntimeError(f"wifi upload failed: {result.get('error')}")

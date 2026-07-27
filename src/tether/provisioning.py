@@ -166,6 +166,16 @@ if _cfg is not None:
                             _chunk_len = int.from_bytes(_header, "big")
                             if _chunk_len > _MAX_CTRL_FRAME:
                                 raise OSError("upload chunk too large")
+                            # A chunk bigger than what's still declared-
+                            # remaining for THIS file must be rejected
+                            # immediately, not written anyway - otherwise
+                            # _remaining goes negative and, in a multi-file
+                            # upload, an oversized chunk would spill into
+                            # what should have been the next file's own
+                            # frames. A compliant chunked client (PC-side
+                            # _upload()) never sends a chunk like this.
+                            if _chunk_len > _remaining:
+                                raise OSError("upload chunk exceeds declared file size")
                             _chunk_data = _recv_exact(_conn, _chunk_len)
                             _wf.write(_chunk_data)
                             _remaining -= len(_chunk_data)
