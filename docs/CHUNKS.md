@@ -1410,6 +1410,157 @@ be new scope beyond a verification pass):
    a reasonable, small follow-up - not implemented here, since this was a
    verification pass, not a fix pass.
 
+- [x] **20. WiFi upload modes, shared-secret auth, non-interrupting status**
+  — done 2026-07-27 (feature built across 7 tasks 2026-07-26; this entry
+  also covers a final whole-branch review pass and its fixes, applied
+  2026-07-27 before merge). Not part of the original 17-chunk plan (like
+  chunks 18/19) - closes the three real gaps chunk 19's addendum
+  documented: wifi never pushed code, the listener was unauthenticated,
+  and `tether status` killed the very listener it just confirmed was up.
+  Design spec: `docs/superpowers/specs/2026-07-25-wifi-modes-auth-design.md`.
+  Plan: `docs/superpowers/plans/2026-07-26-wifi-modes-auth.md`.
+
+  **Architecture:** `boot.py` restructured from a one-shot "accept one
+  connection, bridge it" script into a loop that accepts connections
+  indefinitely, one at a time (never concurrently). Every connection
+  starts with a small preamble - length-prefixed JSON (`ujson`), not
+  msgpack, since the vendored `umsgpack.py` may not exist yet on a board
+  that's only ever been wifi-provisioned - selecting one of three modes:
+  `status` (protocol version, bundle hash or `null`, free heap, uptime,
+  IP - no reset, no interruption), `upload` (receives and writes the full
+  `tether_runtime` bundle, chunked so no frame exceeds 64 KiB), or `run`
+  (the pre-existing `exec()`-based dispatch bridge, unchanged in
+  mechanism but now repeatable instead of one-shot). `mcu.connect(
+  "wifi:<ip>", secret=...)` drives status → hash-compare →
+  upload-if-needed → run automatically, mirroring serial's own shape.
+  Auth: a shared secret, generated fresh and printed by every
+  `tether provision-wifi` run, checked via plain equality (an accepted,
+  documented LAN-threat-model tradeoff, not an oversight) -
+  `--danger-unauthenticated` opts a board out entirely.
+
+  **Real bugs found during the final whole-branch review (2026-07-27),
+  all fixed before merge - documented honestly here rather than folded
+  silently into "done", matching this project's established convention
+  (see chunk 15's four real-hardware bugs, chunk 19's status-race finding):**
+
+  1. **`@mcu.loop` background tasks still duplicated on every wifi
+     reconnect - the literal reason this feature was built, and it was
+     still broken.** The already-merged fix (clearing
+     `mcu_decorators._registrations` at the top of every generated
+     bootstrap, closing the risk the design spec itself had already
+     traced during planning - see its "Mode: `run`" section) addressed a
+     *secondary* mechanism: harmless for plain handlers (a dict, last
+     write wins) but not for `@mcu.loop` (a list `Dispatcher._loops`
+     appends to). The *dominant* mechanism, found only once that fix was
+     in place and reconnecting was tested for real several times in a
+     row: MicroPython's `uasyncio` task queue is itself a process-global
+     structure, and `asyncio.run()` returning or raising does **not**
+     drain tasks queued via `asyncio.create_task()` inside it - exactly
+     what `Dispatcher.run()` does for every `@mcu.loop` function. A
+     previous run-mode session's loop task(s) stayed alive in that global
+     queue and resumed alongside the new session's own task on the next
+     `asyncio.run()` call - an accumulating, not replacing, duplicate
+     every reconnect, regardless of the registry fix. Reproduced directly
+     against the real interpreter: sampled `@mcu.loop` tick counts across
+     3 successive reconnects came out 14/43/87 (deltas 14/29/44 - almost
+     exactly 1x/2x/3x, the accumulating-duplicate-task signature). Fixed
+     with one line: `_handle_run` (inside `_BOOT_PY_TEMPLATE`) now calls
+     `uasyncio.new_event_loop()` in a `finally` clause, resetting the
+     global task queue at the end of every run-mode session regardless of
+     how it ended. Verified fixed: deltas stayed roughly constant per
+     session across repeated real-interpreter runs, comfortably under a
+     1.6x tolerance chosen to separate "accumulating" from "scheduling
+     jitter." New regression test:
+     `test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects`
+     - the counter is stored as an attribute on the `mcu_decorators`
+       module object itself (import-cached, not re-exec'd, so it
+       persists across sessions the same way `_registrations` does),
+       observed via a plain `@mcu.export` getter after each session's
+       sampling window.
+
+  2. **Upload chunking was never actually implemented on the PC side** -
+     `_upload()` sent one `send_bytes_frame` per file unconditionally,
+     even though the whole control channel's invariant (design spec) is
+     "no single frame ever needs to hold more than `MAX_FRAME_SIZE`
+     bytes" and the device side already looped reading chunks per file.
+     A file over 64 KiB failed with "upload chunk too large" and left a
+     truncated write. Fixed by splitting each file's content into
+     `MAX_CONTROL_FRAME_SIZE`-bounded slices before sending. Related
+     device-side gap, promoted from a previously-deferred minor: a
+     chunk's length was only checked against the absolute 64 KiB bound,
+     never against how much was actually still declared-remaining for
+     the file being written, so an oversized chunk got written anyway
+     (`_remaining` going negative) instead of rejected - could spill into
+     what should have been the next file's own frames in a multi-file
+     upload. Fixed with an explicit `_chunk_len > _remaining` check.
+
+  3. **A failed upload left a stale `.tether_hash` lying about a
+     truncated bundle.** `.tether_hash` was written last on success
+     (correct), but nothing invalidated the OLD one first - an upload
+     failing partway (a wifi drop, flash exhaustion, #2's oversize case
+     before its fix) left the device with a partially-written bundle but
+     a hash sentinel still asserting the OLD bundle was intact, so the
+     next `connect()` would see a hash "match" and skip re-uploading,
+     then `run` mode would exec a broken file. Fixed: `_handle_upload`
+     now removes `/.tether_hash` at the very start, before writing
+     anything - a failed upload always leaves the sentinel absent, so a
+     follow-up `status` query correctly reports `tether_app_hash: null`.
+
+  4. **`board.reconnect()` on a still-open wifi connection deadlocked the
+     device.** `_connect_wifi`'s `dial()` never closed the PREVIOUS
+     run-mode connection before opening a new one - since `boot.py`'s
+     accept-loop is strictly sequential, this left the device blocked
+     forever reading from the stale connection, never getting back to
+     `accept()` to serve the new one. Fixed: `dial()`'s closure now
+     tracks the most recent run-mode `WifiStream` and closes it at the
+     START of the next `dial()` call, before opening any new connection -
+     `reconnect()` is now implicitly close-then-reconnect.
+
+  5. **The run-mode preamble ack ignored `timeout=`, blocking forever.**
+     `wifi_transport.connect()` switched the socket to blocking (no
+     timeout) *before* the preamble's own blocking ack read - a device
+     that accepted the TCP connection but never acked (busy, hung, or
+     exactly #4's scenario before that fix) hung `mcu.connect(...,
+     timeout=N)` forever instead of raising within ~N seconds. Fixed:
+     `connect()` gained a `switch_to_blocking` parameter: `dial()` now
+     keeps the connection's finite timeout active through the preamble
+     exchange and only switches to blocking immediately afterward, right
+     before handing the stream to the long-lived `Dispatcher`.
+
+  6. **`WifiAuthError` wasn't exported from the `tether` package** -
+     `from tether import WifiAuthError` raised `ImportError` while its
+     siblings (`RemoteError`, `MCUTimeoutError`, `MCUDisconnectedError`,
+     `ProtocolVersionError`) all worked, despite `connect()`'s own
+     docstring telling users to expect it. Fixed by adding it to
+     `tether/__init__.py`'s import and `__all__`, matching the existing
+     pattern exactly.
+
+  Also added one integration test that had no equivalent anywhere in the
+  existing suite and would have caught bugs 1 and 4 far earlier: every
+  prior wifi test talked to a hand-rolled fake on one side of the
+  connection. `test_real_pc_connect_wifi_against_real_on_device_boot_py`
+  drives the REAL public `tether.connection.connect()` against a REAL
+  generated `boot.py` running under the real `micropython` interpreter -
+  full interop, not two independently-faked halves - covering slice →
+  status → upload → run → a real `@mcu.export` call, then
+  `board.reconnect()` and a second real call.
+
+  Documentation sweep (this same review pass): `docs/DESIGN.md` (§
+  Architecture overview step 5, § Transports' Wifi row, § Disconnection's
+  wifi caveat), `CLAUDE.md` (the "wifi never pushes code" constraint
+  bullet), and `README.md` (Transports table, "WiFi provisioning CLI"
+  section, `Status`) all updated to reflect what's actually true now,
+  with dated correction notes rather than silent rewrites, per this
+  project's own established convention for amending previously-locked
+  claims that real implementation/review has since overtaken.
+
+  Strict TDD throughout the fix wave: every code fix above has a
+  dedicated regression test confirmed RED (failing for the diagnosed
+  reason, against the pre-fix code) before the fix, then GREEN after.
+  238 tests passing (was 230 immediately before this review's fixes; +8:
+  one for each of bugs 1/2(PC-side chunking)/2(device-side guard)/3/4/5/6
+  above, plus the new real-client-vs-real-device integration test).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
