@@ -1,6 +1,6 @@
 import json
 
-from tether.provisioning import STATUS_SCRIPT, generate_wifi_boot
+from tether.provisioning import STATUS_SCRIPT, generate_ble_boot, generate_wifi_boot
 
 
 def test_generate_wifi_boot_produces_boot_py_and_config():
@@ -1696,3 +1696,353 @@ builtins.open = _fake_open
     assert board.e2e_add(10, 20) == 30
 
     device_thread.join(timeout=15.0)
+
+
+# --- BLE peripheral (generate_ble_boot / _BLE_BOOT_TEMPLATE) -----------
+#
+# Every test below drives the *real* generated boot.py under the real
+# micropython interpreter against a fake `bluetooth` module (tests/
+# ble_fakes.py - see its docstring for why a fake, and why threads).
+
+
+@requires_micropython
+def test_fake_bluetooth_module_loads_and_simulates_connect_write_notify():
+    # Pure infrastructure validation, run before anything depends on it:
+    # if the fake itself doesn't behave like MicroPython's `bluetooth`
+    # module, every later BLE test here is unreliable rather than wrong in
+    # an obvious way.
+    from ble_fakes import FAKE_BLUETOOTH_MODULE_SRC
+
+    script = (
+        FAKE_BLUETOOTH_MODULE_SRC
+        + """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_ble.active(True)
+_ble.irq(lambda e, d: print("irq", e, d))
+handles = _ble.gatts_register_services(("service-tuple-goes-here",))
+print("handles:", handles)
+_ble._simulate_connect(0)
+_ble._simulate_mtu(0, 100)
+_ble._simulate_write(0, 100, b"hello")
+print("gatts_read:", _ble.gatts_read(100))
+_ble.gatts_notify(0, 101, b"world")
+print("notifications:", _ble.notifications)
+_ble._simulate_disconnect(0)
+"""
+    )
+    out = run_micropython(script)
+
+    assert "handles: ((100, 101),)" in out
+    assert "irq 1 (0, 0, b'')" in out
+    assert "irq 21 (0, 100)" in out
+    assert "irq 3 (0, 100)" in out
+    assert "gatts_read: b'hello'" in out
+    assert "notifications: [(0, 101, b'world')]" in out
+    assert "irq 2 (0, 0, b'')" in out
+
+
+@requires_micropython
+def test_ble_boot_status_mode_reports_hash_and_reuses_one_connection():
+    # Two status exchanges over a SINGLE connection - the behavior that
+    # distinguishes BLE's session loop from wifi's (where every mode costs
+    # a fresh TCP connection). A reconnect per mode is expensive over BLE.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()  # singleton - the very instance boot.py registered
+_c = Central(_ble)
+_c.connect()
+
+_ack1 = _c.send_preamble("status", "s3cr3t")
+_status1 = _c.read_json_frame()
+_ack2 = _c.send_preamble("status", "s3cr3t")
+_status2 = _c.read_json_frame()
+
+print("ack1:", _ack1)
+print("hash1:", _status1["tether_app_hash"])
+print("protocol_version:", _status1["protocol_version"])
+print("addr:", _status1["ip"])
+print("ack2:", _ack2)
+print("hash2:", _status2["tether_app_hash"])
+print("still_one_connection:", _ble.notifications[0][0] == 0)
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "s3cr3t"}', "/.tether_hash": "cafef00d"},
+    )
+    out = run_micropython(combined, timeout=10.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "ack1: {'ok': True}" in out, out
+    assert "hash1: cafef00d" in out, out
+    assert f"protocol_version: {PROTOCOL_VERSION}" in out, out
+    assert "addr: aa:bb:cc:dd:ee:ff" in out, out
+    assert "ack2: {'ok': True}" in out, out
+    assert "hash2: cafef00d" in out, out
+
+
+@requires_micropython
+def test_ble_boot_upload_then_status_reuses_the_same_connection():
+    # Upload a bundle, then - without reconnecting - query status on the
+    # same connection and confirm the reported hash matches what was just
+    # written. Proves the round trip through the real on-device write path,
+    # not merely that an {"ok": True} came back.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+_app = b"print('uploaded over ble')\\n"
+_hash = b"0badcafe"
+
+print("upload_ack:", _c.send_preamble("upload", "s3cr3t"))
+_c.send_json_frame({"dirs": ["/lib"], "files": [
+    {"path": "/tether_app.py", "size": len(_app)},
+    {"path": "/.tether_hash", "size": len(_hash)},
+]})
+_c.send_bytes_frame(_app)
+_c.send_bytes_frame(_hash)
+print("upload_result:", _c.read_json_frame())
+
+print("status_ack:", _c.send_preamble("status", "s3cr3t"))
+print("status_hash:", _c.read_json_frame()["tether_app_hash"])
+print("written_app:", _files["/tether_app.py"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py, driver, files={"/tether_ble.json": '{"secret": "s3cr3t"}'}
+    )
+    out = run_micropython(combined, timeout=10.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "upload_ack: {'ok': True}" in out, out
+    assert "upload_result: {'ok': True}" in out, out
+    assert "status_ack: {'ok': True}" in out, out
+    assert "status_hash: 0badcafe" in out, out
+    assert "written_app: b\"print('uploaded over ble')\\n\"" in out, out
+
+
+@requires_micropython
+def test_ble_boot_rejects_wrong_secret_and_ends_the_session():
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("correct-secret")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+_reply = _c.send_preamble("status", "wrong-secret")
+print("reply:", _reply)
+# No status payload may follow a rejected preamble, and the device must
+# drop the link rather than loop back for another preamble - otherwise a
+# wrong secret would cost nothing to retry over one connection.
+time.sleep_ms(300)
+print("total_notify_chunks:", len(_ble.notifications))
+print("device_dropped_link:", _ble.disconnects)
+print("readvertising:", _ble.advertising)
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": '{"secret": "correct-secret"}'},
+    )
+    out = run_micropython(combined, timeout=10.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "reply: {'ok': False, 'error': 'auth failed'}" in out, out
+    assert "total_notify_chunks: 1" in out, out
+    assert "device_dropped_link: [0]" in out, out
+    assert "readvertising: True" in out, out
+
+
+@requires_micropython
+def test_ble_boot_run_mode_serves_calls_and_keeps_loop_tasks_ticking():
+    # The payoff test for _ble_make_streams' async reader. Run mode is the
+    # one phase where the device has other work scheduled alongside the
+    # connection (@mcu.loop tasks share the event loop the app runs in), so
+    # the reader must *await* between inbound frames rather than busy-poll.
+    # A busy-poll here would still answer calls correctly - it would only
+    # silently starve every @mcu.loop function, which is exactly the kind
+    # of failure no round-trip assertion alone would catch. Hence the
+    # tick-count assertion.
+    from ble_fakes import combine_boot_py_with_driver
+
+    from tether.marshalling import encode_frame
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+
+    sliced_source = """\
+import mcu_decorators as _test_mod
+
+if not hasattr(_test_mod, "_tick_total"):
+    _test_mod._tick_total = 0
+
+
+@mcu.loop(interval_ms=20)
+def tick():
+    _test_mod._tick_total += 1
+
+
+@mcu.export
+def get_tick_total() -> int:
+    return _test_mod._tick_total
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    handshake = encode_frame(1, {"id": 1, "name": "__tether_handshake__", "args": []})
+    # msg_type 1 == MSG_CALL (2 is MSG_RESULT - encoding a call as one
+    # makes the dispatcher treat it as a reply and silently never answer).
+    get_ticks = encode_frame(1, {"id": 2, "name": "get_tick_total", "args": []})
+
+    driver = f"""
+import bluetooth
+import umsgpack
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+print("run_ack:", _c.send_preamble("run", None))
+
+
+def _read_result():
+    _len = int.from_bytes(_c.recv_exact(4), "big")
+    _body = _c.recv_exact(_len)
+    return _body[:1], umsgpack.loads(_body[1:])
+
+
+_c.write({handshake!r})
+_type1, _payload1 = _read_result()
+print("handshake_type:", _type1)
+print("handshake_payload:", _payload1)
+
+# Idle on a live run session. Nothing is inbound, so the device sits in
+# _BleAsyncReader.readexactly the whole time - if that awaited nothing, the
+# @mcu.loop task below would never get scheduled and the count stays 0.
+time.sleep_ms(600)
+
+_c.write({get_ticks!r})
+_type2, _payload2 = _read_result()
+print("ticks_type:", _type2)
+print("ticks_while_idle:", _payload2["value"])
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": "{}", "/tether_app.py": tether_app_source},
+    )
+    out = run_micropython(combined, timeout=15.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "run_ack: {'ok': True}" in out, out
+    assert "handshake_type: b'\\x02'" in out, out  # MSG_RESULT
+    assert f"handshake_payload: {{'id': 1, 'value': {PROTOCOL_VERSION}}}" in out, out
+    assert "ticks_type: b'\\x02'" in out, out
+
+    ticks = int(out.split("ticks_while_idle:")[1].split()[0])
+    # ~30 expected at interval_ms=20 over 600ms; assert generously - the
+    # point is "the loop ran at all while the reader waited", not the rate.
+    assert ticks >= 5, f"@mcu.loop starved during a live BLE run session: {ticks} ticks\n{out}"
+
+
+def test_generate_ble_boot_produces_boot_py_and_config():
+    files = generate_ble_boot()
+
+    assert set(files.keys()) == {"/boot.py", "/tether_ble.json"}
+    assert isinstance(files["/boot.py"], bytes)
+    assert isinstance(files["/tether_ble.json"], bytes)
+    # BLE has no network to join, so unlike wifi's config the only thing
+    # here is the shared secret.
+    assert set(json.loads(files["/tether_ble.json"])) == {"secret"}
+
+
+def test_generate_ble_boot_keeps_the_secret_out_of_boot_py():
+    files = generate_ble_boot("hunter2")
+
+    assert json.loads(files["/tether_ble.json"])["secret"] == "hunter2"
+    # Same rationale as wifi: boot.py is a fixed template, so rotating the
+    # secret is a config-file-only re-upload and the secret never lands in
+    # anything that gets logged or diffed as "the script".
+    assert b"hunter2" not in files["/boot.py"]
+
+
+def test_generate_ble_boot_includes_a_secret_by_default():
+    config = json.loads(generate_ble_boot()["/tether_ble.json"])
+
+    assert isinstance(config["secret"], str)
+    assert len(config["secret"]) >= 16
+
+
+def test_generate_ble_boot_omits_secret_when_unauthenticated():
+    config = json.loads(generate_ble_boot(danger_unauthenticated=True)["/tether_ble.json"])
+
+    assert config == {}
+
+
+def test_generate_ble_boot_two_calls_produce_different_secrets():
+    first = json.loads(generate_ble_boot()["/tether_ble.json"])["secret"]
+    second = json.loads(generate_ble_boot()["/tether_ble.json"])["secret"]
+
+    assert first != second
+
+
+def test_generate_ble_boot_falls_through_when_never_provisioned():
+    boot_py = generate_ble_boot()["/boot.py"].decode()
+
+    assert "tether_ble.json" in boot_py
+    # Config absent -> the whole peripheral block is skipped and the board
+    # behaves exactly as it did before it was ever provisioned.
+    assert "except OSError" in boot_py
+
+
+def test_ble_boot_uuids_match_the_pc_side_transport():
+    # The template hardcodes these (it runs on the MCU, where
+    # tether.transports.ble does not exist), so nothing but this test stops
+    # the two halves from silently drifting apart - a mismatch looks
+    # identical to "wrong device" from the client's side.
+    from tether.transports.ble import NOTIFY_CHAR_UUID, SERVICE_UUID, WRITE_CHAR_UUID
+
+    boot_py = generate_ble_boot()["/boot.py"].decode()
+
+    assert SERVICE_UUID in boot_py
+    assert WRITE_CHAR_UUID in boot_py
+    assert NOTIFY_CHAR_UUID in boot_py
+
+
+def test_ble_advertising_payload_is_a_legal_gap_payload():
+    from tether.provisioning import _BLE_ADV_PAYLOAD
+
+    # GAP caps a legacy advertising payload at 31 bytes; overflowing it
+    # makes the board silently un-discoverable rather than erroring.
+    assert len(_BLE_ADV_PAYLOAD) <= 31
+    assert b"tether" in _BLE_ADV_PAYLOAD
+
+    # Walk the length-prefixed AD structures - the payload must consume
+    # exactly, with no trailing slack that would mean a bad length byte.
+    offset, ad_types = 0, []
+    while offset < len(_BLE_ADV_PAYLOAD):
+        length = _BLE_ADV_PAYLOAD[offset]
+        ad_types.append(_BLE_ADV_PAYLOAD[offset + 1])
+        offset += 1 + length
+    assert offset == len(_BLE_ADV_PAYLOAD)
+    assert ad_types == [0x01, 0x09, 0x07]  # flags, complete local name, 128-bit UUIDs

@@ -1,5 +1,5 @@
-"""WiFi provisioning: generates the on-device boot.py + credentials file
-that make a board reachable over tether's wifi transport, and the status
+"""Provisioning: generates the on-device boot.py (+ config file) that makes
+a board reachable over tether's wifi and BLE transports, and the status
 diagnostic script the CLI's `status` command runs.
 
 See docs/superpowers/specs/2026-07-25-wifi-upload-design.md for the full
@@ -261,6 +261,242 @@ if _cfg is not None:
                     pass
 """
 
+# Hardcoded rather than imported from transports/ble.py, matching how
+# _BOOT_PY_TEMPLATE above hardcodes DEFAULT_PORT: this text is executed on
+# the MCU, where `tether.transports.ble` does not exist. The two must stay
+# in sync by hand - see test_ble_boot_uuids_match_the_pc_side_transport.
+_BLE_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+_BLE_WRITE_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+_BLE_NOTIFY_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+_BLE_ADV_NAME = "tether"
+
+
+def _ble_adv_payload(name: str, service_uuid: str) -> bytes:
+    """Build the 31-byte-max GAP advertising payload the board advertises
+    with. Assembled here (PC side, at generation time) rather than on the
+    MCU so the template carries one opaque bytes literal instead of packing
+    logic - nothing about it varies per board.
+
+    Three AD structures, each `len, type, value`: flags (LE General
+    Discoverable, BR/EDR unsupported), the complete local name, and the
+    complete list of 128-bit service UUIDs. The UUID goes out
+    little-endian, per the Bluetooth Core spec's byte ordering for
+    advertised UUIDs.
+    """
+    uuid_le = bytes.fromhex(service_uuid.replace("-", ""))[::-1]
+    name_bytes = name.encode()
+    payload = (
+        b"\x02\x01\x06"
+        + bytes([len(name_bytes) + 1, 0x09])
+        + name_bytes
+        + bytes([len(uuid_le) + 1, 0x07])
+        + uuid_le
+    )
+    if len(payload) > 31:
+        raise ValueError(f"advertising payload is {len(payload)} bytes, max 31")
+    return payload
+
+
+_BLE_ADV_PAYLOAD = _ble_adv_payload(_BLE_ADV_NAME, _BLE_SERVICE_UUID)
+
+
+# BLE's counterpart to _BOOT_PY_TEMPLATE above, deliberately the same shape:
+# a fixed template holding no secret (that lives in /tether_ble.json), which
+# does nothing at all if that config file is missing, so a never-provisioned
+# board falls straight through to the idle REPL.
+#
+# Structural note - why the session loop is synchronous, like wifi's:
+# MicroPython delivers `bluetooth` IRQ events through its scheduler, which
+# runs during `time.sleep_ms()`. A busy-poll waiting for IRQ-delivered bytes
+# is therefore the exact BLE analogue of wifi's blocking `accept()`/`recv()`
+# - it yields to the only thing that needs to run while a status/upload
+# exchange is in flight (the BLE stack itself). Nothing else is scheduled
+# on-device outside of run mode, so there is nothing to starve, and keeping
+# this loop synchronous keeps _handle_run's `asyncio.run()` (inside the
+# exec'd app) and its `new_event_loop()` reset non-nested, exactly as wifi
+# already relies on.
+#
+# Run mode is the one place that genuinely needs async: `@mcu.loop` tasks
+# are scheduled in the same event loop the app runs in, so a busy-poll while
+# waiting for the next inbound frame *would* starve them. That is what
+# _ble_make_streams' async reader below exists for - it awaits rather than
+# blocks, so loop tasks keep progressing between frames.
+#
+# One BLE connection is reused across as many status/upload exchanges as the
+# client wants; `run`, an auth failure, and an unrecognized mode each end the
+# session (disconnect + resume advertising).
+_BLE_BOOT_TEMPLATE = f"""\
+try:
+    import ujson as _json
+except ImportError:
+    import json as _json
+
+try:
+    with open("/tether_ble.json") as _f:
+        _cfg = _json.loads(_f.read())
+except OSError:
+    _cfg = None
+
+if _cfg is not None:
+    import bluetooth as _bluetooth
+    import time
+    import gc as _gc
+
+    # Module-scope (unlike wifi's _wifi_make_streams, which imports it
+    # lazily inside itself): _ble_make_streams' nested reader class body
+    # needs the name resolvable, and a frozen uasyncio import at boot costs
+    # nothing.
+    import uasyncio as _asyncio
+
+    _boot_ms = time.ticks_ms()
+    _MAX_CTRL_FRAME = 65536
+    _ADV_PAYLOAD = {_BLE_ADV_PAYLOAD!r}
+    _ADV_INTERVAL_US = 100000
+
+{textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "    ")}
+    _ble = _bluetooth.BLE()
+    _ble.active(True)
+    _ble_addr_str = ":".join("{{:02x}}".format(_b) for _b in _ble.config("mac")[1])
+
+    # One-element lists as mutable boxes: _bt_irq and the stream adapters
+    # below only ever *close over* these, and a MicroPython closure cannot
+    # rebind a plain enclosing-scope name.
+    _conn_handle = [None]
+    _mtu = [23]  # BLE's pre-negotiation default
+    _queue = []
+    _write_handle = [None]
+    _notify_handle = [None]
+
+    def _bt_irq(_event, _data):
+        # Runs in IRQ/scheduler context: routes bytes and records
+        # connection state, never blocks and never does I/O.
+        if _event == 1:  # _IRQ_CENTRAL_CONNECT
+            _conn_handle[0] = _data[0]
+        elif _event == 2:  # _IRQ_CENTRAL_DISCONNECT
+            _conn_handle[0] = None
+            _mtu[0] = 23
+            # Drop anything the departed central left half-sent, so the
+            # next connection never parses a truncated frame as its
+            # preamble.
+            del _queue[:]
+        elif _event == 3:  # _IRQ_GATTS_WRITE
+            if _data[1] == _write_handle[0]:
+                _queue.append(_ble.gatts_read(_write_handle[0]))
+        elif _event == 21:  # _IRQ_MTU_EXCHANGED
+            _mtu[0] = _data[1]
+
+    _ble.irq(_bt_irq)
+
+    _write_char = (_bluetooth.UUID("{_BLE_WRITE_CHAR_UUID}"), _bluetooth.FLAG_WRITE)
+    _notify_char = (_bluetooth.UUID("{_BLE_NOTIFY_CHAR_UUID}"), _bluetooth.FLAG_NOTIFY)
+    _service = (_bluetooth.UUID("{_BLE_SERVICE_UUID}"), (_write_char, _notify_char))
+    ((_write_handle[0], _notify_handle[0]),) = _ble.gatts_register_services((_service,))
+    # The default GATT characteristic buffer is 20 bytes - anything larger
+    # a central writes would be silently truncated, corrupting every frame
+    # once the MTU is negotiated up. Sized past the largest MTU a central
+    # can negotiate so one ATT write always lands whole.
+    _ble.gatts_set_buffer(_write_handle[0], 512)
+
+    class _BleConn:
+        \"\"\"Adapts an IRQ-fed byte queue + gatts_notify() to the plain
+        recv(n)/send(data) socket contract the shared mode handlers use.
+        \"\"\"
+
+        def __init__(self):
+            self._buffer = b""
+
+        def recv(self, _n):
+            while len(self._buffer) < _n:
+                while not _queue:
+                    if _conn_handle[0] is None:
+                        raise OSError("ble disconnected")
+                    time.sleep_ms(10)
+                self._buffer += _queue.pop(0)
+            _result, self._buffer = self._buffer[:_n], self._buffer[_n:]
+            return _result
+
+        def send(self, _data):
+            _usable = max(_mtu[0] - 3, 1)
+            for _i in range(0, len(_data), _usable):
+                _ble.gatts_notify(
+                    _conn_handle[0], _notify_handle[0], _data[_i : _i + _usable]
+                )
+
+        def take_buffer(self):
+            _result, self._buffer = self._buffer, b""
+            return _result
+
+    def _ble_make_streams(_conn):
+        # Seeded with whatever the synchronous preamble read over-consumed,
+        # so no byte is lost handing this connection over to run mode.
+        _leftover = [_conn.take_buffer()]
+
+        class _BleAsyncReader:
+            async def readexactly(self, _n):
+                while len(_leftover[0]) < _n:
+                    while not _queue:
+                        if _conn_handle[0] is None:
+                            raise EOFError("ble disconnected")
+                        # Awaits rather than blocks: this is what keeps
+                        # @mcu.loop tasks running between inbound frames.
+                        await _asyncio.sleep_ms(5)
+                    _leftover[0] += _queue.pop(0)
+                _result, _leftover[0] = _leftover[0][:_n], _leftover[0][_n:]
+                return _result
+
+        class _BleAsyncWriter:
+            def write(self, _data):
+                _conn.send(_data)
+
+            async def drain(self):
+                await _asyncio.sleep_ms(0)
+
+        return _BleAsyncReader(), _BleAsyncWriter()
+
+    _ble.gap_advertise(_ADV_INTERVAL_US, _ADV_PAYLOAD)
+
+    while True:
+        while _conn_handle[0] is None:
+            time.sleep_ms(20)
+        _conn = _BleConn()
+        try:
+            while True:
+                _preamble = _read_json_frame(_conn)
+                _mode = _preamble.get("mode")
+                _secret = _preamble.get("secret")
+                _expected_secret = _cfg.get("secret")
+                if _expected_secret is not None and _secret != _expected_secret:
+                    _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
+                    break
+                elif _mode == "status":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_status(_conn, lambda: _ble_addr_str)
+                elif _mode == "upload":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_upload(_conn)
+                elif _mode == "run":
+                    _send_json_frame(_conn, {{"ok": True}})
+                    _handle_run(_conn, _ble_make_streams)
+                    break
+                else:
+                    _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
+                    break
+        except Exception:
+            pass
+        # status/upload fall through the if/elif chain and loop naturally to
+        # read the next preamble on this same connection; getting here means
+        # the session is over (run finished, auth failed, unknown mode, or
+        # the central vanished) - drop the link and advertise again.
+        if _conn_handle[0] is not None:
+            try:
+                _ble.gap_disconnect(_conn_handle[0])
+            except OSError:
+                pass
+        _ble.gap_advertise(_ADV_INTERVAL_US, _ADV_PAYLOAD)
+"""
+
+
 # Run via serial.run_python() by the CLI's `status` command. Structured
 # output (one JSON line) rather than freeform prints - robust to parse on
 # the PC side, no fragile string matching.
@@ -343,3 +579,20 @@ def generate_wifi_boot(
         "/tether_wifi.json": json.dumps(config).encode(),
     }
     return files
+
+
+def generate_ble_boot(
+    secret: str | None = None, *, danger_unauthenticated: bool = False
+) -> dict[str, bytes]:
+    """Return `{"/boot.py": ..., "/tether_ble.json": ...}` file contents for
+    `tether provision-ble` to upload. Mirrors `generate_wifi_boot` exactly -
+    see its docstring - minus credentials, since BLE has no network to join:
+    the config file carries only the shared secret.
+    """
+    config: dict[str, str] = {}
+    if not danger_unauthenticated:
+        config["secret"] = secret if secret is not None else secrets.token_hex(16)
+    return {
+        "/boot.py": _BLE_BOOT_TEMPLATE.encode(),
+        "/tether_ble.json": json.dumps(config).encode(),
+    }
