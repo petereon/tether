@@ -78,7 +78,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from mpy_runner import requires_micropython, run_micropython
 
+from tether import mcu
 from tether.connection import PROTOCOL_VERSION, generate_bootstrap
+
+
+# Module-level, deliberately - _capture_caller() (connection.py) collects
+# @mcu.export functions from the CALLING file's already-executed module
+# globals, so this needs to live at this file's top level (not nested
+# inside a test function) for test_real_pc_connect_wifi_against_real_
+# on_device_boot_py below to slice/upload/call it through the real
+# connect() pipeline, exactly like a real user's script would.
+@mcu.export
+def e2e_add(a: int, b: int) -> int:
+    return a + b
 
 
 @requires_micropython
@@ -1559,3 +1571,128 @@ builtins.open = _fake_open
     assert results["upload_result"]["ok"] is False, results["upload_result"]
     assert results["status_ack"] == {"ok": True}
     assert results["status_payload"]["tether_app_hash"] is None, results["status_payload"]
+
+
+@requires_micropython
+def test_real_pc_connect_wifi_against_real_on_device_boot_py():
+    # The single test that would have caught Fix 1 (asyncio task-queue
+    # accumulation across reconnects) and Fix 5 (reconnect deadlock) far
+    # earlier: every other wifi test on the PC side talks to a hand-rolled
+    # fake device, and every other wifi test on the device side talks to a
+    # hand-rolled fake PC client. This drives the REAL, public
+    # tether.connection.connect() against a REAL generated boot.py running
+    # under the real micropython interpreter - full interop between the
+    # actual client and the actual device, not two halves each
+    # individually faked.
+    #
+    # Exercises the real end-to-end flow: slice (this file) -> status
+    # query (nothing on-device yet) -> upload (the full runtime bundle,
+    # real _gather_runtime_bundle reading real files off disk) -> run ->
+    # a real @mcu.export function call (e2e_add, defined at this file's
+    # module level above) returns the correct value over the real wire
+    # protocol. Then, since Fix 5 should make it work now, exercises
+    # board.reconnect() and a second real call - this time the status
+    # query should report a matching hash (no re-upload needed).
+    import threading
+    import time
+
+    from mpy_runner import run_micropython_background
+
+    from tether.connection import connect
+
+    test_port = 18774
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{"/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant"}}'}}
+
+class _FakeReadFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+class _FakeWriteFile:
+    def __init__(self, path):
+        self._path = path
+        self._buf = b""
+    def write(self, data):
+        self._buf += data
+        return len(data)
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        _files[self._path] = self._buf
+        return False
+
+class _FakeUos:
+    def mkdir(self, path):
+        pass
+    def remove(self, path):
+        if path in _files:
+            del _files[path]
+        else:
+            raise OSError(2, "no such file")
+
+_sys.modules["uos"] = _FakeUos()
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if mode == "wb":
+        return _FakeWriteFile(path)
+    if path in _files:
+        content = _files[path]
+        if isinstance(content, bytes):
+            content = content.decode()
+        return _FakeReadFile(content)
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    device_thread = threading.Thread(
+        target=run_micropython_background,
+        args=(script,),
+        kwargs={"run_for": 12.0},
+        daemon=True,
+    )
+    device_thread.start()
+    time.sleep(0.5)  # let the device get through wifi-connect + listen setup
+
+    board = connect(f"wifi:127.0.0.1:{test_port}", timeout=5.0)
+    assert board.e2e_add(3, 4) == 7
+
+    board.reconnect()
+    assert board.e2e_add(10, 20) == 30
+
+    device_thread.join(timeout=15.0)
