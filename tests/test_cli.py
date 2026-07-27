@@ -173,6 +173,150 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
     assert b"prompted-password" in written["/tether_wifi.json"]
 
 
+def test_provision_wifi_prints_the_generated_secret(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(written["/tether_wifi.json"])
+    assert config["secret"] in result.output
+
+
+def test_provision_wifi_danger_unauthenticated_omits_secret_and_warns(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+            "--danger-unauthenticated",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(written["/tether_wifi.json"])
+    assert "secret" not in config
+    assert "unauthenticated" in result.output.lower()
+
+
+def test_status_command_tries_wifi_socket_first(monkeypatch):
+    # When the wifi socket answers, status must use it directly - no
+    # reset_board() call at all (that's the whole point of this feature).
+    calls = []
+
+    class _FakeSocket:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_send_preamble(sock, mode, secret):
+        calls.append(("preamble", mode))
+
+    def fake_read_json_frame(sock):
+        calls.append(("status_payload",))
+        return {
+            "protocol_version": 1,
+            "tether_app_hash": "abc123",
+            "free_heap": 50000,
+            "uptime_ms": 1234,
+            "ip": "192.168.1.50",
+        }
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **kw: _FakeSocket())
+    monkeypatch.setattr("tether.transports.wifi.send_preamble", fake_send_preamble)
+    monkeypatch.setattr("tether.transports.wifi.read_json_frame", fake_read_json_frame)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board",
+        lambda ser: calls.append(("reset_board",)),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "192.168.1.50"])
+
+    assert result.exit_code == 0, result.output
+    assert "192.168.1.50" in result.output
+    assert ("reset_board",) not in calls
+
+
+def test_status_command_falls_back_to_raw_repl_when_wifi_socket_unreachable(monkeypatch):
+    import json
+
+    def raise_connection_refused(*a, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("socket.create_connection", raise_connection_refused)
+
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    status = {"provisioned": True, "connected": False, "ip": None}
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (json.dumps(status).encode(), b""),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "10.0.0.5"])
+
+    assert result.exit_code == 0, result.output
+    assert "not currently connected" in result.output.lower()
+
+
 def test_status_command_reports_connected_with_ip(monkeypatch):
     calls = []
 

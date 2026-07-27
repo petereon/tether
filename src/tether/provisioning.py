@@ -14,6 +14,7 @@ exercised for real.
 from __future__ import annotations
 
 import json
+import secrets
 
 from tether.connection import PROTOCOL_VERSION
 from tether.transports.wifi import DEFAULT_PORT
@@ -246,15 +247,27 @@ print(_json.dumps({"provisioned": _provisioned, "connected": _connected, "ip": _
 """
 
 
-def generate_wifi_boot(ssid: str, password: str) -> dict[str, bytes]:
+def generate_wifi_boot(
+    ssid: str, password: str, *, secret: str | None = None, danger_unauthenticated: bool = False
+) -> dict[str, bytes]:
     """Return `{"/boot.py": ..., "/tether_wifi.json": ...}` file contents
     for `tether provision-wifi` to upload. `boot.py` is a fixed template
     (see `_BOOT_PY_TEMPLATE`'s own docstring) - only the config file
-    contains credentials, so re-provisioning with new ones is a
-    config-file-only re-upload.
+    contains credentials and the shared secret, so re-provisioning with
+    new ones is a config-file-only re-upload.
+
+    `secret`: explicit secret to use (mainly for tests - real callers
+    should let this generate one). `danger_unauthenticated`: when True,
+    no secret is stored at all, regardless of `secret` - the on-device
+    listener accepts any connection with no auth check. Every call
+    generates a fresh random secret by default (unless overridden or
+    unauthenticated), so re-provisioning naturally rotates it.
     """
-    config = json.dumps({"ssid": ssid, "password": password}).encode()
-    return {
+    config: dict[str, str] = {"ssid": ssid, "password": password}
+    if not danger_unauthenticated:
+        config["secret"] = secret if secret is not None else secrets.token_hex(16)
+    files = {
         "/boot.py": _BOOT_PY_TEMPLATE.encode(),
-        "/tether_wifi.json": config,
+        "/tether_wifi.json": json.dumps(config).encode(),
     }
+    return files

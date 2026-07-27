@@ -88,14 +88,23 @@ def devices_command() -> None:
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option("--ssid", required=True, help="WiFi network name.")
 @click.option("--password", default=None, help="WiFi password (prompted if omitted).")
-def provision_wifi_command(port: str | None, ssid: str, password: str | None) -> None:
+@click.option(
+    "--danger-unauthenticated",
+    is_flag=True,
+    default=False,
+    help="Skip generating a shared secret - the wifi listener accepts any connection.",
+)
+def provision_wifi_command(
+    port: str | None, ssid: str, password: str | None, danger_unauthenticated: bool
+) -> None:
     """Upload a boot.py that auto-connects to WiFi and makes the board
     reachable over tether's wifi transport on every boot.
 
     Note: this uploads boot.py + wifi credentials only - the program that
     actually runs when a wifi client connects (tether_app.py) is uploaded
-    separately by a normal serial `mcu.connect(...)` session. Run that at
-    least once, over serial, before connecting to this board over wifi.
+    separately, over wifi itself, the first time `mcu.connect("wifi:<ip>")`
+    is called (or over a normal serial `mcu.connect(...)` session, which
+    still works too).
     """
     import beaupy
 
@@ -106,7 +115,15 @@ def provision_wifi_command(port: str | None, ssid: str, password: str | None) ->
     if password is None:
         password = beaupy.prompt("WiFi password:", secure=True)
 
-    files = provisioning.generate_wifi_boot(ssid, password)
+    if danger_unauthenticated:
+        click.echo(
+            "WARNING: --danger-unauthenticated - this board's wifi listener will "
+            "accept connections from anyone on the network, no secret required."
+        )
+
+    files = provisioning.generate_wifi_boot(
+        ssid, password, danger_unauthenticated=danger_unauthenticated
+    )
 
     with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
@@ -114,17 +131,53 @@ def provision_wifi_command(port: str | None, ssid: str, password: str | None) ->
         serial_transport.reset_board(ser)
 
     click.echo(f"Provisioned {resolved_port} for wifi network {ssid!r}. Board is restarting.")
+    if not danger_unauthenticated:
+        import json
+
+        config = json.loads(files["/tether_wifi.json"])
+        click.echo(f"Shared secret (save this - needed to connect): {config['secret']}")
     click.echo("Run `tether status` in a few seconds to check connectivity.")
 
 
 @main.command("status")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
-def status_command(port: str | None) -> None:
-    """Check whether a board is wifi-provisioned and currently connected."""
+@click.option(
+    "--ip",
+    default=None,
+    help="Device IP (if known) - tried first, over wifi, before falling back to serial.",
+)
+@click.option("--secret", default=None, help="Shared secret, if the device requires one.")
+def status_command(port: str | None, ip: str | None, secret: str | None) -> None:
+    """Check whether a board is wifi-provisioned and currently connected.
+
+    Tries a direct, non-destructive wifi query first if --ip is given (no
+    reset, no interruption). Falls back to the existing raw-REPL
+    diagnostic (which does reset the board) only if the wifi socket
+    itself is unreachable - meaning wifi never came up in the first
+    place, not that the board is merely busy.
+    """
     import json
+    import os
+    import socket
 
     from tether import provisioning
     from tether.transports import serial as serial_transport
+    from tether.transports import wifi as wifi_transport
+
+    if ip:
+        resolved_secret = secret if secret is not None else os.environ.get("TETHER_WIFI_SECRET")
+        try:
+            sock = socket.create_connection((ip, wifi_transport.DEFAULT_PORT), timeout=3.0)
+        except OSError:
+            sock = None
+        if sock is not None:
+            try:
+                wifi_transport.send_preamble(sock, "status", resolved_secret)
+                payload = wifi_transport.read_json_frame(sock)
+            finally:
+                sock.close()
+            click.echo(f"Provisioned and connected. IP: {payload['ip']}")
+            return
 
     resolved_port = _resolve_port(port)
     with _open_board(resolved_port) as ser:
@@ -139,14 +192,14 @@ def status_command(port: str | None) -> None:
 
     try:
         info = json.loads(stdout.decode(errors="replace").strip())
-        provisioned, connected, ip = info["provisioned"], info["connected"], info["ip"]
+        provisioned, connected, ip_from_serial = info["provisioned"], info["connected"], info["ip"]
     except (json.JSONDecodeError, KeyError) as exc:
         raise click.ClickException(f"could not parse status response: {exc}") from None
 
     if not provisioned:
         click.echo("Not provisioned for wifi. Run `tether provision-wifi` first.")
     elif connected:
-        click.echo(f"Provisioned and connected. IP: {ip}")
+        click.echo(f"Provisioned and connected. IP: {ip_from_serial}")
     else:
         click.echo("Provisioned but not currently connected to wifi.")
 

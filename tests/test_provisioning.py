@@ -15,7 +15,13 @@ def test_generate_wifi_boot_embeds_credentials_only_in_the_config_file():
     files = generate_wifi_boot("MyNetwork", "hunter2")
 
     config = json.loads(files["/tether_wifi.json"])
-    assert config == {"ssid": "MyNetwork", "password": "hunter2"}
+    # Exact-membership rather than exact-equality: a shared secret is
+    # generated into this same config by default (see
+    # test_generate_wifi_boot_includes_a_secret_by_default) - this test's
+    # job is only to confirm the credentials themselves are right and
+    # nowhere else, not to enumerate every key the config may carry.
+    assert config["ssid"] == "MyNetwork"
+    assert config["password"] == "hunter2"
     # boot.py itself is a fixed template, never contains credentials -
     # keeps re-provisioning (new SSID) a config-file-only change, and
     # keeps credentials out of anything that might get logged/diffed as
@@ -39,6 +45,31 @@ def test_status_script_is_valid_python_source():
     import ast
 
     ast.parse(STATUS_SCRIPT.decode())
+
+
+def test_generate_wifi_boot_includes_a_secret_by_default():
+    files = generate_wifi_boot("MyNetwork", "hunter2")
+
+    config = json.loads(files["/tether_wifi.json"])
+    assert "secret" in config
+    assert isinstance(config["secret"], str)
+    assert len(config["secret"]) >= 16  # not a trivially guessable short token
+
+
+def test_generate_wifi_boot_omits_secret_when_explicitly_none():
+    files = generate_wifi_boot("MyNetwork", "hunter2", secret=None, danger_unauthenticated=True)
+
+    config = json.loads(files["/tether_wifi.json"])
+    assert "secret" not in config
+
+
+def test_generate_wifi_boot_two_calls_produce_different_secrets():
+    files_a = generate_wifi_boot("MyNetwork", "hunter2")
+    files_b = generate_wifi_boot("MyNetwork", "hunter2")
+
+    config_a = json.loads(files_a["/tether_wifi.json"])
+    config_b = json.loads(files_b["/tether_wifi.json"])
+    assert config_a["secret"] != config_b["secret"]
 
 
 import sys
