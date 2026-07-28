@@ -1876,6 +1876,26 @@ timeout already handles this correctly.
   `reset_board()` already catch a regression here once updated for the
   new sequence).
 
+**Addendum (2026-07-28) — PyPI package renamed to `tether-mcu`.**
+
+`tether` was already taken on PyPI. Renamed the *distribution* name only
+(`pyproject.toml`'s `[project] name`) to `tether-mcu` - the importable
+package stays `tether/` (`import tether`, `from tether import mcu, pc`
+unchanged), and the installed console script stays `tether`
+(`[project.scripts]` untouched), matching the common pattern of a
+PyPI-distribution name differing from its import name (e.g.
+`beautifulsoup4` distributes `bs4`). Verified by building the wheel
+(`uv build`) and confirming its contents are still the unmodified
+`tether/` package tree - only the outer distribution metadata name
+differs. `uv.lock` regenerated to match (`uv lock`). No other file
+references the distribution name (checked - the README's own install
+instructions all use local editable installs, `uv pip install -e
+".[serial]"`, unaffected either way; `publish.yml` reads the name from
+`pyproject.toml`, nothing hardcoded).
+
+  2 changed files (`pyproject.toml`, `uv.lock`), no test/behavior changes
+  - 295 tests passing, unchanged.
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

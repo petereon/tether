@@ -1,5 +1,5 @@
 [project]
-name = "tether"
+name = "tether-mcu"
 version = "0.1.0"
 description = "Call MicroPython functions from Python and back, over serial, wifi, or BLE, from a single file."
 readme = "README.md"
