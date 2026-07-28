@@ -163,6 +163,46 @@ def provision_wifi_command(
     click.echo("Run `tether status` in a few seconds to check connectivity.")
 
 
+def _find_mac_local_ble_address(timeout: float = 8.0) -> str | None:
+    """Best-effort: scan for the just-provisioned board by its advertised
+    name and return whatever address THIS machine's Bluetooth stack
+    actually needs to connect to it - on macOS, CoreBluetooth hides real
+    BLE MAC addresses from apps for privacy and hands out a randomized
+    per-app UUID instead (see DESIGN.md's BLE row), so the MAC this
+    command already read straight from the board over serial is unusable
+    for `mcu.connect("ble:<addr>")` there. Making the user run their own
+    throwaway scan script to translate one into the other is a real DX
+    gap - found by watching a real first run hit exactly this. Requires
+    the optional `ble` extra; returns None (never raises) if `bleak`
+    isn't installed, the scan times out, or the board isn't found within
+    it - `--ble-addr <address>` and `provision ble`'s existing MAC-based
+    output/macOS note are both still correct fallbacks either way, this
+    is a bonus autodetection on top of them, not a replacement.
+    """
+    try:
+        import asyncio
+
+        import bleak
+
+        from tether.provisioning import _BLE_ADV_NAME
+    except ImportError:
+        return None
+
+    async def _scan() -> str | None:
+        devices = await bleak.BleakScanner.discover(timeout=timeout)
+        for device in devices:
+            if device.name == _BLE_ADV_NAME:
+                return device.address
+        return None
+
+    try:
+        return asyncio.run(_scan())
+    except Exception:  # noqa: BLE001 - any scan failure (permissions, adapter
+        # off, timeout) means "couldn't autodetect," not a bug to surface -
+        # the caller already has a correct fallback.
+        return None
+
+
 @provision_group.command("ble")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option(
@@ -215,13 +255,27 @@ def provision_ble_command(port: str | None, danger_unauthenticated: bool) -> Non
         )
         serial_transport.reset_board(ser)
 
+    mac = addr_stdout.decode().strip()
     click.echo(f"Provisioned {resolved_port} for BLE. Board is restarting.")
-    click.echo(f"BLE address: {addr_stdout.decode().strip()}")
+    click.echo(f"BLE address: {mac}")
     if not danger_unauthenticated:
         import json
 
         config = json.loads(files["/tether_ble.json"])
         click.echo(f"Shared secret (save this - needed to connect): {config['secret']}")
+
+    # Best-effort autodetection of the address THIS machine actually needs
+    # (see _find_mac_local_ble_address's own docstring for why the MAC
+    # above isn't always it) - silently skipped, never adding noise, if
+    # bleak isn't installed or the scan just doesn't find anything; the
+    # MAC above and the macOS note remain correct either way.
+    local_addr = _find_mac_local_ble_address()
+    if local_addr is not None and local_addr.lower() != mac.lower():
+        click.echo(
+            f"On this machine, connect with this address instead: {local_addr} "
+            "(not the MAC above - see the macOS note in DESIGN.md's Transports table)"
+        )
+
     click.echo("Run `tether status --ble-addr <address>` in a few seconds to check connectivity.")
 
 

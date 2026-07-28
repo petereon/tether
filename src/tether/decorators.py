@@ -41,14 +41,61 @@ class ExportSpec:
 class _McuNamespace:
     """`@mcu.export` / `@mcu.loop` decorators. See DESIGN.md § Call semantics."""
 
+    if typing.TYPE_CHECKING:
+        # `mcu.connect` is assigned as a plain instance attribute in
+        # __init__.py, not defined here - connection.py (which defines
+        # connect()) imports FROM this module, so this module can't import
+        # connection.py back without a circular import. That assignment is
+        # invisible to static analysis (it's not a class-level method), so
+        # every `mcu.connect(...)` call site was flagged as "no attribute
+        # connect" by any type checker. This TYPE_CHECKING-only
+        # declaration has no runtime effect (never executes - the real
+        # value still comes from __init__.py's assignment) but tells
+        # static analysis the attribute exists.
+        #
+        # A bare `Callable[..., Any]` annotation, not `connect =
+        # <actual function>`: assigning the real function's value here
+        # makes static analysis treat it as a class-level method
+        # (self-binding the first positional argument) - wrong, since
+        # __init__.py's own comment explains this is set directly on the
+        # *instance*, which Python never binds `self` for. A plain
+        # annotation with no value avoids that descriptor treatment
+        # entirely.
+        connect: Callable[..., Any]
+
+    # Two genuinely different return shapes depending on whether `func` is
+    # given, which a single signature can't express correctly: bare
+    # `@mcu.export` calls this with `func` already bound to the function
+    # being decorated, and returns the decorated result directly
+    # (Callable[..., Any] - see decorate()'s own cast()); `@mcu.export(...)`
+    # (with kwargs) calls this with `func=None` and gets back a decorator
+    # to apply next (Callable[[F], Callable[..., Any]]). Without the
+    # @overload split, a bare `@mcu.export`-decorated function's call sites
+    # were seen by static analysis as needing a further decorator-call
+    # step that never actually happens at runtime - producing wrong
+    # inferred types (fn's original signature, not the dispatch wrapper's)
+    # for every bare-form @mcu.export function, which is the common case.
+    @typing.overload
+    def export(
+        self, func: F, *, timeout: float | None = None, heartbeat_interval: float | None = None
+    ) -> Callable[..., Any]: ...
+    @typing.overload
+    def export(
+        self,
+        func: None = None,
+        *,
+        timeout: float | None = None,
+        heartbeat_interval: float | None = None,
+    ) -> Callable[[F], Callable[..., Any]]: ...
+
     def export(
         self,
         func: F | None = None,
         *,
         timeout: float | None = None,
         heartbeat_interval: float | None = None,
-    ) -> Callable[[F], F]:
-        def decorate(fn: F) -> F:
+    ) -> Callable[[F], Callable[..., Any]] | Callable[..., Any]:
+        def decorate(fn: F) -> Callable[..., Any]:
             _validate_signature(fn)  # raises at decoration time; see DESIGN.md Q4
             spec = ExportSpec(
                 func=fn,
@@ -88,7 +135,18 @@ class _McuNamespace:
                 return getattr(board, fn.__name__)(*args, **kwargs)
 
             dispatch.__tether_export__ = spec  # type: ignore[attr-defined]
-            return dispatch  # type: ignore[return-value]
+            # cast(), not just this function's own declared return type:
+            # @functools.wraps(fn) makes static analysis infer `dispatch`
+            # as having fn's EXACT signature (typeshed types
+            # functools.wraps to preserve it), overriding the broader
+            # Callable[..., Any] this function declares - which is
+            # actively wrong here, since `dispatch` genuinely does NOT
+            # preserve fn's signature at runtime (fn's body never runs on
+            # the PC; `dispatch` takes *args/**kwargs and dispatches
+            # through whichever board is ambient). The cast corrects what
+            # static analysis sees at every `@mcu.export`-decorated call
+            # site to match what's actually true at runtime.
+            return typing.cast("Callable[..., Any]", dispatch)
 
         return decorate(func) if func is not None else decorate
 
