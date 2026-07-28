@@ -1876,6 +1876,85 @@ timeout already handles this correctly.
   `reset_board()` already catch a regression here once updated for the
   new sequence).
 
+**Addendum (2026-07-28) — real `ty` typing fixes (not suppression), a
+BLE-example DX fix, and `provision ble` auto-detecting the macOS connect
+address.**
+
+1. **Decorator typing was genuinely dishonest, not just unhelpful to
+   static analysis.** `@mcu.export`'s declared return type
+   (`Callable[[F], F]`) claimed the decorated function keeps its exact
+   original signature; at runtime it returns a completely different
+   `dispatch(*args, **kwargs)` wrapper that dispatches through the
+   ambient board. Running Astral's `ty` against `examples/` surfaced this
+   concretely: 26 diagnostics, several of them real consequences of the
+   lie (`blink(5)` flagged as "not awaitable" and "too many positional
+   arguments" because `ty` believed `blink` was still the original
+   `async def blink(times: int) -> None`). Fixed properly:
+   - `@mcu.export`'s return type split into a real `@typing.overload`
+     pair - bare `@mcu.export` (the common form) genuinely returns
+     `Callable[..., Any]` directly; `@mcu.export(timeout=...)` returns a
+     decorator (`Callable[[F], Callable[..., Any]]`). A single
+     non-overloaded signature can't express "return type depends on
+     whether an argument is None," which is exactly what this decorator
+     does.
+   - The inner `dispatch` function is now returned via
+     `typing.cast("Callable[..., Any]", dispatch)`, not a bare `return
+     dispatch` - `@functools.wraps(fn)` has special-cased typeshed
+     handling that made static analysis infer `dispatch`'s type from
+     `fn` regardless of the enclosing function's own declared return
+     type; the cast is what actually overrides it at the point that
+     matters.
+   - `mcu.connect` was a complete blind spot for static analysis - it's
+     assigned as a plain instance attribute in `__init__.py` (not a
+     class method - avoids a circular import with `connection.py`,
+     which imports FROM `decorators.py`), invisible to any type checker.
+     Added a `TYPE_CHECKING`-only `connect: Callable[..., Any]`
+     declaration on `_McuNamespace` - a bare annotation, not an
+     assignment, since assigning the actual function's value there made
+     static analysis treat it as a bound method (wrongly self-binding
+     the first argument) instead of the plain unbound-function-on-an-
+     instance it actually is.
+
+   Result: `examples/` diagnostics dropped from 26 to 6, verified via
+   `ty check examples/` before/after. The remaining 6 (unresolved
+   `machine`/`time.sleep_ms` imports, and `await`-ing a `@pc.export`
+   function from MCU-side code) are structurally different: they depend
+   on the slicer's compile-time rewrite of the sliced bundle, which no
+   static analysis of the *original* file can ever correctly model -
+   exactly the "future language server" territory CLAUDE.md/DESIGN.md
+   already flag as out of scope, not something a decorator-signature fix
+   can reach.
+
+2. **`examples/ble_blink/` now gives a helpful hint instead of a raw
+   traceback for the single most common first-run mistake on macOS**:
+   passing the MAC `tether provision ble` printed, which CoreBluetooth
+   never exposes to apps. Caught by exception class *name* (not import,
+   since `bleak` may not be importable) around `mcu.connect()`.
+
+3. **`tether provision ble` now auto-detects and prints the address this
+   machine actually needs**, closing the gap the DX fix above works
+   around. A real gap found running `examples/ble_blink/` against real
+   hardware and having to hand-write a throwaway `bleak.BleakScanner`
+   script to translate the MAC into the macOS-local UUID before it would
+   connect - a bad first-run experience for exactly the audience most
+   likely to hit it. `_find_mac_local_ble_address()` does a best-effort,
+   bounded (8s) `bleak` scan for the just-provisioned board by its
+   advertised name after the final reset, and prints the found address
+   only when it differs from the MAC already printed (silent, zero-noise
+   no-op if `bleak` isn't installed, the scan times out, or - on Linux/
+   BlueZ - it finds the same MAC already shown). Never raises; the
+   existing MAC + macOS-note output remains the correct fallback either
+   way.
+
+   Verified against real ESP32 hardware: `tether provision ble` printed
+   `4B05B0A9-D2BF-F915-EEFD-EF8975838091` (this Mac's actual CoreBluetooth
+   UUID for the board) unprompted, alongside the existing MAC - confirmed
+   directly connectable with `examples/ble_blink/` using exactly that
+   printed value, no manual scan needed.
+
+  4 changed files (`decorators.py`, `cli.py`, `ble_blink.py`, plus new
+  tests in `test_cli.py`), 299 tests passing (was 295).
+
 **Addendum (2026-07-28) — PyPI package renamed to `tether-mcu`.**
 
 `tether` was already taken on PyPI. Renamed the *distribution* name only
@@ -1894,7 +1973,7 @@ instructions all use local editable installs, `uv pip install -e
 `pyproject.toml`, nothing hardcoded).
 
   2 changed files (`pyproject.toml`, `uv.lock`), no test/behavior changes
-  - 295 tests passing, unchanged.
+  - 299 tests passing, unchanged.
 
 ---
 
