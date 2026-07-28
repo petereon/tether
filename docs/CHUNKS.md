@@ -1276,18 +1276,18 @@ works.
   New `tether[cli]` extra (`click`, `beaupy`, `pyserial`) and console-script
   entry point (`[project.scripts] tether = "tether.cli:main"`), with four
   commands: `tether devices` (lists connected MicroPython-capable USB
-  serial devices), `tether provision-wifi --ssid ... [--password ...]`
+  serial devices), `tether provision wifi --ssid ... [--password ...]`
   (uploads a `boot.py` + credentials file, prompting for a hidden password
   via `beaupy` if `--password` is omitted), `tether status` (reports
   whether a board is provisioned and currently connected), and `tether
-  unprovision-wifi` (removes stored credentials, gated behind a
+  unprovision wifi` (removes stored credentials, gated behind a
   `beaupy.confirm()` prompt since it's destructive, unlike the others).
   `--port` is optional everywhere - `_resolve_port()` auto-discovers via a
   new `serial.list_devices()` primitive and prompts interactively via
   `beaupy.select()` when more than one device is connected.
 
   On-device: a new `boot.py` template (`src/tether/provisioning.py`'s
-  `generate_wifi_boot()`), uploaded once by `provision-wifi`, auto-runs on
+  `generate_wifi_boot()`), uploaded once by `provision wifi`, auto-runs on
   every MicroPython boot. If `/tether_wifi.json` is absent it does
   nothing - a never-provisioned board behaves exactly as it did before
   this feature existed, no separate opt-in flag needed. If present, it
@@ -1313,7 +1313,7 @@ works.
   run-code-get-output primitive, generalized from `read_file`'s
   enter/exec/follow/exit sequence - used by `status` to run
   `STATUS_SCRIPT` on the board and parse its one-line JSON result), and
-  `remove_file()` (used by `unprovision-wifi`).
+  `remove_file()` (used by `unprovision wifi`).
 
   Real finding from implementation, not anticipated by the design or plan:
   a status-check race condition, discovered only via real ESP32 hardware
@@ -1339,10 +1339,10 @@ works.
   of always waiting out the full deadline.
 
   Real-hardware verification (ESP32, USB serial, network "Culo"):
-  `provision-wifi`, `status`, and `unprovision-wifi` all verified
+  `provision wifi`, `status`, and `unprovision wifi` all verified
   end-to-end against the real board, including `status` correctly
   reporting "Provisioned and connected. IP: 192.168.0.197" after the race
-  fix, and "Not provisioned for wifi." once `unprovision-wifi` removed the
+  fix, and "Not provisioned for wifi." once `unprovision wifi` removed the
   credentials file. The plain serial `connect()` path
   (`examples/blink_and_log/blink_and_log.py`, unmodified) was re-verified
   clean after unprovisioning, confirming this feature left the existing
@@ -1359,7 +1359,7 @@ works.
 
 **Addendum (2026-07-25) — `mcu.connect("wifi:<ip>")` verified against real
 ESP32 firmware.** Chunk 19's own verification covered the CLI
-(`provision-wifi`/`status`/`unprovision-wifi`) and the socket-bridge
+(`provision wifi`/`status`/`unprovision wifi`) and the socket-bridge
 mechanism against the real MicroPython interpreter, but not yet an actual
 wifi RPC session against real hardware - this addendum closes that gap.
 
@@ -1401,7 +1401,7 @@ be new scope beyond a verification pass):
    *association* itself survives (confirmed: `WLAN.isconnected()` stays
    true across the interrupt, since that's firmware-level state
    independent of the interrupted Python script) - only the *listener*
-   doesn't. Practically: `provision-wifi` → `status` → `mcu.connect(...)`
+   doesn't. Practically: `provision wifi` → `status` → `mcu.connect(...)`
    times out on the connect, discovered directly when the first
    verification attempt (which checked `status` first, per the CLI's own
    printed suggestion) timed out; a retry that skipped the `status` check
@@ -1434,7 +1434,7 @@ be new scope beyond a verification pass):
   "wifi:<ip>", secret=...)` drives status → hash-compare →
   upload-if-needed → run automatically, mirroring serial's own shape.
   Auth: a shared secret, generated fresh and printed by every
-  `tether provision-wifi` run, checked via plain equality (an accepted,
+  `tether provision wifi` run, checked via plain equality (an accepted,
   documented LAN-threat-model tradeoff, not an oversight) -
   `--danger-unauthenticated` opts a board out entirely.
 
@@ -1624,10 +1624,10 @@ be new scope beyond a verification pass):
      had real sockets to test against), so no test could ever have caught
      this. Fixed by threading a timeout through `BleStream`/
      `BleControlChannel`/`_connect_ble`/`status_command`.
-  2. **`provision-ble` killed the boot.py it had just installed.** Its
+  2. **`provision ble` killed the boot.py it had just installed.** Its
      MAC-readback step (a raw-REPL round trip) Ctrl-C'd the freshly
      started BLE session loop, and nothing reset the board again
-     afterward (unlike `provision-wifi`, where the final reset is always
+     afterward (unlike `provision wifi`, where the final reset is always
      last) — every subsequent connect attempt hung against a GATT server
      with no Python servicing it, until a physical power cycle. Fixed by
      reordering: read the MAC before the final reset, not after.
@@ -1643,7 +1643,7 @@ be new scope beyond a verification pass):
   `gatts_notify` cannot fail); stale docstrings in `transports/ble.py`
   still asserting "BLE never pushes code" were corrected.
 
-  **Real-hardware verification (2026-07-28):** `tether provision-ble`,
+  **Real-hardware verification (2026-07-28):** `tether provision ble`,
   `tether status --ble-addr`, and a real `mcu.connect("ble:<addr>")`
   session — upload+run with no prior serial upload, script-edit
   propagation, `board.reconnect()` three times in a row with **no
@@ -1658,7 +1658,7 @@ be new scope beyond a verification pass):
   platform/cosmetic, not code defects: macOS's CoreBluetooth hides real
   BLE MAC addresses from apps for privacy, exposing a randomized per-app
   UUID instead — `mcu.connect("ble:<addr>")` on macOS needs that UUID
-  (from a scan), not the MAC `provision-ble` prints (correct and usable
+  (from a scan), not the MAC `provision ble` prints (correct and usable
   as-is on Linux/BlueZ); and the advertised device name was observed once
   showing MicroPython's own default GATT device name ("MPY ESP32")
   instead of this project's advertised local name ("tether") in a scan,
