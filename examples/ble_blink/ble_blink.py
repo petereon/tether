@@ -84,7 +84,28 @@ if __name__ == "__main__":
     # secret=None (the default) reads TETHER_BLE_SECRET - see connection.py's
     # _connect_ble. Pass secret="..." here directly instead if you'd rather
     # not use an env var.
-    board = mcu.connect(f"ble:{address}")
+    try:
+        board = mcu.connect(f"ble:{address}")
+    except Exception as exc:
+        # The single most common first-run mistake on macOS: passing the
+        # MAC address `tether provision ble` printed, which CoreBluetooth
+        # never exposes to apps - see this file's own macOS note above.
+        # Caught by class NAME, not import, since bleak (an optional
+        # extra) may not always be importable here - a bare `except
+        # Exception` catching a real bleak error and re-raising it as
+        # itself either way, just with an extra hint first when it's this
+        # specific, very-likely-to-recur mistake.
+        if type(exc).__name__ == "BleakDeviceNotFoundError" and ":" in address:
+            print(
+                f"Could not find a BLE device at {address!r}. On macOS, "
+                "CoreBluetooth hides real BLE MAC addresses from apps - "
+                "you likely need the randomized per-app UUID a scan "
+                "reports instead (e.g. via `bleak.BleakScanner.discover()`), "
+                "not the MAC `tether provision ble` printed. See this "
+                "file's own macOS note near the top."
+            )
+        raise
+
     print(f"Connected over BLE to {address}. Blinking 5 times...")
     blink(5)  # just a function call - mcu.connect() set the ambient board
     print("Done.")

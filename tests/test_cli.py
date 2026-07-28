@@ -565,6 +565,97 @@ def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
     )
 
 
+def test_provision_ble_prints_the_local_connect_address_when_it_differs_from_the_mac(
+    monkeypatch,
+):
+    # Real DX gap found running examples/ble_blink/ against real hardware:
+    # on macOS, CoreBluetooth hides the real BLE MAC from apps, so the MAC
+    # this command reads over serial and prints isn't what mcu.connect()
+    # actually needs there - the user had to run their own throwaway bleak
+    # scan to find the right address. _find_mac_local_ble_address's own
+    # scan is mocked out entirely here (no real Bluetooth involved) -
+    # this test only verifies the CLI wires its result into the output
+    # correctly when it differs from the MAC already printed.
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+    monkeypatch.setattr(
+        "tether.cli._find_mac_local_ble_address",
+        lambda timeout=8.0: "4B05B0A9-D2BF-F915-EEFD-EF8975838091",
+    )
+
+    result = CliRunner().invoke(main, ["provision", "ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    assert "4B05B0A9-D2BF-F915-EEFD-EF8975838091" in result.output
+    assert "On this machine, connect with this address instead" in result.output
+
+
+def test_provision_ble_prints_no_extra_line_when_autodetect_finds_nothing(monkeypatch):
+    # The common case: bleak isn't installed, the scan times out, or the
+    # board isn't found in time. Must degrade silently - no extra noise,
+    # no error - since the MAC already printed and the existing macOS note
+    # remain the correct fallback either way.
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+    monkeypatch.setattr("tether.cli._find_mac_local_ble_address", lambda timeout=8.0: None)
+
+    result = CliRunner().invoke(main, ["provision", "ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "On this machine, connect with this address instead" not in result.output
+
+
+def test_provision_ble_prints_no_extra_line_when_autodetect_matches_the_mac(monkeypatch):
+    # Linux/BlueZ case: bleak's scan reports the same real MAC already
+    # printed - the extra line would be pure noise (same address twice).
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+    monkeypatch.setattr(
+        "tether.cli._find_mac_local_ble_address", lambda timeout=8.0: "aa:bb:cc:dd:ee:ff"
+    )
+
+    result = CliRunner().invoke(main, ["provision", "ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "On this machine, connect with this address instead" not in result.output
+
+
+def test_find_mac_local_ble_address_returns_none_when_bleak_not_installed(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "bleak":
+            raise ImportError("no module named 'bleak'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    from tether.cli import _find_mac_local_ble_address
+
+    assert _find_mac_local_ble_address(timeout=0.1) is None
+
+
 def test_provision_ble_warns_if_wifi_already_provisioned(monkeypatch):
     _patch_fake_serial(monkeypatch)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
