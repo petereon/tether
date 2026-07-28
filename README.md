@@ -116,6 +116,24 @@ The example hardcodes `Pin(2, Pin.OUT)` — pin 2 is the common onboard LED
 pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
+`examples/wifi_blink/` and `examples/ble_blink/` are the wifi/BLE
+equivalents — same `@mcu.export`/`@pc.export` code, but connecting over
+`"wifi:<ip>"`/`"ble:<addr>"` instead of serial (after `tether provision
+wifi`/`tether provision ble` — see below), and additionally demonstrating
+`board.reconnect()` with no physical reset needed:
+
+```bash
+uv pip install -e ".[cli,serial,ble]"
+tether provision wifi --ssid YOUR_SSID   # or: tether provision ble
+tether status                            # prints the board's IP
+
+export TETHER_WIFI_SECRET=<secret from provision wifi>
+python examples/wifi_blink/wifi_blink.py <board-ip>
+```
+
+Both verified end-to-end against real ESP32 hardware, including the
+reconnect.
+
 ## WiFi & BLE provisioning CLI
 
 Install the `tether[cli]` extra to get the `tether` console script:

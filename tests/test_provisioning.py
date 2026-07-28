@@ -1863,6 +1863,60 @@ print("written_app:", _files["/tether_app.py"])
 
 
 @requires_micropython
+def test_ble_boot_resends_the_nonce_while_waiting_for_the_first_preamble():
+    # Real-hardware regression: BleakClient.start_notify()'s CCCD
+    # subscription write happens strictly AFTER client.connect() returns,
+    # but the device's CENTRAL_CONNECT IRQ (which triggers the very first
+    # nonce send) fires the instant the link forms - a notify() sent before
+    # that subscription completes is silently dropped by the BLE stack,
+    # with no delivery confirmation available to detect it. Confirmed via
+    # direct real ESP32 + bleak reproduction: a single one-shot nonce send
+    # was reliably lost every time, not just occasionally (see
+    # provisioning.py's _NONCE_RESEND_MS for the full writeup).
+    #
+    # This fake can't model "silently dropped, not queued" - gatts_notify()
+    # here always records the send - so this test verifies the RESEND
+    # mechanism directly: a central slow to respond should see multiple
+    # identical nonce notifications queued up over time, not just one,
+    # proving the device kept trying rather than sending once and then
+    # blocking forever waiting for a response that was never going to
+    # arrive.
+    from ble_fakes import combine_boot_py_with_driver
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    driver = """
+import bluetooth
+import time
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+# Longer than one _NONCE_RESEND_MS (300ms) interval, well short of
+# _NONCE_MAX_WAIT_MS (5000ms) - long enough to observe at least one
+# resend, nowhere near the give-up timeout.
+time.sleep_ms(700)
+
+_nonce_notifies = [n for n in _ble.notifications if b'"nonce"' in n[2]]
+print("nonce_notify_count:", len(_nonce_notifies))
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py, driver, files={"/tether_ble.json": '{"secret": "s3cr3t"}'}
+    )
+    out = run_micropython(combined, timeout=10.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    count_line = next(line for line in out.splitlines() if line.startswith("nonce_notify_count:"))
+    count = int(count_line.split(":")[1].strip())
+    assert count >= 2, (
+        f"expected at least 2 resent nonce notifications during a 700ms wait "
+        f"(a single one-shot send is the exact bug this test guards against), got {count}: {out}"
+    )
+
+
+@requires_micropython
 def test_ble_boot_rejects_wrong_secret_and_ends_the_session():
     from ble_fakes import combine_boot_py_with_driver
 
