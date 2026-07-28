@@ -118,7 +118,8 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
     result = CliRunner().invoke(
         main,
         [
-            "provision-wifi",
+            "provision",
+            "wifi",
             "--port",
             "/dev/ttyUSB0",
             "--ssid",
@@ -132,7 +133,7 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
     assert set(written.keys()) == {"/boot.py", "/tether_wifi.json"}
     assert b"MyNetwork" in written["/tether_wifi.json"]
     assert calls == ["reset", "write", "reset"], (
-        "provision-wifi must reset before write (known state) and "
+        "provision wifi must reset before write (known state) and "
         "reset after write (board picks up new config)"
     )
 
@@ -165,7 +166,7 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
     monkeypatch.setattr("beaupy.prompt", fake_prompt)
 
     result = CliRunner().invoke(
-        main, ["provision-wifi", "--port", "/dev/ttyUSB0", "--ssid", "MyNetwork"]
+        main, ["provision", "wifi", "--port", "/dev/ttyUSB0", "--ssid", "MyNetwork"]
     )
 
     assert result.exit_code == 0, result.output
@@ -197,7 +198,8 @@ def test_provision_wifi_prints_the_generated_secret(monkeypatch):
     result = CliRunner().invoke(
         main,
         [
-            "provision-wifi",
+            "provision",
+            "wifi",
             "--port",
             "/dev/ttyUSB0",
             "--ssid",
@@ -234,7 +236,8 @@ def test_provision_wifi_danger_unauthenticated_omits_secret_and_warns(monkeypatc
     result = CliRunner().invoke(
         main,
         [
-            "provision-wifi",
+            "provision",
+            "wifi",
             "--port",
             "/dev/ttyUSB0",
             "--ssid",
@@ -408,12 +411,12 @@ def test_unprovision_wifi_removes_config_after_confirmation(monkeypatch):
 
     monkeypatch.setattr("tether.transports.serial.remove_file", fake_remove_file)
 
-    result = CliRunner().invoke(main, ["unprovision-wifi", "--port", "/dev/ttyUSB0"])
+    result = CliRunner().invoke(main, ["unprovision", "wifi", "--port", "/dev/ttyUSB0"])
 
     assert result.exit_code == 0, result.output
     assert removed["path"] == "/tether_wifi.json"
     assert calls == ["reset", "remove"], (
-        "unprovision-wifi must reset the board (known state) before removing the wifi config"
+        "unprovision wifi must reset the board (known state) before removing the wifi config"
     )
 
 
@@ -426,7 +429,7 @@ def test_unprovision_wifi_does_nothing_without_confirmation(monkeypatch):
         lambda ser, path, **kw: removed.setdefault("called", True),
     )
 
-    result = CliRunner().invoke(main, ["unprovision-wifi", "--port", "/dev/ttyUSB0"])
+    result = CliRunner().invoke(main, ["unprovision", "wifi", "--port", "/dev/ttyUSB0"])
 
     assert result.exit_code == 0, result.output
     assert "called" not in removed
@@ -487,7 +490,7 @@ def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
 
     monkeypatch.setattr("tether.transports.serial.run_python", fake_run_python)
 
-    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+    result = CliRunner().invoke(main, ["provision", "ble", "--port", "/dev/ttyUSB0"])
 
     assert result.exit_code == 0, result.output
     assert set(written.keys()) == {"/boot.py", "/tether_ble.json"}
@@ -496,12 +499,12 @@ def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
     # Final-review finding (F2). run_python enters the raw REPL via a Ctrl-C
     # interrupt, which kills whatever boot.py is running - so the MAC read
     # must happen BEFORE the final reset, leaving reset_board the last
-    # serial operation exactly as provision-wifi does. Reversed (the
+    # serial operation exactly as provision wifi does. Reversed (the
     # original order) the board is left advertising with nothing servicing
     # its BLE session loop, and every later connect attempt hangs until a
     # physical power cycle.
     assert calls == ["reset", "write", "run_python", "reset"], (
-        "provision-ble must reset before write (known state) and reset LAST, "
+        "provision ble must reset before write (known state) and reset LAST, "
         "after every raw-REPL operation, so the new boot.py is left running"
     )
 
@@ -520,7 +523,7 @@ def test_provision_ble_warns_if_wifi_already_provisioned(monkeypatch):
 
     monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
 
-    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+    result = CliRunner().invoke(main, ["provision", "ble", "--port", "/dev/ttyUSB0"])
 
     assert result.exit_code == 0, result.output
     assert "overwrite" in result.output.lower()
@@ -540,7 +543,8 @@ def test_provision_wifi_warns_if_ble_already_provisioned(monkeypatch):
     result = CliRunner().invoke(
         main,
         [
-            "provision-wifi",
+            "provision",
+            "wifi",
             "--port",
             "/dev/ttyUSB0",
             "--ssid",
@@ -566,7 +570,7 @@ def test_provision_ble_danger_unauthenticated_prints_no_secret(monkeypatch):
     )
 
     result = CliRunner().invoke(
-        main, ["provision-ble", "--port", "/dev/ttyUSB0", "--danger-unauthenticated"]
+        main, ["provision", "ble", "--port", "/dev/ttyUSB0", "--danger-unauthenticated"]
     )
 
     assert result.exit_code == 0, result.output
