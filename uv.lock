@@ -436,7 +436,7 @@ wheels = [
 ]
 
 [[package]]
-name = "tether"
+name = "tether-mcu"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
