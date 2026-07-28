@@ -418,6 +418,25 @@ if _cfg is not None:
     # transmit - the client would then see a bare connection-closed OSError
     # instead of the intended WifiAuthError.
     _NACK_FLUSH_MS = 100
+    # How often to resend the one-per-connection nonce while waiting for
+    # the client's first preamble, and how long to keep resending before
+    # giving up on a connection that never responds at all. Needed because
+    # the CENTRAL_CONNECT IRQ (which triggers the first nonce send) fires
+    # as soon as the BLE link forms - before the central has necessarily
+    # finished subscribing to notifications (BleakClient.start_notify()'s
+    # CCCD write happens strictly after client.connect() returns on the PC
+    # side). A notify() sent before that subscription completes is silently
+    # dropped by the BLE stack - gatts_notify() has no delivery
+    # confirmation, so the device can't detect this any other way.
+    # Confirmed via direct real-hardware reproduction (bare bleak
+    # subscribe-then-wait): a single one-shot nonce send is reliably lost
+    # to this race, not just occasionally. Resending is safe against
+    # duplicate delivery: once the central *is* subscribed, a not-yet-
+    # subscribed central's earlier notify() was truly dropped, not queued,
+    # so only the resend sent after subscription completes ever reaches
+    # `_queue`.
+    _NONCE_RESEND_MS = 300
+    _NONCE_MAX_WAIT_MS = 5000
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "    ")}
     _ble = _bluetooth.BLE()
@@ -651,8 +670,24 @@ if _cfg is not None:
             # docstring on the one-connection-reused model).
             _expected_secret = _cfg.get("secret")
             _nonce = _uos.urandom(16)
-            _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
             _authenticated = _expected_secret is None
+            _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
+            # Resend on a timer until the central's first preamble actually
+            # lands in _queue - see _NONCE_RESEND_MS's own comment above for
+            # why a single send isn't reliable. Bounded by _NONCE_MAX_WAIT_MS
+            # so a central that connects but never subscribes at all doesn't
+            # wedge this session forever.
+            _nonce_deadline = time.ticks_add(time.ticks_ms(), _NONCE_RESEND_MS)
+            _nonce_giveup = time.ticks_add(time.ticks_ms(), _NONCE_MAX_WAIT_MS)
+            while not _queue:
+                if _conn_handle[0] is None:
+                    raise OSError("ble disconnected")
+                if time.ticks_diff(_nonce_giveup, time.ticks_ms()) <= 0:
+                    raise OSError("central never subscribed to notifications")
+                if time.ticks_diff(_nonce_deadline, time.ticks_ms()) <= 0:
+                    _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
+                    _nonce_deadline = time.ticks_add(time.ticks_ms(), _NONCE_RESEND_MS)
+                time.sleep_ms(10)
             while True:
                 _preamble = _read_json_frame(_conn)
                 _mode = _preamble.get("mode")

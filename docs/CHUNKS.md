@@ -1779,6 +1779,103 @@ surfaced four worth acting on immediately rather than leaving parked:
    needed to start sending a nonce before reading a preamble, matching the
    new protocol), 284 tests passing (was 283).
 
+**Addendum (2026-07-28) — wifi/BLE runnable examples, and a real BLE bug
+they surfaced.**
+
+Added `examples/wifi_blink/` and `examples/ble_blink/`, wifi/BLE
+equivalents of `examples/blink_and_log/` - same `@mcu.export`/`@pc.export`
+code, only `mcu.connect()`'s address/credential source differs. Both use
+env vars (`TETHER_WIFI_SECRET`/`TETHER_BLE_SECRET`) for the secret, matching
+the CLI's own convention, and demonstrate `board.reconnect()` with no
+physical reset - the headline reason to provision wifi/BLE over plain
+serial in the first place. `tests/test_examples.py` was refactored to
+parametrize its existing checks (parses, slices to just the shared
+mcu-bound code, generates valid bootstrap, runs correctly under the real
+`micropython` interpreter with a faked `Pin`) across all three examples,
+plus one new check confirming each example's driver block actually
+connects with the right transport scheme and demonstrates reconnect.
+
+Running `examples/ble_blink/` against real ESP32 hardware surfaced a real,
+100%-reproducible bug in the HMAC nonce-challenge (addendum item 5 above),
+previously merged and shipped: the device sends its one-per-connection
+nonce the instant `_IRQ_CENTRAL_CONNECT` fires, but `BleakClient.
+start_notify()`'s CCCD subscription write happens strictly *after*
+`client.connect()` returns on the PC side - a notify sent before that
+subscription completes is silently dropped by the BLE stack, with no
+delivery-confirmation mechanism available to the peripheral to detect it.
+Confirmed via an isolated bare-bleak reproduction (connect, subscribe to
+notifications, wait 5s): zero notifications received, every time, not an
+occasional flake - `nc`/`ping`-level reachability checks were actively
+misleading during diagnosis, since TCP's listen backlog and ICMP echo both
+work independently of whether the actual application (a dead/interrupted
+`boot.py`, in wifi's case, or a peripheral mid-race, in BLE's) is
+listening. Fixed by resending the nonce on a timer (`_NONCE_RESEND_MS` =
+300ms) until the central's first preamble actually lands, bounded by
+`_NONCE_MAX_WAIT_MS` (5s) so a central that connects but never subscribes
+doesn't wedge the session forever - safe against duplicate delivery, since
+a not-yet-subscribed central's earlier notify was truly dropped rather
+than queued for later delivery. New regression test
+(`test_ble_boot_resends_the_nonce_while_waiting_for_the_first_preamble`)
+verifies the resend mechanism directly, since the fake BLE peripheral
+can't model "silently dropped" (its `gatts_notify()` always records the
+send) - checks that a central slow to respond sees multiple identical
+nonce notifications, not just one. Mutation-verified: reverting to a
+single one-shot send drops the notification count from ≥2 back to 1,
+correctly failing the test.
+
+Also root-caused, in passing, a separate source of "wifi seems flaky"
+confusion hit while debugging the above: any raw-REPL-based diagnostic
+(`tether status` without `--ip`, or hand-rolled Ctrl-C-based scripts) that
+interrupts a board running its wifi/BLE accept-loop kills that loop
+outright - it does not auto-resume, and nothing before this addendum
+documented that plainly. `nc -zv`/`ping` continuing to "succeed"
+afterward is the trap: they only prove OS/TCP/ICMP-level reachability,
+not that the on-device Python program is still alive to service the
+tether protocol. Not itself a code change (this is inherent to
+MicroPython's single-process model, matching DESIGN.md's existing
+"sequential-only" limitation) - recorded here since it cost real
+debugging time and will again for the next person who hits it. `tether
+status --ip <ip>`/`--ble-addr <addr>` (talks to the listener directly,
+never touches serial) is the way to check status without this risk.
+
+  3 changed files (`provisioning.py`, `tests/test_examples.py`,
+  `tests/test_provisioning.py`) plus 2 new example files, 295 tests
+  passing (was 284).
+
+**Addendum (2026-07-28) — actually fixed `tether status`'s
+listener-killing side effect, not just documented it.**
+
+The previous addendum's "wifi seems flaky" finding was left as a
+documented trap, not a fix. Fixed properly: `status_command`'s raw-REPL
+fallback (used whenever `--ip`/`--ble-addr` aren't given, or fail) now
+resets the board a SECOND time after running `STATUS_SCRIPT`, restoring
+whatever was running before the diagnostic interrupted it - most
+importantly, a wifi/BLE `boot.py`'s accept-loop, which does not resume on
+its own once Ctrl-C'd. Wrapped in `try`/`finally` so this happens even if
+the diagnostic itself raises. `tether unprovision`'s cancel path (`beaupy.
+confirm` returns `False`) had the identical bug for a different reason -
+its own leading `reset_board()` (needed to read `/tether_wifi.json`/
+`/tether_ble.json` to decide what to prompt about) already interrupted a
+live listener before the user even answered "no" - fixed the same way:
+reset again before reporting "Cancelled." so declining to unprovision is
+a genuine no-op.
+
+Verified against real ESP32 hardware: a wifi listener now survives a bare
+`tether status` call, and several in a row, with no manual recovery
+needed - confirmed by running `examples/wifi_blink/` immediately
+afterward each time. One real, expected (not a bug) side effect found
+during that verification: a connection attempted *immediately* after
+`tether status` returns can hit a brief window (observed: several
+seconds) where the board is still rejoining wifi from the reset, same as
+right after any boot - documented in `status_command`'s own docstring
+rather than papered over with a fixed sleep, since `mcu.connect()`'s own
+timeout already handles this correctly.
+
+  1 changed file (`cli.py`) plus 2 updated tests, 295 tests passing (no
+  new tests needed - the existing exact-call-sequence assertions on
+  `reset_board()` already catch a regression here once updated for the
+  new sequence).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

@@ -250,10 +250,34 @@ def status_command(
 
     Tries a direct, non-destructive query first if --ble-addr or --ip is
     given (no reset, no interruption) - BLE is tried first if both are
-    given. Falls back to the existing raw-REPL diagnostic (which does
-    reset the board) only if neither socket/BLE connection is reachable -
-    meaning the transport never came up in the first place, not that the
-    board is merely busy.
+    given. Falls back to the raw-REPL diagnostic only if neither socket/BLE
+    connection is reachable - meaning the transport never came up in the
+    first place, not that the board is merely busy.
+
+    The raw-REPL fallback resets the board TWICE, not once: entering raw
+    REPL to run STATUS_SCRIPT necessarily interrupts whatever was already
+    running - including, on a wifi/BLE-provisioned board, boot.py's own
+    accept-loop, which does not resume on its own once interrupted (a
+    plain Ctrl-C stops the program; nothing about entering/leaving raw
+    REPL re-runs boot.py). Without the second reset, a bare `tether
+    status` would silently and permanently kill a working wifi/BLE
+    listener - a real, previously-unfixed trap: `nc`/`ping` keep
+    "succeeding" against the board afterward regardless (TCP's listen
+    backlog and ICMP echo don't require the interrupted application to
+    still be running), which is exactly what made this hard to diagnose.
+    The second reset restores the board to the same live-and-listening
+    state this command found it in, so `tether status` is genuinely
+    non-destructive from the caller's point of view even on this slower
+    path - it just costs an extra reset/reconnect cycle to get there.
+    Verified against real ESP32 hardware: a wifi listener survives a bare
+    `tether status` call (and several in a row) with no manual recovery
+    needed, whereas before this fix the same sequence permanently killed
+    it. That reconnect cycle isn't instant, though - a wifi/BLE connection
+    attempted immediately after this command returns can hit a brief
+    window (observed: several seconds) where the board is still rejoining
+    the network, same as right after any boot; mcu.connect()'s own
+    timeout/retry is the right way to ride that out, not a fixed sleep
+    here.
     """
     import json
     import os
@@ -346,10 +370,21 @@ def status_command(
     resolved_port = _resolve_port(port)
     with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
-        # timeout=10.0 must stay comfortably above STATUS_SCRIPT's own
-        # internal 8s wifi-connect poll (provisioning.py) - it also has
-        # to cover the raw-REPL round trip on top of that wait.
-        stdout, stderr = serial_transport.run_python(ser, provisioning.STATUS_SCRIPT, timeout=10.0)
+        try:
+            # timeout=10.0 must stay comfortably above STATUS_SCRIPT's own
+            # internal 8s wifi-connect poll (provisioning.py) - it also
+            # has to cover the raw-REPL round trip on top of that wait.
+            stdout, stderr = serial_transport.run_python(
+                ser, provisioning.STATUS_SCRIPT, timeout=10.0
+            )
+        finally:
+            # Restore whatever was running before this command interrupted
+            # it (most importantly, a wifi/BLE boot.py's accept-loop) -
+            # see this function's own docstring. Runs even if run_python
+            # itself raised, so a status check that fails partway still
+            # leaves the board in its normal running state rather than
+            # stuck at an idle REPL prompt.
+            serial_transport.reset_board(ser)
 
     if stderr:
         raise click.ClickException(f"status check failed: {stderr.decode(errors='replace')}")
@@ -399,6 +434,14 @@ def unprovision_command(port: str | None) -> None:
 
         present = [name for name, found in (("wifi", has_wifi), ("BLE", has_ble)) if found]
         if not beaupy.confirm(f"Remove {' and '.join(present)} credentials from {resolved_port}?"):
+            # Nothing changed on-device, but the reset_board() above already
+            # interrupted whatever was running (a wifi/BLE boot.py's
+            # accept-loop, if either transport is actually provisioned -
+            # see status_command's docstring for the same trap) - restore
+            # it before reporting "cancelled", so a cancelled unprovision
+            # is a genuine no-op, not a silent way to kill a working
+            # listener.
+            serial_transport.reset_board(ser)
             click.echo("Cancelled.")
             return
 
