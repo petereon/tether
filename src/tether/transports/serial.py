@@ -459,8 +459,8 @@ def run_python(serial_obj: Any, code: bytes, *, timeout: float = 10.0) -> tuple[
 def remove_file(serial_obj: Any, path: str, *, timeout: float = 10.0) -> None:
     """Delete `path` from the device's filesystem via raw REPL. Silently
     succeeds if the file doesn't exist (matches ensure_dir's existing
-    try/except OSError pattern) - used by the CLI's unprovision wifi to
-    remove /tether_wifi.json.
+    try/except OSError pattern) - used by the CLI's unprovision command to
+    remove /tether_wifi.json and/or /tether_ble.json.
     """
     script = f"import uos\ntry:\n    uos.remove({path!r})\nexcept OSError:\n    pass\n"
     push_raw_repl(serial_obj, script.encode(), timeout=timeout)

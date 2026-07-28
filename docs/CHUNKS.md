@@ -1653,18 +1653,16 @@ be new scope beyond a verification pass):
   missing secret), `--danger-unauthenticated`, and the wifi/BLE
   boot.py-conflict warning (both directions) — were all run against a
   real ESP32. Serial (`examples/blink_and_log/blink_and_log.py`) confirmed
-  completely unaffected throughout. Two real, non-blocking findings
-  surfaced only by hardware, not fixed in this chunk since they're
-  platform/cosmetic, not code defects: macOS's CoreBluetooth hides real
+  completely unaffected throughout. One real, non-blocking finding
+  surfaced only by hardware, not fixed in this chunk since it's a macOS
+  platform behavior, not a code defect: macOS's CoreBluetooth hides real
   BLE MAC addresses from apps for privacy, exposing a randomized per-app
   UUID instead — `mcu.connect("ble:<addr>")` on macOS needs that UUID
   (from a scan), not the MAC `provision ble` prints (correct and usable
-  as-is on Linux/BlueZ); and the advertised device name was observed once
-  showing MicroPython's own default GATT device name ("MPY ESP32")
-  instead of this project's advertised local name ("tether") in a scan,
-  believed to be CoreBluetooth reporting a cached GATT read from an
-  earlier connection rather than the live advertisement — address/UUID-
-  based connection was unaffected.
+  as-is on Linux/BlueZ). A second finding (the advertised device name
+  showing MicroPython's own default GATT device name, "MPY ESP32",
+  instead of this project's "tether" in a scan) was root-caused and fixed
+  the same day — see the 2026-07-28 addendum below.
 
   Documentation sweep (this same review pass): `docs/DESIGN.md` (§
   Architecture overview step 5, § Transports' BLE row), `CLAUDE.md` (the
@@ -1675,6 +1673,111 @@ be new scope beyond a verification pass):
 
   278 tests passing (was 268 immediately before the final review's fixes;
   +10, one per finding above).
+
+**Addendum (2026-07-28) — follow-up fixes from a post-merge gap review.**
+Reviewing chunk 20/21's own accepted limitations and parked findings
+surfaced four worth acting on immediately rather than leaving parked:
+
+1. **`unprovision-wifi`/`unprovision-ble` asymmetry removed.** A board
+   only ever runs one transport's `boot.py` at a time (the mutual-
+   exclusivity design chunk 21 already established), so there was no
+   real reason to unprovision one transport but not the other. `tether
+   unprovision-wifi`/`unprovision-ble` collapse into a single `tether
+   unprovision`, which removes whichever of `/tether_wifi.json`/
+   `/tether_ble.json` are actually present (checked via `read_file`
+   first, so the confirmation prompt and final message are accurate
+   about what's really being removed - not a blind "removed everything"
+   claim).
+2. **`BleStream.write()` gains the same timeout `read()` already had.**
+   The final review's F1 fix (chunk 21) bounded reads; writes were left
+   with `Future.result()`'s default unbounded wait - a peripheral that
+   stops acknowledging ATT writes mid-exchange could still hang the
+   whole process forever, on the write side specifically. Same fix
+   shape: `concurrent.futures.TimeoutError` caught and converted to
+   `OSError`, matching the read-side contract; `BleControlChannel`
+   threads its existing `timeout` through both directions now.
+3. **BLE gets its own `@mcu.loop`-duplication-across-reconnects
+   regression test**, mirroring wifi's own headline test
+   (`test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects`).
+   This was a real, named gap in chunk 21's final review (verified once,
+   manually, on real hardware, but nothing automated). Reconnects three
+   times via the existing `Central` test helper, samples
+   `get_tick_total()` via a real RPC call after each session (not just a
+   raw counter comparison - a stale reader task racing the live session
+   for frames, the specific hazard the final review flagged as
+   BLE-specific, would show up as a hung/wrong RPC result here, not just
+   an inflated count). Mutation-verified: reverting the underlying fix
+   reproduces the exact 1x/2x/3x accumulating signature (15/46/93,
+   deltas 15/31/47) chunk 20's own wifi bug had.
+4. **The advertised-BLE-name discrepancy (chunk 21's parked finding) was
+   root-caused, not just left as a shrug.** Confirmed directly against
+   real hardware: MicroPython's `bluetooth` module has its own built-in
+   default `gap_name` ("MPY ESP32"), entirely independent of this
+   project's custom advertising payload's local name ("tether") -
+   nothing in `tether`'s code had ever set it. Fixed with one call,
+   `_ble.config(gap_name="tether")`, right after `_ble.active(True)`.
+   Verified fixed at the source (reading `gap_name` from inside the
+   actual running boot.py setup code, not a fresh disconnected session,
+   now returns `b'tether'`). One residual, non-fixable-from-here
+   artifact found during verification: a bleak scan on this dev machine
+   still occasionally reports "MPY ESP32" for a device it has scanned
+   many times before - traced to CoreBluetooth not even exposing the
+   standard Generic Access service via `client.services` (a documented
+   Apple platform behavior; the OS manages device-name display
+   internally and can lag a real device's current `gap_name` behind its
+   own cache) - not something more code on tether's side can control.
+
+  4 new/changed test files, 283 tests passing (was 278).
+
+5. **Shared-secret auth upgraded to an HMAC-SHA256 nonce-challenge**, so
+   the plaintext secret itself no longer crosses the wire (chunk 20/21's
+   own accepted limitation, and this gap review's recommended fix over a
+   full TLS stack, which doesn't fit the bundle/complexity budget on this
+   hardware class). The device sends a fresh `os.urandom(16)` nonce as the
+   very first thing on every accepted connection, before reading anything;
+   the client answers with `HMAC-SHA256(secret, nonce)` instead of the
+   secret itself. MicroPython has `hashlib.sha256` but no `hmac` module,
+   so the device runs a small hand-rolled HMAC-SHA256 (`_hmac_sha256` in
+   the shared `_MODE_HANDLER_FUNCTIONS_SRC`) - verified byte-for-byte
+   against CPython's real `hmac.new(key, msg, hashlib.sha256)` both
+   locally and on real ESP32 hardware; the PC side (`transports/wifi.py`'s
+   `send_preamble`, `transports/ble.py`'s `BleControlChannel.send_preamble`)
+   uses real stdlib `hmac`. BLE's one-connection-reused-across-modes model
+   (chunk 21) needed its own state: only the FIRST preamble on a physical
+   connection presents a nonce response (`BleControlChannel._authenticated`
+   PC-side, `_authenticated` device-side); later preambles on that same
+   already-open connection skip the check, matching the shape the
+   one-connection design already established.
+
+   **A real, non-obvious bug found and fixed via this chunk's own testing,
+   worth recording:** the hand-rolled HMAC's key-padding literal
+   (`b"\x00"`) sat inside `_MODE_HANDLER_FUNCTIONS_SRC`, itself an f-string
+   at THIS module's import time - a single backslash there gets eagerly
+   interpreted by CPython immediately, baking a raw embedded NUL byte into
+   the generated `boot.py`'s own source text (not the two-character escape
+   sequence). MicroPython's parser turned out to mis-tokenize a literal
+   NUL byte sitting inside a byte-string literal in source (confirmed via
+   direct reproduction under the real `micropython` unix-port: the parsed
+   byte value came out as `1`, not `0`) - producing a wrong HMAC on every
+   single connection, both wifi and BLE, authenticated or not. The
+   isolated hand-rolled algorithm itself was correct throughout (verified
+   against CPython's `hmac` before this was even wired into the accept
+   loop) - the bug was purely in how the literal round-tripped through a
+   second layer of Python-source-generating-Python-source, and needed a
+   real embedded-context reproduction (not an isolated unit test of the
+   function alone) to surface. Fixed with `b"\\x00"` (double backslash) in
+   the f-string, so the *generated* file's source text carries the literal
+   escape sequence for MicroPython's own parser to interpret. A few
+   existing test fakes that fully replace the on-device `uos` module
+   (predating this feature) also needed a `urandom()` method added, since
+   the accept loop now calls it once per connection.
+
+   Verified against real ESP32 hardware: wifi round-trip (correct secret
+   connects and reconnects; wrong secret raises `WifiAuthError`) confirmed
+   working end-to-end. 3 changed test files plus `tests/ble_fakes.py` and
+   `tests/test_connection.py`'s hand-rolled fake wifi/BLE devices (which
+   needed to start sending a nonce before reading a preamble, matching the
+   new protocol), 284 tests passing (was 283).
 
 ---
 

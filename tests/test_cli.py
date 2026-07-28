@@ -389,7 +389,7 @@ def test_status_command_reports_connected_with_ip(monkeypatch):
     )
 
 
-def test_unprovision_wifi_removes_config_after_confirmation(monkeypatch):
+def test_unprovision_removes_both_wifi_and_ble_when_both_present(monkeypatch):
     calls = []
 
     class _FakeSerial:
@@ -402,25 +402,70 @@ def test_unprovision_wifi_removes_config_after_confirmation(monkeypatch):
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
     monkeypatch.setattr("beaupy.confirm", lambda question: True)
-
-    removed = {}
-
-    def fake_remove_file(ser, path, **kwargs):
-        calls.append("remove")
-        removed["path"] = path
-
-    monkeypatch.setattr("tether.transports.serial.remove_file", fake_remove_file)
-
-    result = CliRunner().invoke(main, ["unprovision", "wifi", "--port", "/dev/ttyUSB0"])
-
-    assert result.exit_code == 0, result.output
-    assert removed["path"] == "/tether_wifi.json"
-    assert calls == ["reset", "remove"], (
-        "unprovision wifi must reset the board (known state) before removing the wifi config"
+    monkeypatch.setattr(
+        "tether.transports.serial.read_file",
+        lambda ser, path, timeout=10.0: b"{}",  # both files "present"
     )
 
+    removed_paths = []
+    monkeypatch.setattr(
+        "tether.transports.serial.remove_file",
+        lambda ser, path, **kw: removed_paths.append(path),
+    )
 
-def test_unprovision_wifi_does_nothing_without_confirmation(monkeypatch):
+    result = CliRunner().invoke(main, ["unprovision", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert set(removed_paths) == {"/tether_wifi.json", "/tether_ble.json"}
+    assert calls == ["reset"], "unprovision must reset the board (known state) before removing"
+    assert "wifi" in result.output.lower()
+    assert "ble" in result.output.lower()
+
+
+def test_unprovision_removes_only_ble_when_only_ble_present(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("beaupy.confirm", lambda question: True)
+
+    def fake_read_file(ser, path, timeout=10.0):
+        return b"{}" if path == "/tether_ble.json" else None
+
+    monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
+
+    removed_paths = []
+    monkeypatch.setattr(
+        "tether.transports.serial.remove_file",
+        lambda ser, path, **kw: removed_paths.append(path),
+    )
+
+    result = CliRunner().invoke(main, ["unprovision", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert removed_paths == ["/tether_ble.json"]
+    assert "wifi" not in result.output.lower()
+
+
+def test_unprovision_reports_nothing_to_do_when_neither_present(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+
+    confirmed = {"called": False}
+    monkeypatch.setattr(
+        "beaupy.confirm", lambda question: confirmed.__setitem__("called", True) or True
+    )
+
+    result = CliRunner().invoke(main, ["unprovision", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert confirmed["called"] is False, "must not prompt when there is nothing to remove"
+    assert "no stored" in result.output.lower()
+
+
+def test_unprovision_does_nothing_without_confirmation(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: b"{}")
     monkeypatch.setattr("beaupy.confirm", lambda question: False)
 
     removed = {}
@@ -429,7 +474,7 @@ def test_unprovision_wifi_does_nothing_without_confirmation(monkeypatch):
         lambda ser, path, **kw: removed.setdefault("called", True),
     )
 
-    result = CliRunner().invoke(main, ["unprovision", "wifi", "--port", "/dev/ttyUSB0"])
+    result = CliRunner().invoke(main, ["unprovision", "--port", "/dev/ttyUSB0"])
 
     assert result.exit_code == 0, result.output
     assert "called" not in removed

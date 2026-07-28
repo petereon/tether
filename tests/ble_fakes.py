@@ -97,6 +97,7 @@ class _FakeBLE:
         # racing a queued notification against the link teardown.
         self.notify_ticks = []
         self.disconnect_ticks = []
+        self._config = {}
 
     def active(self, _on=None):
         if _on is not None:
@@ -106,9 +107,19 @@ class _FakeBLE:
     def irq(self, _handler):
         self._irq_handler = _handler
 
-    def config(self, _key):
+    def config(self, _key=None, **_kwargs):
+        # Real MicroPython bluetooth.BLE.config() is get-or-set, matching
+        # its own docs: config('param') to read, config(param=value, ...)
+        # to write - a fake supporting only the positional/get form would
+        # silently swallow any code that sets gap_name/mtu/etc, since a
+        # real TypeError-on-unsupported-kwarg would never surface here.
+        if _kwargs:
+            self._config.update(_kwargs)
+            return None
         if _key == "mac":
             return (0, b"\\xaa\\xbb\\xcc\\xdd\\xee\\xff")
+        if _key in self._config:
+            return self._config[_key]
         raise ValueError(_key)
 
     def gap_advertise(self, _interval_us, _adv_data=None):
@@ -326,6 +337,13 @@ class _FakeUos:
     def listdir(path="/"):
         return [p.lstrip("/") for p in _files]
 
+    @staticmethod
+    def urandom(n):
+        # _BLE_BOOT_TEMPLATE calls uos.urandom() once per connection for
+        # its nonce - a fixed value is fine here, nothing in these tests
+        # checks its actual randomness.
+        return bytes(n)
+
 
 _sys.modules["uos"] = _FakeUos
 _sys.modules["os"] = _FakeUos
@@ -341,6 +359,37 @@ _sys.modules["os"] = _FakeUos
 CENTRAL_HELPER_SRC = """
 import ujson as _cjson
 
+try:
+    import uhashlib as _chashlib
+except ImportError:
+    import hashlib as _chashlib
+
+
+def _c_hexlify(_data):
+    return "".join("{:02x}".format(_b) for _b in _data)
+
+
+def _c_unhexlify(_hex):
+    return bytes(int(_hex[_i : _i + 2], 16) for _i in range(0, len(_hex), 2))
+
+
+def _c_hmac_sha256(_key, _msg):
+    # Independent copy of provisioning.py's hand-rolled HMAC-SHA256 - this
+    # driver stands in for the real PC-side client (transports/ble.py),
+    # which has real stdlib hmac available; this fake, running under the
+    # real micropython interpreter alongside the boot.py under test, does
+    # not, so it re-implements the same hand-rolled algorithm rather than
+    # reaching into boot_py_source's own copy (which is a local name inside
+    # _boot_thread(), not visible here - see combine_boot_py_with_driver).
+    _block_size = 64
+    if len(_key) > _block_size:
+        _key = _chashlib.sha256(_key).digest()
+    _key = _key + b"\\x00" * (_block_size - len(_key))
+    _o_key_pad = bytes(_b ^ 0x5C for _b in _key)
+    _i_key_pad = bytes(_b ^ 0x36 for _b in _key)
+    _inner = _chashlib.sha256(_i_key_pad + _msg).digest()
+    return _chashlib.sha256(_o_key_pad + _inner).digest()
+
 
 class Central:
     def __init__(self, ble, conn_handle=0, mtu=100):
@@ -351,6 +400,11 @@ class Central:
         # second Central against the same fake reads only its own replies.
         self._read_pos = len(ble.notifications)
         self._buf = b""
+        # Mirrors BleControlChannel's own _authenticated flag: only the
+        # first send_preamble() call on this Central reads a nonce and
+        # answers it - later calls on the same (simulated) connection just
+        # send {mode}. See transports/ble.py's send_preamble docstring.
+        self._authenticated = False
 
     def connect(self):
         self._ble._simulate_connect(self._conn)
@@ -404,7 +458,17 @@ class Central:
         return _cjson.loads(self.recv_exact(_length, timeout_ms))
 
     def send_preamble(self, mode, secret):
-        self.send_json_frame({"mode": mode, "secret": secret})
+        if not self._authenticated:
+            _nonce_frame = self.read_json_frame()
+            _nonce = _c_unhexlify(_nonce_frame["nonce"])
+            if secret is not None:
+                _response = _c_hexlify(_c_hmac_sha256(secret.encode(), _nonce))
+            else:
+                _response = None
+            self.send_json_frame({"mode": mode, "response": _response})
+            self._authenticated = True
+        else:
+            self.send_json_frame({"mode": mode})
         return self.read_json_frame()
 """
 

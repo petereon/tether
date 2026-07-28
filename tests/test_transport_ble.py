@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 
 import pytest
@@ -46,6 +47,24 @@ def test_write_splits_a_payload_larger_than_the_mtu_into_multiple_gatt_writes():
     stream.write(b"x" * 45)
 
     assert client.writes == [b"x" * 20, b"x" * 20, b"x" * 5]
+
+
+def test_write_raises_oserror_on_timeout_instead_of_hanging_forever():
+    # A peripheral that stops acknowledging ATT writes mid-exchange (gone
+    # out of range, wedged) must not hang this call - and, transitively,
+    # whatever process called it - forever. Regression test: write() used
+    # to have no timeout parameter at all, silently blocking on
+    # Future.result() with no bound, unlike read()'s already-bounded
+    # contract.
+    class _HangingBleakClient(_FakeBleakClient):
+        async def write_gatt_char(self, char_uuid: str, data: bytes, response: bool = True) -> None:
+            await asyncio.sleep(999)
+
+    client = _HangingBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+
+    with pytest.raises(OSError, match="timed out"):
+        stream.write(b"hello", timeout=0.2)
 
 
 def test_on_notify_delivers_the_bytes_through_read():
@@ -125,9 +144,9 @@ def test_control_channel_send_json_frame_writes_length_prefixed_body():
     stream = BleStream(client, _running_loop(), _WRITE_CHAR)
     channel = BleControlChannel(stream)
 
-    channel.send_json_frame({"mode": "status", "secret": None})
+    channel.send_json_frame({"mode": "status", "response": None})
 
-    body = b'{"mode": "status", "secret": null}'
+    body = b'{"mode": "status", "response": null}'
     assert b"".join(client.writes) == len(body).to_bytes(4, "big") + body
 
 
@@ -164,13 +183,32 @@ def test_control_channel_read_json_frame_raises_on_closed_connection():
         channel.read_json_frame()
 
 
+def _queue_frames(stream: BleStream, *frames: dict) -> None:
+    """Feed one notification carrying every frame back-to-back - matches
+    how a real device's nonce-then-ack sequence arrives (see
+    test_control_channel_leftover_bytes_carry_into_the_next_frame for the
+    same multi-frame-in-one-notification shape).
+    """
+    combined = b""
+    for frame in frames:
+        body = json.dumps(frame).encode()
+        combined += len(body).to_bytes(4, "big") + body
+    stream.on_notify(None, bytearray(combined))
+
+
 def test_send_preamble_raises_wifi_auth_error_on_nack():
     client = _FakeBleakClient()
     stream = BleStream(client, _running_loop(), _WRITE_CHAR)
     channel = BleControlChannel(stream)
 
-    nack = b'{"ok": false, "error": "auth failed"}'
-    stream.on_notify(None, bytearray(len(nack).to_bytes(4, "big") + nack))
+    # First send_preamble() call on a channel reads a nonce before sending
+    # anything (see send_preamble's own docstring) - queue that, then the
+    # device's nack, as two frames on the one connection.
+    _queue_frames(
+        stream,
+        {"nonce": b"0123456789abcdef".hex()},
+        {"ok": False, "error": "auth failed"},
+    )
 
     with pytest.raises(WifiAuthError, match="auth failed"):
         channel.send_preamble("status", "wrong-secret")
@@ -181,10 +219,29 @@ def test_send_preamble_succeeds_on_ack():
     stream = BleStream(client, _running_loop(), _WRITE_CHAR)
     channel = BleControlChannel(stream)
 
-    ack = b'{"ok": true}'
-    stream.on_notify(None, bytearray(len(ack).to_bytes(4, "big") + ack))
+    _queue_frames(stream, {"nonce": b"0123456789abcdef".hex()}, {"ok": True})
 
     channel.send_preamble("status", "right-secret")  # must not raise
+
+
+def test_send_preamble_only_reads_a_nonce_on_the_first_call():
+    # BLE reuses one connection across every mode (status -> upload -> run)
+    # - unlike wifi's fresh-connection-per-mode model, only the FIRST
+    # send_preamble() call on a channel should read/answer a nonce; later
+    # calls on the same channel just send {mode} (see the class docstring
+    # and _BLE_BOOT_TEMPLATE's matching _authenticated device-side state).
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    _queue_frames(stream, {"nonce": b"0123456789abcdef".hex()}, {"ok": True}, {"ok": True})
+
+    channel.send_preamble("status", "right-secret")
+    client.writes.clear()
+    channel.send_preamble("upload", "right-secret")
+
+    sent = json.loads(b"".join(client.writes)[4:])
+    assert sent == {"mode": "upload"}
 
 
 def test_stream_read_with_a_timeout_raises_oserror_not_queue_empty():

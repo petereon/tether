@@ -1,6 +1,25 @@
+import hashlib
+import hmac
 import json
 
 from tether.provisioning import STATUS_SCRIPT, generate_ble_boot, generate_wifi_boot
+
+
+def _send_wifi_preamble(sock, mode, secret, send_json, read_json):
+    """Test helper standing in for tether.transports.wifi.send_preamble's
+    request half only (not its ack-read-and-raise half) - these
+    hand-written test clients want to inspect the raw ack dict directly
+    (including auth-failure acks), not have WifiAuthError raised for them.
+    Performs the same nonce-challenge round trip the real on-device
+    accept-loop now requires (see provisioning.py's _BOOT_PY_TEMPLATE):
+    read the nonce the device sends immediately on accept(), then send
+    HMAC-SHA256(secret, nonce) as the response (or None if unauthenticated).
+    """
+    nonce = bytes.fromhex(read_json(sock)["nonce"])
+    response = (
+        hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest() if secret is not None else None
+    )
+    send_json(sock, {"mode": mode, "response": response})
 
 
 def test_generate_wifi_boot_produces_boot_py_and_config():
@@ -401,13 +420,13 @@ def test_boot_py_status_mode_and_preamble_auth():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock)
         results["status_payload"] = read_json(sock)
         sock.close()
 
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "bogus", "secret": None})
+        _send_wifi_preamble(sock2, "bogus", None, send_json, read_json)
         results["unknown_mode_ack"] = read_json(sock2)
         sock2.close()
 
@@ -507,7 +526,7 @@ def test_boot_py_rejects_wrong_secret():
     def run_client():
         time.sleep(0.5)
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": "wrong-one"})
+        _send_wifi_preamble(sock, "status", "wrong-one", send_json, read_json)
         results["ack"] = read_json(sock)
         sock.close()
 
@@ -605,7 +624,7 @@ def test_boot_py_accepts_correct_secret():
     def run_client():
         time.sleep(0.5)
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": "the-real-secret"})
+        _send_wifi_preamble(sock, "status", "the-real-secret", send_json, read_json)
         results["ack"] = read_json(sock)
         results["payload"] = read_json(sock)
         sock.close()
@@ -733,7 +752,7 @@ def test_boot_py_survives_malformed_preamble_and_serves_next_connection():
         # 3. A subsequent, well-formed connection must still be served -
         # this is the real proof the accept-loop didn't crash.
         sock3 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock3, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock3, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock3)
         results["status_payload"] = read_json(sock3)
         sock3.close()
@@ -845,7 +864,7 @@ def test_boot_py_run_mode_survives_a_reconnect_without_a_reset():
 
     def do_one_run_session():
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "run", "secret": None})
+        _send_wifi_preamble(sock, "run", None, send_json, read_json)
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
 
@@ -1018,7 +1037,7 @@ def get_tick_total() -> int:
 
     def do_one_run_session(req_id):
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "run", "secret": None})
+        _send_wifi_preamble(sock, "run", None, send_json, read_json)
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
 
@@ -1174,7 +1193,7 @@ def test_boot_py_upload_mode_writes_files_verified_via_status():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         send_json(
@@ -1194,7 +1213,7 @@ def test_boot_py_upload_mode_writes_files_verified_via_status():
 
         time.sleep(0.5)
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock2, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock2)
         results["status_payload"] = read_json(sock2)
         sock2.close()
@@ -1323,7 +1342,7 @@ def test_boot_py_upload_mode_rejects_a_chunk_that_overflows_the_declared_file_si
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         # Declares a 5-byte file, then sends a single 10-byte chunk for it -
@@ -1465,7 +1484,7 @@ def test_boot_py_invalidates_stale_hash_when_an_upload_fails_partway():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         # Same failure trigger as Fix 3's device-side guard test: a chunk
@@ -1480,7 +1499,7 @@ def test_boot_py_invalidates_stale_hash_when_an_upload_fails_partway():
 
         time.sleep(0.5)
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock2, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock2)
         results["status_payload"] = read_json(sock2)
         sock2.close()
@@ -1522,6 +1541,11 @@ class _FakeUos:
             raise OSError(2, "no such file")
     def mkdir(self, path):
         pass
+    def urandom(self, n):
+        # This fake replaces the whole uos module, and the accept loop now
+        # calls uos.urandom() once per connection for its nonce - a fixed
+        # value is fine, nothing here checks its actual randomness.
+        return bytes(n)
 
 _sys.modules["uos"] = _FakeUos()
 
@@ -1661,6 +1685,8 @@ class _FakeUos:
             del _files[path]
         else:
             raise OSError(2, "no such file")
+    def urandom(self, n):
+        return bytes(n)
 
 _sys.modules["uos"] = _FakeUos()
 
@@ -1870,7 +1896,11 @@ print("nack_flush_ms:", time.ticks_diff(_ble.disconnect_ticks[0], _ble.notify_ti
 
     assert "BOOT THREAD DIED" not in out, out
     assert "reply: {'ok': False, 'error': 'auth failed'}" in out, out
-    assert "total_notify_chunks: 1" in out, out
+    # 2, not 1: the device's one-per-connection nonce is its own
+    # notification, sent before Central.send_preamble() even presents a
+    # response - so a rejected preamble is nonce (1) + nack (2), not just
+    # the nack alone.
+    assert "total_notify_chunks: 2" in out, out
     assert "device_dropped_link: [0]" in out, out
     assert "readvertising: True" in out, out
 
@@ -1975,6 +2005,133 @@ print("ticks_while_idle:", _payload2["value"])
     assert ticks >= 5, f"@mcu.loop starved during a live BLE run session: {ticks} ticks\n{out}"
 
 
+@requires_micropython
+def test_ble_boot_run_mode_does_not_accumulate_loop_tasks_across_reconnects():
+    # BLE's own version of the wifi headline regression test
+    # (test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects,
+    # test_connection.py). The underlying fix (mcu_decorators._registrations
+    # cleared per exec(), uasyncio.new_event_loop() reset in _handle_run's
+    # finally - both in the shared _MODE_HANDLER_FUNCTIONS_SRC) is
+    # transport-agnostic and already covered for wifi, but nothing
+    # previously exercised it for BLE specifically - a real, named gap
+    # noted (not fixed) in this feature's own final review. `_BleAsyncReader`
+    # closes over the module-global `_queue` (not a per-connection object
+    # the way wifi's per-socket StreamReader is), which the final review
+    # flagged as a slightly different-shaped hazard: a stale reader task
+    # surviving a reconnect wouldn't just inflate a counter, it would race
+    # the live session's reader for `_queue.pop(0)` and silently steal
+    # frames. Sampling `get_tick_total()` via a real RPC call after each
+    # reconnect (not just comparing raw counters) means a corrupted/hung
+    # session would show up as this test hanging or asserting garbage, not
+    # just a wrong number - the same class of evidence a stale-reader race
+    # would actually produce.
+    from ble_fakes import combine_boot_py_with_driver
+
+    from tether.marshalling import encode_frame
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+
+    sliced_source = """\
+import mcu_decorators as _test_mod
+
+if not hasattr(_test_mod, "_tick_total"):
+    _test_mod._tick_total = 0
+
+
+@mcu.loop(interval_ms=20)
+def tick():
+    _test_mod._tick_total += 1
+
+
+@mcu.export
+def get_tick_total() -> int:
+    return _test_mod._tick_total
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    def _session_driver(req_id: int) -> str:
+        handshake = encode_frame(1, {"id": req_id, "name": "__tether_handshake__", "args": []})
+        get_ticks = encode_frame(1, {"id": req_id + 1, "name": "get_tick_total", "args": []})
+        return f"""
+_c = Central(_ble)
+_c.connect()
+print("session ack:", _c.send_preamble("run", None))
+
+def _read_result():
+    _len = int.from_bytes(_c.recv_exact(4), "big")
+    _body = _c.recv_exact(_len)
+    return _body[:1], umsgpack.loads(_body[1:])
+
+_c.write({handshake!r})
+_t1, _p1 = _read_result()
+print("session handshake:", _t1, _p1)
+
+time.sleep_ms(300)
+
+_c.write({get_ticks!r})
+_t2, _p2 = _read_result()
+print("session total:", _p2["value"])
+
+_c.disconnect()
+time.sleep_ms(300)  # let boot.py's own bounded disconnect-wait finish and re-advertise
+"""
+
+    driver = f"""
+import bluetooth
+import umsgpack
+
+_ble = bluetooth.BLE()
+
+{_session_driver(1)}
+{_session_driver(3)}
+{_session_driver(5)}
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": "{}", "/tether_app.py": tether_app_source},
+    )
+    out = run_micropython(combined, timeout=20.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert out.count("session ack: {'ok': True}") == 3, out
+
+    totals = [
+        int(line.split("session total:")[1].strip())
+        for line in out.splitlines()
+        if "session total:" in line
+    ]
+    assert len(totals) == 3, out
+
+    first, second, third = totals
+    delta1 = first
+    delta2 = second - first
+    delta3 = third - second
+
+    # Sanity: ticks actually fired every session (not zero - a different
+    # bug this test isn't about).
+    assert delta1 > 0, totals
+    assert delta2 > 0, totals
+    assert delta3 > 0, totals
+
+    # The real check: an accumulating-duplicate-task regression would show
+    # delta2 ~= 2x delta1 and delta3 ~= 3x delta1 (matches the exact
+    # signature the wifi headline bug produced: 14/29/44, i.e. deltas
+    # roughly 1x/2x/3x). 1.6x separates "roughly constant plus scheduling
+    # jitter" from "accumulating an extra duplicate task" without being so
+    # tight that timing jitter alone could trip it - same tolerance wifi's
+    # own regression test uses.
+    assert delta2 < delta1 * 1.6, (
+        f"BLE @mcu.loop tick count is accumulating across reconnects: "
+        f"deltas were {delta1}, {delta2}, {delta3} (totals {totals})"
+    )
+    assert delta3 < delta1 * 1.6, (
+        f"BLE @mcu.loop tick count is accumulating across reconnects: "
+        f"deltas were {delta1}, {delta2}, {delta3} (totals {totals})"
+    )
+
+
 def test_generate_ble_boot_produces_boot_py_and_config():
     files = generate_ble_boot()
 
@@ -2059,6 +2216,42 @@ def test_ble_advertising_payload_is_a_legal_gap_payload():
 
 
 @requires_micropython
+def test_ble_boot_sets_gap_name_to_match_the_advertised_local_name():
+    # Real-hardware finding: MicroPython's bluetooth module has its own
+    # default gap_name ("MPY ESP32") independent of _BLE_ADV_PAYLOAD's
+    # custom advertising local name - left unset, the standard Generic
+    # Access GATT service's Device Name characteristic (which every BLE
+    # peripheral exposes automatically) disagrees with the live
+    # advertisement, and some OS Bluetooth stacks report one or the other
+    # depending on what they've cached, not consistently the live ad.
+    # Confirmed directly against real hardware: `bluetooth.BLE().config
+    # ("gap_name")` returned b'MPY ESP32' before this fix, unprompted by
+    # any code in this project.
+    from ble_fakes import FAKE_BLUETOOTH_MODULE_SRC, FAKE_FS_SRC
+    from mpy_runner import run_micropython
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+    # Same "run setup only, stop before the infinite session loop" idea as
+    # the setup-succeeds check elsewhere in this file - gap_name is set
+    # once, early, well before the loop.
+    idx = boot_py.index("    while True:\n        # Re-establish")
+    setup_src = boot_py[:idx]
+
+    script = f"""
+{FAKE_BLUETOOTH_MODULE_SRC}
+
+_files = {{"/tether_ble.json": "{{}}"}}
+
+{FAKE_FS_SRC}
+
+{setup_src}
+    print("gap_name:", _ble.config("gap_name"))
+"""
+    out = run_micropython(script, timeout=8.0)
+    assert "gap_name: tether" in out, out
+
+
+@requires_micropython
 def test_ble_boot_survives_a_slow_disconnect_and_serves_the_next_connection():
     # Review finding (Important 1). gap_disconnect() is asynchronous on
     # real hardware: it only *requests* a disconnect. Re-advertising before
@@ -2135,8 +2328,14 @@ _ble = bluetooth.BLE()
 _c = Central(_ble, mtu=23)  # BLE's pre-negotiation minimum: 20 usable bytes
 _c.connect()
 
+# Consume the device's one-per-connection nonce normally (not burst-written
+# - the device sends it, this doesn't exercise the write-burst path) before
+# hand-computing the response for the burst-written preamble below.
+_nonce = _c_unhexlify(_c.read_json_frame()["nonce"])
+_response = _c_hexlify(_c_hmac_sha256(b"s3cr3t", _nonce))
+
 # Every chunk lands before the device's read handler runs even once.
-_c.send_json_frame_burst({"mode": "status", "secret": "s3cr3t"})
+_c.send_json_frame_burst({"mode": "status", "response": _response})
 print("append_mode:", _ble._append[WRITE_VALUE_HANDLE])
 print("ack:", _c.read_json_frame())
 print("hash:", _c.read_json_frame()["tether_app_hash"])

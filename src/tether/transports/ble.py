@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import queue
 import struct
@@ -95,7 +97,17 @@ class BleStream:
         except queue.Empty:
             raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes, timeout: float | None = None) -> None:
+        """`timeout=None` (the default) blocks indefinitely - correct for
+        the long-lived RPC stream the Dispatcher owns, same reasoning as
+        `read()`'s default. A bounded `timeout` is for the synchronous
+        control exchange (BleControlChannel) - a peripheral that stops
+        acknowledging ATT writes mid-exchange must fail rather than hang
+        this call (and, transitively, the caller's whole process) forever.
+        Raises OSError on expiry, matching read()'s contract - this used
+        to have no timeout at all, silently inheriting whatever
+        `.result()`'s own default (block forever) did.
+        """
         # GATT writes are capped by the negotiated ATT MTU - split anything
         # larger into multiple writes. FrameDecoder (marshalling/__init__.py)
         # already reassembles arbitrarily-chunked reads into whole frames on
@@ -130,7 +142,16 @@ class BleStream:
         # event-loop wakeup) rather than one per chunk - the sequencing
         # above already happens entirely within this single coroutine on
         # the loop's own thread.
-        asyncio.run_coroutine_threadsafe(_write_all(), self._loop).result()
+        future = asyncio.run_coroutine_threadsafe(_write_all(), self._loop)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # The coroutine is still running on the loop's thread after
+            # this - cancel() only prevents future.result() from waiting
+            # on it further, matching connect()'s own documented handling
+            # of this exact race (see its own TimeoutError comment below).
+            future.cancel()
+            raise OSError(f"timed out after {timeout}s writing BLE data") from None
 
     def on_notify(self, _sender: Any, data: bytearray) -> None:
         """Registered as the notify characteristic's callback - matches
@@ -186,19 +207,27 @@ class BleControlChannel:
     one-connection decision: BLE connection setup is too costly to redo
     per mode, unlike wifi's cheap TCP handshake).
 
-    `timeout` bounds every read this channel makes (per read, like a
-    socket timeout - wifi's control channel gets the same semantics from
-    `socket.settimeout`). It is deliberately not shared with the
-    underlying BleStream, which stays unbounded-blocking for the
-    Dispatcher's own reads once the control exchange is over and the raw
-    stream is handed off - see BleStream.read's docstring. Pass None only
-    if a caller genuinely wants to wait forever.
+    `timeout` bounds every read AND write this channel makes (per call,
+    like a socket timeout - wifi's control channel gets the same
+    semantics from `socket.settimeout`). It is deliberately not shared
+    with the underlying BleStream, which stays unbounded-blocking for the
+    Dispatcher's own reads/writes once the control exchange is over and
+    the raw stream is handed off - see BleStream.read's/write's
+    docstrings. Pass None only if a caller genuinely wants to wait
+    forever.
     """
 
     def __init__(self, stream: BleStream, *, timeout: float | None = DEFAULT_TIMEOUT) -> None:
         self._stream = stream
         self._timeout = timeout
         self._buffer = b""
+        # Unlike wifi (fresh connection, fresh nonce, per mode), one BLE
+        # connection is reused across every mode - so only the FIRST
+        # send_preamble() call on a given channel does the nonce-challenge
+        # round trip; every later call on the same (already-authenticated)
+        # connection just sends {mode}. See send_preamble's own docstring
+        # and _BLE_BOOT_TEMPLATE's matching device-side state.
+        self._authenticated = False
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buffer) < n:
@@ -211,7 +240,7 @@ class BleControlChannel:
 
     def send_json_frame(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body)
+        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body, self._timeout)
 
     def read_json_frame(self) -> dict[str, Any]:
         header = self._recv_exact(_LENGTH_PREFIX.size)
@@ -222,7 +251,7 @@ class BleControlChannel:
         return json.loads(body.decode("utf-8"))
 
     def send_bytes_frame(self, data: bytes) -> None:
-        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data)
+        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data, self._timeout)
 
     def read_bytes_frame(self) -> bytes:
         header = self._recv_exact(_LENGTH_PREFIX.size)
@@ -232,16 +261,40 @@ class BleControlChannel:
         return self._recv_exact(length)
 
     def send_preamble(self, mode: str, secret: str | None) -> None:
-        """Send the connection preamble (mode + shared secret) and wait
-        for the device's ack. Raises WifiAuthError if the device rejects
-        it - matches wifi's send_preamble exactly (see transports/wifi.py).
+        """Send the connection preamble (mode, plus a nonce-challenge
+        response on the FIRST call this channel makes) and wait for the
+        device's ack. Raises WifiAuthError if the device rejects it -
+        same error type wifi's send_preamble uses (see transports/wifi.py),
+        reused rather than adding a BLE-specific auth error class.
+
+        The device sends one nonce per physical connection, immediately
+        after accepting it and before reading any preamble - not per mode,
+        since a BLE connection is reused across status -> upload -> run
+        (see the design's one-connection decision, BleControlChannel's own
+        class docstring, and _BLE_BOOT_TEMPLATE's matching device-side
+        state). This channel mirrors that: the nonce is read and answered
+        exactly once (`self._authenticated` below), and every later
+        send_preamble() call on the same channel sends just `{mode}` - the
+        device already knows this connection is authenticated and doesn't
+        expect (or check) a response on those later preambles.
         """
         from tether.errors import WifiAuthError
 
-        self.send_json_frame({"mode": mode, "secret": secret})
-        response = self.read_json_frame()
-        if not response.get("ok", False):
-            raise WifiAuthError(response.get("error") or "connection rejected by device")
+        if not self._authenticated:
+            nonce_frame = self.read_json_frame()
+            nonce = bytes.fromhex(nonce_frame["nonce"])
+            response = (
+                hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+                if secret is not None
+                else None
+            )
+            self.send_json_frame({"mode": mode, "response": response})
+            self._authenticated = True
+        else:
+            self.send_json_frame({"mode": mode})
+        ack = self.read_json_frame()
+        if not ack.get("ok", False):
+            raise WifiAuthError(ack.get("error") or "connection rejected by device")
 
 
 def connect(address: str, *, timeout: float = DEFAULT_TIMEOUT) -> BleStream:
