@@ -52,6 +52,27 @@ class WifiStream:
         self._sock.sendall(data)
 
     def close(self) -> None:
+        # shutdown() before close() - not redundant. This process's own
+        # Dispatcher reader thread is typically still blocked in recv() on
+        # this exact socket when close() is called (no Dispatcher.stop()
+        # exists yet - see connection.py's own comments on this), and
+        # POSIX leaves close()-while-another-thread-is-blocked-on-the-same-
+        # fd unspecified. Confirmed against real Linux (not just reasoned
+        # about): close() alone leaves the peer never observing the
+        # connection end at all - board.reconnect() over wifi hangs/times
+        # out waiting for the OLD device-side connection to close, because
+        # no FIN or RST ever reaches it, only on Linux (harmless on macOS,
+        # where this was developed and had passed before). shutdown()
+        # operates at the protocol level, is specified to affect every
+        # thread with a blocking call on the socket, and reliably causes
+        # the peer to see the connection end regardless of what else has
+        # this fd open. OSError is possible if the socket is already
+        # disconnected (e.g. the peer already closed it) - not an error
+        # worth surfacing here, close() below still needs to run either way.
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self._sock.close()
 
 

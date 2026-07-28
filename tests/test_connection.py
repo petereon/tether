@@ -1101,13 +1101,7 @@ def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
     device_thread = threading.Thread(target=fake_device, daemon=True)
     device_thread.start()
 
-    # timeout=3.0 was tight enough to flake under CI's more contended
-    # runners (real threading + real sequential status/upload/run socket
-    # round trips, twice, sharing one CPU-throttled box) while reliably
-    # passing on a fast local machine - bumped to give real scheduling
-    # variance headroom without weakening what's asserted (still bounded,
-    # still fails loud on an actual hang/regression).
-    board = connect(f"wifi:127.0.0.1:{port}", timeout=10.0)
+    board = connect(f"wifi:127.0.0.1:{port}", timeout=3.0)
     assert board._mock_read_temp() == 21.5
 
     board.reconnect()  # must not hang/timeout - this is the fix under test
