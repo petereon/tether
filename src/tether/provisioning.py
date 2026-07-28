@@ -375,6 +375,21 @@ if _cfg is not None:
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "    ")}
     _ble = _bluetooth.BLE()
     _ble.active(True)
+    # MicroPython's bluetooth module has its own default gap_name
+    # ("MPY ESP32") baked in, populating the standard Generic Access GATT
+    # service's Device Name characteristic every peripheral exposes
+    # automatically - separate from _BLE_ADV_PAYLOAD's custom advertising
+    # local name below. Left unset, the two disagree, and some OS
+    # Bluetooth stacks (observed on macOS CoreBluetooth) report whichever
+    # one they happen to have cached rather than always the live
+    # advertisement's name - a real device can show up as "tether" in one
+    # scan and "MPY ESP32" in the next. Setting both to the same value
+    # removes the discrepancy at the source instead of leaving it to
+    # chance which one a given OS/scan happens to surface.
+    try:
+        _ble.config(gap_name="{_BLE_ADV_NAME}")
+    except Exception:
+        pass
     _ble_addr_str = ":".join("{{:02x}}".format(_b) for _b in _ble.config("mac")[1])
 
     # One-element lists as mutable boxes: _bt_irq and the stream adapters

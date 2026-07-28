@@ -129,16 +129,20 @@ tether devices                                        # list connected boards
 tether provision wifi --ssid SSID [--password PW]      # upload boot.py + credentials + a secret
 tether provision ble [--danger-unauthenticated]         # upload boot.py + a secret, advertises the board
 tether status [--ip IP] [--secret S] [--ble-addr A] [--ble-secret S]  # check provisioned/connected state
-tether unprovision wifi                                # remove stored credentials
+tether unprovision                                     # remove all stored credentials (wifi + BLE)
 ```
 
 `--port` is optional everywhere — if more than one known device is
 connected and `--port` is omitted, you're prompted interactively to pick
 one. `--password` is prompted for (hidden input) if omitted from
-`provision wifi`. `unprovision wifi` asks for confirmation first, since it
-kills the board's wifi reachability (it only removes the stored
-credentials — the uploaded `boot.py` itself stays, harmlessly, and does
-nothing without them). `provision wifi` uploads a small `boot.py` that
+`provision wifi`. `unprovision` removes whichever of `/tether_wifi.json`/
+`/tether_ble.json` are actually present — a board only ever runs one
+transport at a time (see the boot.py-conflict warning below), so there's
+no reason to unprovision one transport but not the other. It asks for
+confirmation first, since it kills the board's wifi/BLE reachability (it
+only removes the stored credentials — the uploaded `boot.py` itself stays,
+harmlessly, and does nothing without them). `provision wifi` uploads a
+small `boot.py` that
 auto-connects to wifi on every boot and, once connected, loops
 indefinitely accepting connections (one at a time) that push code, run
 it, or report status — after it finishes, connect from Python with

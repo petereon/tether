@@ -95,7 +95,17 @@ class BleStream:
         except queue.Empty:
             raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes, timeout: float | None = None) -> None:
+        """`timeout=None` (the default) blocks indefinitely - correct for
+        the long-lived RPC stream the Dispatcher owns, same reasoning as
+        `read()`'s default. A bounded `timeout` is for the synchronous
+        control exchange (BleControlChannel) - a peripheral that stops
+        acknowledging ATT writes mid-exchange must fail rather than hang
+        this call (and, transitively, the caller's whole process) forever.
+        Raises OSError on expiry, matching read()'s contract - this used
+        to have no timeout at all, silently inheriting whatever
+        `.result()`'s own default (block forever) did.
+        """
         # GATT writes are capped by the negotiated ATT MTU - split anything
         # larger into multiple writes. FrameDecoder (marshalling/__init__.py)
         # already reassembles arbitrarily-chunked reads into whole frames on
@@ -130,7 +140,16 @@ class BleStream:
         # event-loop wakeup) rather than one per chunk - the sequencing
         # above already happens entirely within this single coroutine on
         # the loop's own thread.
-        asyncio.run_coroutine_threadsafe(_write_all(), self._loop).result()
+        future = asyncio.run_coroutine_threadsafe(_write_all(), self._loop)
+        try:
+            future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            # The coroutine is still running on the loop's thread after
+            # this - cancel() only prevents future.result() from waiting
+            # on it further, matching connect()'s own documented handling
+            # of this exact race (see its own TimeoutError comment below).
+            future.cancel()
+            raise OSError(f"timed out after {timeout}s writing BLE data") from None
 
     def on_notify(self, _sender: Any, data: bytearray) -> None:
         """Registered as the notify characteristic's callback - matches
@@ -186,13 +205,14 @@ class BleControlChannel:
     one-connection decision: BLE connection setup is too costly to redo
     per mode, unlike wifi's cheap TCP handshake).
 
-    `timeout` bounds every read this channel makes (per read, like a
-    socket timeout - wifi's control channel gets the same semantics from
-    `socket.settimeout`). It is deliberately not shared with the
-    underlying BleStream, which stays unbounded-blocking for the
-    Dispatcher's own reads once the control exchange is over and the raw
-    stream is handed off - see BleStream.read's docstring. Pass None only
-    if a caller genuinely wants to wait forever.
+    `timeout` bounds every read AND write this channel makes (per call,
+    like a socket timeout - wifi's control channel gets the same
+    semantics from `socket.settimeout`). It is deliberately not shared
+    with the underlying BleStream, which stays unbounded-blocking for the
+    Dispatcher's own reads/writes once the control exchange is over and
+    the raw stream is handed off - see BleStream.read's/write's
+    docstrings. Pass None only if a caller genuinely wants to wait
+    forever.
     """
 
     def __init__(self, stream: BleStream, *, timeout: float | None = DEFAULT_TIMEOUT) -> None:
@@ -211,7 +231,7 @@ class BleControlChannel:
 
     def send_json_frame(self, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body)
+        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body, self._timeout)
 
     def read_json_frame(self) -> dict[str, Any]:
         header = self._recv_exact(_LENGTH_PREFIX.size)
@@ -222,7 +242,7 @@ class BleControlChannel:
         return json.loads(body.decode("utf-8"))
 
     def send_bytes_frame(self, data: bytes) -> None:
-        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data)
+        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data, self._timeout)
 
     def read_bytes_frame(self) -> bytes:
         header = self._recv_exact(_LENGTH_PREFIX.size)

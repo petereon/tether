@@ -97,6 +97,7 @@ class _FakeBLE:
         # racing a queued notification against the link teardown.
         self.notify_ticks = []
         self.disconnect_ticks = []
+        self._config = {}
 
     def active(self, _on=None):
         if _on is not None:
@@ -106,9 +107,19 @@ class _FakeBLE:
     def irq(self, _handler):
         self._irq_handler = _handler
 
-    def config(self, _key):
+    def config(self, _key=None, **_kwargs):
+        # Real MicroPython bluetooth.BLE.config() is get-or-set, matching
+        # its own docs: config('param') to read, config(param=value, ...)
+        # to write - a fake supporting only the positional/get form would
+        # silently swallow any code that sets gap_name/mtu/etc, since a
+        # real TypeError-on-unsupported-kwarg would never surface here.
+        if _kwargs:
+            self._config.update(_kwargs)
+            return None
         if _key == "mac":
             return (0, b"\\xaa\\xbb\\xcc\\xdd\\xee\\xff")
+        if _key in self._config:
+            return self._config[_key]
         raise ValueError(_key)
 
     def gap_advertise(self, _interval_us, _adv_data=None):

@@ -368,35 +368,46 @@ def status_command(
         click.echo("Provisioned but not currently connected to wifi.")
 
 
-@main.group("unprovision")
-def unprovision_group() -> None:
-    """Remove stored wifi/BLE credentials from a board."""
-
-
-@unprovision_group.command("wifi")
+@main.command("unprovision")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
-def unprovision_wifi_command(port: str | None) -> None:
-    """Remove stored WiFi credentials from a board.
+def unprovision_command(port: str | None) -> None:
+    """Remove all stored wifi/BLE credentials from a board.
 
-    Note: this only removes /tether_wifi.json - the auto-run boot.py
-    itself is left in place (harmless without credentials: it does
-    nothing and falls through to the idle REPL, same as a never-
-    provisioned board). Re-run `provision wifi` to provision again.
+    Removes both /tether_wifi.json and /tether_ble.json, whichever are
+    actually present - a board only ever runs one transport's boot.py at
+    a time (see `provision wifi`/`provision ble`'s own conflict warning),
+    so there is no reason to unprovision one transport but not the
+    other. The uploaded boot.py itself is left in place either way
+    (harmless without credentials: it does nothing and falls through to
+    the idle REPL, same as a never-provisioned board). Re-run
+    `provision wifi`/`provision ble` to provision again.
     """
     import beaupy
 
     from tether.transports import serial as serial_transport
 
     resolved_port = _resolve_port(port)
-    if not beaupy.confirm(f"Remove wifi credentials from {resolved_port}?"):
-        click.echo("Cancelled.")
-        return
 
     with _open_board(resolved_port) as ser:
         serial_transport.reset_board(ser)
-        serial_transport.remove_file(ser, "/tether_wifi.json")
+        has_wifi = serial_transport.read_file(ser, "/tether_wifi.json", timeout=5.0) is not None
+        has_ble = serial_transport.read_file(ser, "/tether_ble.json", timeout=5.0) is not None
 
-    click.echo(f"Removed wifi credentials from {resolved_port}.")
+        if not has_wifi and not has_ble:
+            click.echo(f"{resolved_port} has no stored wifi or BLE credentials.")
+            return
+
+        present = [name for name, found in (("wifi", has_wifi), ("BLE", has_ble)) if found]
+        if not beaupy.confirm(f"Remove {' and '.join(present)} credentials from {resolved_port}?"):
+            click.echo("Cancelled.")
+            return
+
+        if has_wifi:
+            serial_transport.remove_file(ser, "/tether_wifi.json")
+        if has_ble:
+            serial_transport.remove_file(ser, "/tether_ble.json")
+
+    click.echo(f"Removed {' and '.join(present)} credentials from {resolved_port}.")
 
 
 if __name__ == "__main__":

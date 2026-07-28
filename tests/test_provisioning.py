@@ -1975,6 +1975,132 @@ print("ticks_while_idle:", _payload2["value"])
     assert ticks >= 5, f"@mcu.loop starved during a live BLE run session: {ticks} ticks\n{out}"
 
 
+def test_ble_boot_run_mode_does_not_accumulate_loop_tasks_across_reconnects():
+    # BLE's own version of the wifi headline regression test
+    # (test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects,
+    # test_connection.py). The underlying fix (mcu_decorators._registrations
+    # cleared per exec(), uasyncio.new_event_loop() reset in _handle_run's
+    # finally - both in the shared _MODE_HANDLER_FUNCTIONS_SRC) is
+    # transport-agnostic and already covered for wifi, but nothing
+    # previously exercised it for BLE specifically - a real, named gap
+    # noted (not fixed) in this feature's own final review. `_BleAsyncReader`
+    # closes over the module-global `_queue` (not a per-connection object
+    # the way wifi's per-socket StreamReader is), which the final review
+    # flagged as a slightly different-shaped hazard: a stale reader task
+    # surviving a reconnect wouldn't just inflate a counter, it would race
+    # the live session's reader for `_queue.pop(0)` and silently steal
+    # frames. Sampling `get_tick_total()` via a real RPC call after each
+    # reconnect (not just comparing raw counters) means a corrupted/hung
+    # session would show up as this test hanging or asserting garbage, not
+    # just a wrong number - the same class of evidence a stale-reader race
+    # would actually produce.
+    from ble_fakes import combine_boot_py_with_driver
+
+    from tether.marshalling import encode_frame
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+
+    sliced_source = """\
+import mcu_decorators as _test_mod
+
+if not hasattr(_test_mod, "_tick_total"):
+    _test_mod._tick_total = 0
+
+
+@mcu.loop(interval_ms=20)
+def tick():
+    _test_mod._tick_total += 1
+
+
+@mcu.export
+def get_tick_total() -> int:
+    return _test_mod._tick_total
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    def _session_driver(req_id: int) -> str:
+        handshake = encode_frame(1, {"id": req_id, "name": "__tether_handshake__", "args": []})
+        get_ticks = encode_frame(1, {"id": req_id + 1, "name": "get_tick_total", "args": []})
+        return f"""
+_c = Central(_ble)
+_c.connect()
+print("session ack:", _c.send_preamble("run", None))
+
+def _read_result():
+    _len = int.from_bytes(_c.recv_exact(4), "big")
+    _body = _c.recv_exact(_len)
+    return _body[:1], umsgpack.loads(_body[1:])
+
+_c.write({handshake!r})
+_t1, _p1 = _read_result()
+print("session handshake:", _t1, _p1)
+
+time.sleep_ms(300)
+
+_c.write({get_ticks!r})
+_t2, _p2 = _read_result()
+print("session total:", _p2["value"])
+
+_c.disconnect()
+time.sleep_ms(300)  # let boot.py's own bounded disconnect-wait finish and re-advertise
+"""
+
+    driver = f"""
+import bluetooth
+import umsgpack
+
+_ble = bluetooth.BLE()
+
+{_session_driver(1)}
+{_session_driver(3)}
+{_session_driver(5)}
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py,
+        driver,
+        files={"/tether_ble.json": "{}", "/tether_app.py": tether_app_source},
+    )
+    out = run_micropython(combined, timeout=20.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert out.count("session ack: {'ok': True}") == 3, out
+
+    totals = [
+        int(line.split("session total:")[1].strip())
+        for line in out.splitlines()
+        if "session total:" in line
+    ]
+    assert len(totals) == 3, out
+
+    first, second, third = totals
+    delta1 = first
+    delta2 = second - first
+    delta3 = third - second
+
+    # Sanity: ticks actually fired every session (not zero - a different
+    # bug this test isn't about).
+    assert delta1 > 0, totals
+    assert delta2 > 0, totals
+    assert delta3 > 0, totals
+
+    # The real check: an accumulating-duplicate-task regression would show
+    # delta2 ~= 2x delta1 and delta3 ~= 3x delta1 (matches the exact
+    # signature the wifi headline bug produced: 14/29/44, i.e. deltas
+    # roughly 1x/2x/3x). 1.6x separates "roughly constant plus scheduling
+    # jitter" from "accumulating an extra duplicate task" without being so
+    # tight that timing jitter alone could trip it - same tolerance wifi's
+    # own regression test uses.
+    assert delta2 < delta1 * 1.6, (
+        f"BLE @mcu.loop tick count is accumulating across reconnects: "
+        f"deltas were {delta1}, {delta2}, {delta3} (totals {totals})"
+    )
+    assert delta3 < delta1 * 1.6, (
+        f"BLE @mcu.loop tick count is accumulating across reconnects: "
+        f"deltas were {delta1}, {delta2}, {delta3} (totals {totals})"
+    )
+
+
 def test_generate_ble_boot_produces_boot_py_and_config():
     files = generate_ble_boot()
 
@@ -2056,6 +2182,42 @@ def test_ble_advertising_payload_is_a_legal_gap_payload():
         offset += 1 + length
     assert offset == len(_BLE_ADV_PAYLOAD)
     assert ad_types == [0x01, 0x09, 0x07]  # flags, complete local name, 128-bit UUIDs
+
+
+@requires_micropython
+def test_ble_boot_sets_gap_name_to_match_the_advertised_local_name():
+    # Real-hardware finding: MicroPython's bluetooth module has its own
+    # default gap_name ("MPY ESP32") independent of _BLE_ADV_PAYLOAD's
+    # custom advertising local name - left unset, the standard Generic
+    # Access GATT service's Device Name characteristic (which every BLE
+    # peripheral exposes automatically) disagrees with the live
+    # advertisement, and some OS Bluetooth stacks report one or the other
+    # depending on what they've cached, not consistently the live ad.
+    # Confirmed directly against real hardware: `bluetooth.BLE().config
+    # ("gap_name")` returned b'MPY ESP32' before this fix, unprompted by
+    # any code in this project.
+    from ble_fakes import FAKE_BLUETOOTH_MODULE_SRC, FAKE_FS_SRC
+    from mpy_runner import run_micropython
+
+    boot_py = generate_ble_boot(danger_unauthenticated=True)["/boot.py"].decode()
+    # Same "run setup only, stop before the infinite session loop" idea as
+    # the setup-succeeds check elsewhere in this file - gap_name is set
+    # once, early, well before the loop.
+    idx = boot_py.index("    while True:\n        # Re-establish")
+    setup_src = boot_py[:idx]
+
+    script = f"""
+{FAKE_BLUETOOTH_MODULE_SRC}
+
+_files = {{"/tether_ble.json": "{{}}"}}
+
+{FAKE_FS_SRC}
+
+{setup_src}
+    print("gap_name:", _ble.config("gap_name"))
+"""
+    out = run_micropython(script, timeout=8.0)
+    assert "gap_name: tether" in out, out
 
 
 @requires_micropython

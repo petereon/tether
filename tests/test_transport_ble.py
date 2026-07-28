@@ -48,6 +48,24 @@ def test_write_splits_a_payload_larger_than_the_mtu_into_multiple_gatt_writes():
     assert client.writes == [b"x" * 20, b"x" * 20, b"x" * 5]
 
 
+def test_write_raises_oserror_on_timeout_instead_of_hanging_forever():
+    # A peripheral that stops acknowledging ATT writes mid-exchange (gone
+    # out of range, wedged) must not hang this call - and, transitively,
+    # whatever process called it - forever. Regression test: write() used
+    # to have no timeout parameter at all, silently blocking on
+    # Future.result() with no bound, unlike read()'s already-bounded
+    # contract.
+    class _HangingBleakClient(_FakeBleakClient):
+        async def write_gatt_char(self, char_uuid: str, data: bytes, response: bool = True) -> None:
+            await asyncio.sleep(999)
+
+    client = _HangingBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+
+    with pytest.raises(OSError, match="timed out"):
+        stream.write(b"hello", timeout=0.2)
+
+
 def test_on_notify_delivers_the_bytes_through_read():
     client = _FakeBleakClient()
     stream = BleStream(client, _running_loop(), _WRITE_CHAR)

@@ -1653,18 +1653,16 @@ be new scope beyond a verification pass):
   missing secret), `--danger-unauthenticated`, and the wifi/BLE
   boot.py-conflict warning (both directions) — were all run against a
   real ESP32. Serial (`examples/blink_and_log/blink_and_log.py`) confirmed
-  completely unaffected throughout. Two real, non-blocking findings
-  surfaced only by hardware, not fixed in this chunk since they're
-  platform/cosmetic, not code defects: macOS's CoreBluetooth hides real
+  completely unaffected throughout. One real, non-blocking finding
+  surfaced only by hardware, not fixed in this chunk since it's a macOS
+  platform behavior, not a code defect: macOS's CoreBluetooth hides real
   BLE MAC addresses from apps for privacy, exposing a randomized per-app
   UUID instead — `mcu.connect("ble:<addr>")` on macOS needs that UUID
   (from a scan), not the MAC `provision ble` prints (correct and usable
-  as-is on Linux/BlueZ); and the advertised device name was observed once
-  showing MicroPython's own default GATT device name ("MPY ESP32")
-  instead of this project's advertised local name ("tether") in a scan,
-  believed to be CoreBluetooth reporting a cached GATT read from an
-  earlier connection rather than the live advertisement — address/UUID-
-  based connection was unaffected.
+  as-is on Linux/BlueZ). A second finding (the advertised device name
+  showing MicroPython's own default GATT device name, "MPY ESP32",
+  instead of this project's "tether" in a scan) was root-caused and fixed
+  the same day — see the 2026-07-28 addendum below.
 
   Documentation sweep (this same review pass): `docs/DESIGN.md` (§
   Architecture overview step 5, § Transports' BLE row), `CLAUDE.md` (the
@@ -1675,6 +1673,61 @@ be new scope beyond a verification pass):
 
   278 tests passing (was 268 immediately before the final review's fixes;
   +10, one per finding above).
+
+**Addendum (2026-07-28) — follow-up fixes from a post-merge gap review.**
+Reviewing chunk 20/21's own accepted limitations and parked findings
+surfaced four worth acting on immediately rather than leaving parked:
+
+1. **`unprovision-wifi`/`unprovision-ble` asymmetry removed.** A board
+   only ever runs one transport's `boot.py` at a time (the mutual-
+   exclusivity design chunk 21 already established), so there was no
+   real reason to unprovision one transport but not the other. `tether
+   unprovision-wifi`/`unprovision-ble` collapse into a single `tether
+   unprovision`, which removes whichever of `/tether_wifi.json`/
+   `/tether_ble.json` are actually present (checked via `read_file`
+   first, so the confirmation prompt and final message are accurate
+   about what's really being removed - not a blind "removed everything"
+   claim).
+2. **`BleStream.write()` gains the same timeout `read()` already had.**
+   The final review's F1 fix (chunk 21) bounded reads; writes were left
+   with `Future.result()`'s default unbounded wait - a peripheral that
+   stops acknowledging ATT writes mid-exchange could still hang the
+   whole process forever, on the write side specifically. Same fix
+   shape: `concurrent.futures.TimeoutError` caught and converted to
+   `OSError`, matching the read-side contract; `BleControlChannel`
+   threads its existing `timeout` through both directions now.
+3. **BLE gets its own `@mcu.loop`-duplication-across-reconnects
+   regression test**, mirroring wifi's own headline test
+   (`test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects`).
+   This was a real, named gap in chunk 21's final review (verified once,
+   manually, on real hardware, but nothing automated). Reconnects three
+   times via the existing `Central` test helper, samples
+   `get_tick_total()` via a real RPC call after each session (not just a
+   raw counter comparison - a stale reader task racing the live session
+   for frames, the specific hazard the final review flagged as
+   BLE-specific, would show up as a hung/wrong RPC result here, not just
+   an inflated count). Mutation-verified: reverting the underlying fix
+   reproduces the exact 1x/2x/3x accumulating signature (15/46/93,
+   deltas 15/31/47) chunk 20's own wifi bug had.
+4. **The advertised-BLE-name discrepancy (chunk 21's parked finding) was
+   root-caused, not just left as a shrug.** Confirmed directly against
+   real hardware: MicroPython's `bluetooth` module has its own built-in
+   default `gap_name` ("MPY ESP32"), entirely independent of this
+   project's custom advertising payload's local name ("tether") -
+   nothing in `tether`'s code had ever set it. Fixed with one call,
+   `_ble.config(gap_name="tether")`, right after `_ble.active(True)`.
+   Verified fixed at the source (reading `gap_name` from inside the
+   actual running boot.py setup code, not a fresh disconnected session,
+   now returns `b'tether'`). One residual, non-fixable-from-here
+   artifact found during verification: a bleak scan on this dev machine
+   still occasionally reports "MPY ESP32" for a device it has scanned
+   many times before - traced to CoreBluetooth not even exposing the
+   standard Generic Access service via `client.services` (a documented
+   Apple platform behavior; the OS manages device-name display
+   internally and can lag a real device's current `gap_name` behind its
+   own cache) - not something more code on tether's side can control.
+
+  4 new/changed test files, 283 tests passing (was 278).
 
 ---
 
