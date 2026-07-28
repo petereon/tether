@@ -611,6 +611,7 @@ _conn_handle = [None]
 _mtu = [23]  # BLE's default, pre-negotiation
 _queue = []
 
+
 def _bt_irq(_event, _data):
     if _event == _IRQ_CENTRAL_CONNECT:
         _conn_handle[0] = _data[0]
@@ -653,7 +654,9 @@ while True:
                 _send_json_frame(_conn, {"ok": True})
                 _handle_run(
                     _conn,
-                    lambda _c: _ble_make_streams((_ble, _conn_handle[0], _notify_handle, _mtu[0], _queue, _leftover)),
+                    lambda _c: _ble_make_streams(
+                        (_ble, _conn_handle[0], _notify_handle, _mtu[0], _queue, _leftover)
+                    ),
                 )
                 break
             else:
@@ -758,7 +761,9 @@ _sys.modules["bluetooth"] = _FakeBluetoothModule
 def test_fake_bluetooth_module_loads_and_simulates_connect_write_notify():
     from mpy_runner import run_micropython
 
-    script = FAKE_BLUETOOTH_MODULE_SRC + """
+    script = (
+        FAKE_BLUETOOTH_MODULE_SRC
+        + """
 import bluetooth
 _ble = bluetooth.BLE()
 _ble.active(True)
@@ -768,6 +773,7 @@ _ble._simulate_write(0, 101, b"hello")
 _ble.gatts_notify(0, 100, b"world")
 print("notifications:", _ble.notifications)
 """
+    )
     out = run_micropython(script)
     assert "irq 1" in out
     assert "irq 3" in out
@@ -1161,13 +1167,13 @@ def test_connect_ble_uploads_when_hash_differs_then_runs_over_one_connection():
     from tether.connection import _connect_ble
     from tether.slicer import slice_mcu_bound
 
-    source = '''
+    source = """
 from tether import mcu
 
 @mcu.export
 def add(a: int, b: int) -> int:
     return a + b
-'''
+"""
     sliced = slice_mcu_bound(source, base_dir=Path("."))
     bootstrap = generate_bootstrap(sliced.source, "")
 
@@ -1531,7 +1537,15 @@ def test_provision_wifi_warns_if_ble_already_provisioned(monkeypatch):
 
     result = CliRunner().invoke(
         main,
-        ["provision-wifi", "--port", "/dev/ttyUSB0", "--ssid", "MyNetwork", "--password", "hunter2"],
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
     )
 
     assert result.exit_code == 0, result.output
@@ -1688,7 +1702,7 @@ def provision_ble_command(port: str | None, danger_unauthenticated: bool) -> Non
         serial_transport.reset_board(ser)
         addr_stdout, _ = serial_transport.run_python(
             ser,
-            b'import bluetooth\nb=bluetooth.BLE()\nb.active(True)\n'
+            b"import bluetooth\nb=bluetooth.BLE()\nb.active(True)\n"
             b'print(":".join("{:02x}".format(x) for x in b.config("mac")[1]))\n',
             timeout=5.0,
         )
@@ -1716,10 +1730,18 @@ _check_other_transport_provisioned(ser, "/tether_ble.json", "BLE")
 Add the two new options, and — before the existing `if ip:` block — an analogous `if ble_addr:` block using `ble_transport`/`BleControlChannel`:
 
 ```python
-@click.option("--ble-addr", default=None, help="Device BLE address (if known) - tried first, over BLE, before falling back to serial.")
+@click.option(
+    "--ble-addr",
+    default=None,
+    help="Device BLE address (if known) - tried first, over BLE, before falling back to serial.",
+)
 @click.option("--ble-secret", default=None, help="BLE shared secret, if the device requires one.")
 def status_command(
-    port: str | None, ip: str | None, secret: str | None, ble_addr: str | None, ble_secret: str | None
+    port: str | None,
+    ip: str | None,
+    secret: str | None,
+    ble_addr: str | None,
+    ble_secret: str | None,
 ) -> None:
     # existing --port/--ip/--secret click.option decorators and the
     # docstring stay exactly as they are today - only the two new options
