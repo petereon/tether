@@ -12,12 +12,12 @@ side exactly like a local function call — `tether` figures out which parts
 of the file belong on the MCU, uploads just that code, and handles framing,
 serialization, and routing calls over the wire.
 
-Targets ESP32 and similar MicroPython-capable boards. Serial and wifi (via
-the `tether` CLI's provisioning step) both work against real hardware
-today, including `mcu.connect("wifi:<ip>")` itself — a full PC-to-MCU call,
-an MCU-to-PC reverse call, and remote-exception propagation were all
-verified end-to-end against a real ESP32. BLE is planned but not yet usable
-against a real device — see Transports below.
+Targets ESP32 and similar MicroPython-capable boards. Serial, wifi, and BLE
+(via the `tether` CLI's provisioning step) all work against real hardware
+today, including `mcu.connect("wifi:<ip>")`/`mcu.connect("ble:<addr>")`
+themselves — a full PC-to-MCU call, an MCU-to-PC reverse call, and
+remote-exception propagation were all verified end-to-end against a real
+ESP32 over each transport. See Transports below.
 
 ## How it works
 
@@ -83,9 +83,9 @@ at once (`with board:` scopes which one is ambient for a block).
 
 | Transport | Address | Notes |
 |---|---|---|
-| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. Pushes code over MicroPython's raw REPL — the only transport that works on a completely unprovisioned board (wifi needs `tether provision-wifi` first; see below). |
+| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. Pushes code over MicroPython's raw REPL — the only transport that works on a completely unprovisioned board (wifi/BLE need `tether provision-wifi`/`tether provision-ble` first; see below). |
 | Wifi | `"wifi:<ip>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with the `tether` CLI (`tether provision-wifi`, see below). **Now pushes code automatically** — `mcu.connect("wifi:<ip>")` slices, hash-checks, and uploads (if needed) before running, the same as serial does, no prior serial session required. **Authenticated by default** — every connection needs a shared secret (`tether provision-wifi` generates and prints one; pass it via `mcu.connect(secret=...)` or the `TETHER_WIFI_SECRET` env var) unless the board was provisioned with `--danger-unauthenticated`. `tether status --ip <ip>` is now fast and non-destructive (no reset). `board.reconnect()` now works over wifi too — sequential only, one connection at a time. Both the CLI (`provision-wifi`/`status`/`unprovision-wifi`) and an actual `mcu.connect("wifi:<ip>")` session — a PC-to-MCU call, an MCU-to-PC reverse call, and remote-exception propagation — were run end-to-end against a real board. Credentials and the shared secret are both stored in plaintext on-device (`/tether_wifi.json`) — the only realistic option on this hardware class, no secure storage exists. See "WiFi provisioning CLI" below for the full picture. |
-| BLE | `"ble:<addr>"` | **Not usable against a real device yet**, same reason as wifi used to be — no on-device BLE listener exists. Planned. |
+| BLE | `"ble:<addr>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with `tether provision-ble`. Same code-push/auth/status model as wifi (shared secret, `--danger-unauthenticated`, `tether status --ble-addr <addr>`), but reuses **one** BLE connection across status/upload/run instead of opening a fresh one per mode — connection setup is comparatively expensive over BLE. Wifi and BLE are mutually exclusive on one board (provisioning one warns before overwriting the other's `boot.py` — a board only auto-runs one at a time). **macOS note:** CoreBluetooth hides real BLE MAC addresses from apps for privacy; `mcu.connect("ble:<addr>")` on macOS needs the randomized UUID a BLE scan reports, not the MAC `tether provision-ble` prints (which is correct and usable as-is on Linux/BlueZ). |
 
 ## Walkthrough: blink an LED
 
@@ -116,7 +116,7 @@ The example hardcodes `Pin(2, Pin.OUT)` — pin 2 is the common onboard LED
 pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
-## WiFi provisioning CLI
+## WiFi & BLE provisioning CLI
 
 Install the `tether[cli]` extra to get the `tether` console script:
 
@@ -127,7 +127,8 @@ uv pip install -e ".[cli]"
 ```
 tether devices                                       # list connected boards
 tether provision-wifi --ssid SSID [--password PW]     # upload boot.py + credentials + a secret
-tether status [--ip IP] [--secret SECRET]              # check provisioned/connected state
+tether provision-ble [--danger-unauthenticated]       # upload boot.py + a secret, advertises the board
+tether status [--ip IP] [--secret S] [--ble-addr A] [--ble-secret S]  # check provisioned/connected state
 tether unprovision-wifi                               # remove stored credentials
 ```
 
@@ -192,6 +193,33 @@ prerequisite for connecting over wifi.
 still sequential-only, one connection at a time, so you can't check
 `status` while a `run` session is actively live, only in between.
 
+### BLE
+
+`tether provision-ble [--danger-unauthenticated]` is the BLE equivalent of
+`provision-wifi` — no network credentials needed (BLE just advertises),
+but everything else matches: a fresh shared secret generated and printed
+by default (`mcu.connect(secret=...)` or `TETHER_BLE_SECRET` env var;
+`tether.WifiAuthError` on a bad/missing one, reused as-is for BLE — same
+exception class, both transports), `tether status --ble-addr <addr>
+[--ble-secret ...]` as the fast non-destructive path, and full code push
+(`mcu.connect("ble:<addr>")` slices/hash-checks/uploads exactly like wifi).
+
+**One real difference from wifi:** BLE connection setup is comparatively
+expensive, so `status`/`upload`/`run` all reuse a **single** BLE
+connection instead of wifi's one-connection-per-mode — only `run`
+finishing, an auth failure, or an unrecognized mode ends the session.
+
+**Wifi and BLE are mutually exclusive on one board** — MicroPython only
+auto-runs one `/boot.py`, so provisioning one warns (doesn't block) before
+overwriting the other's; the other's credentials file is left in place but
+nothing reads it anymore.
+
+**macOS-specific:** CoreBluetooth hides a device's real BLE MAC address
+from apps for privacy, exposing a randomized per-app UUID instead.
+`provision-ble` prints the board's real MAC (correct and directly usable
+on Linux/BlueZ) — on macOS, get the UUID to connect with from a BLE scan
+(e.g. `bleak.BleakScanner.discover()`) instead.
+
 ## Status
 
 Core functionality (slicing, the wire protocol, dispatch, multi-board and
@@ -210,7 +238,15 @@ the full picture and wifi's remaining, accepted limitations (sequential
 connections only, plaintext credentials/secret on-device, no
 TLS/challenge-response auth).
 
-BLE is PC-side client code only, covered by automated tests (a fake
-matching the BLE library's API) — there is currently no on-device BLE
-listener to connect to, so it doesn't work against a real board yet. See
-`docs/DESIGN.md` for the full architecture.
+BLE now works against real hardware end-to-end too, including code push,
+shared-secret auth, non-interrupting status, and reconnect:
+`tether provision-ble` and `tether status --ble-addr` were run against a
+real ESP32, and a real `mcu.connect("ble:<addr>")` session was verified —
+upload+run, script-edit propagation, `board.reconnect()` three times in a
+row with no physical reset (`@mcu.loop` tasks confirmed not to accumulate),
+auth rejection, and `--danger-unauthenticated`. Unlike wifi, BLE reuses one
+physical connection across status/upload/run rather than opening a fresh
+one per mode. See the Transports table above and `docs/DESIGN.md` for the
+full architecture and BLE's remaining, accepted limitations (sequential
+connections only, plaintext shared secret, no BLE pairing/bonding, no
+concurrent wifi+BLE on one board).
