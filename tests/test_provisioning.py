@@ -1975,6 +1975,7 @@ print("ticks_while_idle:", _payload2["value"])
     assert ticks >= 5, f"@mcu.loop starved during a live BLE run session: {ticks} ticks\n{out}"
 
 
+@requires_micropython
 def test_ble_boot_run_mode_does_not_accumulate_loop_tasks_across_reconnects():
     # BLE's own version of the wifi headline regression test
     # (test_boot_py_run_mode_does_not_accumulate_loop_tasks_across_reconnects,
