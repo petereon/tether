@@ -384,8 +384,10 @@ def test_status_command_reports_connected_with_ip(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "192.168.1.42" in result.output
-    assert calls == ["reset", "run_python"], (
-        "status must reset the board (known state) before running the status check script"
+    assert calls == ["reset", "run_python", "reset"], (
+        "status must reset the board (known state) before running the status check script, "
+        "and reset it again afterward to resume whatever was interrupted (e.g. a wifi/BLE "
+        "boot.py's accept-loop) - see status_command's own docstring"
     )
 
 
@@ -464,7 +466,8 @@ def test_unprovision_reports_nothing_to_do_when_neither_present(monkeypatch):
 
 def test_unprovision_does_nothing_without_confirmation(monkeypatch):
     _patch_fake_serial(monkeypatch)
-    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    calls = []
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
     monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: b"{}")
     monkeypatch.setattr("beaupy.confirm", lambda question: False)
 
@@ -479,6 +482,14 @@ def test_unprovision_does_nothing_without_confirmation(monkeypatch):
     assert result.exit_code == 0, result.output
     assert "called" not in removed
     assert "cancelled" in result.output.lower()
+    # Regression: the reset_board() at the top of this command already
+    # interrupted whatever was running (a wifi/BLE boot.py's accept-loop,
+    # on a provisioned board) before the user even answered the confirm
+    # prompt - a cancelled unprovision must reset the board again to
+    # resume it, or "no" would silently kill a working listener despite
+    # changing nothing on-device. See status_command's own docstring for
+    # the same trap in a sibling command.
+    assert calls == ["reset", "reset"], calls
 
 
 def test_status_command_reports_not_provisioned(monkeypatch):

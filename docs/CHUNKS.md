@@ -1842,6 +1842,40 @@ never touches serial) is the way to check status without this risk.
   `tests/test_provisioning.py`) plus 2 new example files, 295 tests
   passing (was 284).
 
+**Addendum (2026-07-28) — actually fixed `tether status`'s
+listener-killing side effect, not just documented it.**
+
+The previous addendum's "wifi seems flaky" finding was left as a
+documented trap, not a fix. Fixed properly: `status_command`'s raw-REPL
+fallback (used whenever `--ip`/`--ble-addr` aren't given, or fail) now
+resets the board a SECOND time after running `STATUS_SCRIPT`, restoring
+whatever was running before the diagnostic interrupted it - most
+importantly, a wifi/BLE `boot.py`'s accept-loop, which does not resume on
+its own once Ctrl-C'd. Wrapped in `try`/`finally` so this happens even if
+the diagnostic itself raises. `tether unprovision`'s cancel path (`beaupy.
+confirm` returns `False`) had the identical bug for a different reason -
+its own leading `reset_board()` (needed to read `/tether_wifi.json`/
+`/tether_ble.json` to decide what to prompt about) already interrupted a
+live listener before the user even answered "no" - fixed the same way:
+reset again before reporting "Cancelled." so declining to unprovision is
+a genuine no-op.
+
+Verified against real ESP32 hardware: a wifi listener now survives a bare
+`tether status` call, and several in a row, with no manual recovery
+needed - confirmed by running `examples/wifi_blink/` immediately
+afterward each time. One real, expected (not a bug) side effect found
+during that verification: a connection attempted *immediately* after
+`tether status` returns can hit a brief window (observed: several
+seconds) where the board is still rejoining wifi from the reset, same as
+right after any boot - documented in `status_command`'s own docstring
+rather than papered over with a fixed sleep, since `mcu.connect()`'s own
+timeout already handles this correctly.
+
+  1 changed file (`cli.py`) plus 2 updated tests, 295 tests passing (no
+  new tests needed - the existing exact-call-sequence assertions on
+  `reset_board()` already catch a regression here once updated for the
+  new sequence).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
