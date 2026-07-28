@@ -107,6 +107,7 @@ def test_provision_wifi_uploads_boot_py_and_config(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     def fake_write_files(ser, files, **kwargs):
         calls.append("write")
@@ -146,6 +147,7 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
 
     monkeypatch.setattr("serial.Serial", _FakeSerial)
     monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
 
     written = {}
 
@@ -171,6 +173,187 @@ def test_provision_wifi_prompts_for_password_when_omitted(monkeypatch):
     # The prompted value must actually be the one written to the device -
     # not just that beaupy.prompt was called with the right arguments.
     assert b"prompted-password" in written["/tether_wifi.json"]
+
+
+def test_provision_wifi_prints_the_generated_secret(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(written["/tether_wifi.json"])
+    assert config["secret"] in result.output
+
+
+def test_provision_wifi_danger_unauthenticated_omits_secret_and_warns(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+            "--danger-unauthenticated",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    config = json.loads(written["/tether_wifi.json"])
+    assert "secret" not in config
+    assert "unauthenticated" in result.output.lower()
+
+
+def test_status_command_tries_wifi_socket_first(monkeypatch):
+    # When the wifi socket answers, status must use it directly - no
+    # reset_board() call at all (that's the whole point of this feature).
+    calls = []
+
+    class _FakeSocket:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_send_preamble(sock, mode, secret):
+        calls.append(("preamble", mode))
+
+    def fake_read_json_frame(sock):
+        calls.append(("status_payload",))
+        return {
+            "protocol_version": 1,
+            "tether_app_hash": "abc123",
+            "free_heap": 50000,
+            "uptime_ms": 1234,
+            "ip": "192.168.1.50",
+        }
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **kw: _FakeSocket())
+    monkeypatch.setattr("tether.transports.wifi.send_preamble", fake_send_preamble)
+    monkeypatch.setattr("tether.transports.wifi.read_json_frame", fake_read_json_frame)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board",
+        lambda ser: calls.append(("reset_board",)),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "192.168.1.50"])
+
+    assert result.exit_code == 0, result.output
+    assert "192.168.1.50" in result.output
+    assert ("reset_board",) not in calls
+
+
+def test_status_command_falls_back_to_raw_repl_when_wifi_socket_unreachable(monkeypatch):
+    import json
+
+    def raise_connection_refused(*a, **kw):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("socket.create_connection", raise_connection_refused)
+
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    status = {"provisioned": True, "connected": False, "ip": None}
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (json.dumps(status).encode(), b""),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "10.0.0.5"])
+
+    assert result.exit_code == 0, result.output
+    assert "not currently connected" in result.output.lower()
+
+
+def test_status_command_wifi_auth_failure_gives_clean_error_no_fallback(monkeypatch):
+    # A wrong/missing shared secret must produce a clear, user-facing
+    # click.ClickException - not an unhandled traceback, and not a silent
+    # fallback to the raw-REPL path (that would reset a perfectly healthy
+    # board just because the wrong secret was supplied).
+    from tether.errors import WifiAuthError
+
+    calls = []
+
+    class _FakeSocket:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_send_preamble(sock, mode, secret):
+        raise WifiAuthError("auth failed")
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **kw: _FakeSocket())
+    monkeypatch.setattr("tether.transports.wifi.send_preamble", fake_send_preamble)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board",
+        lambda ser: calls.append(("reset_board",)),
+    )
+
+    result = CliRunner().invoke(main, ["status", "--port", "/dev/ttyUSB0", "--ip", "192.168.1.50"])
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, (SystemExit, click.ClickException))
+    assert "192.168.1.50" in result.output
+    assert "secret" in result.output.lower()
+    assert ("reset_board",) not in calls
 
 
 def test_status_command_reports_connected_with_ip(monkeypatch):
@@ -271,3 +454,220 @@ def test_status_command_reports_not_provisioned(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert "not provisioned" in result.output.lower()
+
+
+def _patch_fake_serial(monkeypatch):
+    class _FakeSerial:
+        def __init__(self, port, baudrate, timeout):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("serial.Serial", _FakeSerial)
+
+
+def test_provision_ble_generates_secret_and_prints_address(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    calls = []
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: calls.append("reset"))
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+
+    written = {}
+
+    def fake_write_files(ser, files, **kwargs):
+        calls.append("write")
+        written.update(files)
+
+    monkeypatch.setattr("tether.transports.serial.write_files", fake_write_files)
+
+    def fake_run_python(ser, code, timeout=5.0):
+        calls.append("run_python")
+        return (b"aa:bb:cc:dd:ee:ff\n", b"")
+
+    monkeypatch.setattr("tether.transports.serial.run_python", fake_run_python)
+
+    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert set(written.keys()) == {"/boot.py", "/tether_ble.json"}
+    assert "Shared secret" in result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    # Final-review finding (F2). run_python enters the raw REPL via a Ctrl-C
+    # interrupt, which kills whatever boot.py is running - so the MAC read
+    # must happen BEFORE the final reset, leaving reset_board the last
+    # serial operation exactly as provision-wifi does. Reversed (the
+    # original order) the board is left advertising with nothing servicing
+    # its BLE session loop, and every later connect attempt hangs until a
+    # physical power cycle.
+    assert calls == ["reset", "write", "run_python", "reset"], (
+        "provision-ble must reset before write (known state) and reset LAST, "
+        "after every raw-REPL operation, so the new boot.py is left running"
+    )
+
+
+def test_provision_ble_warns_if_wifi_already_provisioned(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+
+    def fake_read_file(ser, path, timeout=10.0):
+        return b'{"ssid": "x", "password": "y"}' if path == "/tether_wifi.json" else None
+
+    monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
+
+    result = CliRunner().invoke(main, ["provision-ble", "--port", "/dev/ttyUSB0"])
+
+    assert result.exit_code == 0, result.output
+    assert "overwrite" in result.output.lower()
+    assert "wifi" in result.output.lower()
+
+
+def test_provision_wifi_warns_if_ble_already_provisioned(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+
+    def fake_read_file(ser, path, timeout=10.0):
+        return b'{"secret": "x"}' if path == "/tether_ble.json" else None
+
+    monkeypatch.setattr("tether.transports.serial.read_file", fake_read_file)
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "provision-wifi",
+            "--port",
+            "/dev/ttyUSB0",
+            "--ssid",
+            "MyNetwork",
+            "--password",
+            "hunter2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "overwrite" in result.output.lower()
+    assert "ble" in result.output.lower()
+
+
+def test_provision_ble_danger_unauthenticated_prints_no_secret(monkeypatch):
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+    monkeypatch.setattr("tether.transports.serial.write_files", lambda ser, files, **kw: None)
+    monkeypatch.setattr("tether.transports.serial.read_file", lambda ser, path, timeout=10.0: None)
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=5.0: (b"aa:bb:cc:dd:ee:ff\n", b""),
+    )
+
+    result = CliRunner().invoke(
+        main, ["provision-ble", "--port", "/dev/ttyUSB0", "--danger-unauthenticated"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Shared secret" not in result.output
+    assert "WARNING" in result.output
+
+
+def test_status_ble_addr_tries_ble_first_non_destructively(monkeypatch):
+    calls = []
+
+    class _FakeStream:
+        def close(self):
+            calls.append(("close",))
+
+    class _FakeChannel:
+        def __init__(self, stream, *, timeout=None):
+            # Final-review finding (F1): status must bound its BLE reads -
+            # a board that connects but never answers used to hang here.
+            calls.append(("channel_timeout", timeout))
+
+        def send_preamble(self, mode, secret):
+            calls.append(("preamble", mode))
+
+        def read_json_frame(self):
+            return {
+                "protocol_version": 1,
+                "tether_app_hash": "abc123",
+                "free_heap": 50000,
+                "uptime_ms": 1234,
+                "ip": "aa:bb:cc:dd:ee:ff",
+            }
+
+    monkeypatch.setattr("tether.transports.ble.connect", lambda addr, timeout=5.0: _FakeStream())
+    monkeypatch.setattr("tether.transports.ble.BleControlChannel", _FakeChannel)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board", lambda ser: calls.append(("reset_board",))
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--ble-addr", "AA:BB:CC:DD:EE:FF", "--ble-secret", "s3cr3t"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    assert ("reset_board",) not in calls
+    timeouts = [call[1] for call in calls if call[0] == "channel_timeout"]
+    assert timeouts and all(t is not None for t in timeouts), calls
+
+
+def test_status_ble_addr_falls_back_to_serial_when_ble_unreachable(monkeypatch):
+    def raise_unreachable(addr, timeout=5.0):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("tether.transports.ble.connect", raise_unreachable)
+
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr("tether.transports.serial.reset_board", lambda ser: None)
+
+    status = {"provisioned": True, "connected": False, "ip": None}
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (json.dumps(status).encode(), b""),
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--port", "/dev/ttyUSB0", "--ble-addr", "AA:BB:CC:DD:EE:FF"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "not currently connected" in result.output.lower()
+
+
+def test_status_ble_addr_without_bleak_installed_fails_loud_without_resetting(monkeypatch):
+    # Final-review finding (F9). `bleak` is an optional extra (tether[ble]).
+    # Its ModuleNotFoundError used to be swallowed by the same
+    # `except Exception` that means "device unreachable, fall back to
+    # serial" - so a missing dependency silently took the destructive
+    # raw-REPL path, hardware-resetting the board. Avoiding exactly that
+    # reset is why the two-tier BLE/serial status design exists.
+    calls = []
+
+    def raise_missing_bleak(addr, timeout=5.0):
+        raise ModuleNotFoundError("No module named 'bleak'")
+
+    monkeypatch.setattr("tether.transports.ble.connect", raise_missing_bleak)
+    _patch_fake_serial(monkeypatch)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board", lambda ser: calls.append("reset_board")
+    )
+    monkeypatch.setattr(
+        "tether.transports.serial.run_python",
+        lambda ser, code, timeout=10.0: (
+            b'{"provisioned": true, "connected": false, "ip": null}',
+            b"",
+        ),
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--port", "/dev/ttyUSB0", "--ble-addr", "AA:BB:CC:DD:EE:FF"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "tether[ble]" in result.output
+    assert calls == [], "a missing optional dependency must never reset the board"

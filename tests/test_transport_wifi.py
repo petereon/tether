@@ -3,7 +3,16 @@ import threading
 
 import pytest
 
-from tether.transports.wifi import WifiStream, connect
+from tether.errors import WifiAuthError
+from tether.transports.wifi import (
+    WifiStream,
+    connect,
+    read_bytes_frame,
+    read_json_frame,
+    send_bytes_frame,
+    send_json_frame,
+    send_preamble,
+)
 
 
 def test_wifi_stream_write_sends_bytes_and_read_receives_them():
@@ -79,3 +88,51 @@ def test_connect_raises_when_nothing_is_listening_on_the_port():
 
     with pytest.raises(OSError):
         connect("127.0.0.1", port, timeout=2.0)
+
+
+def test_send_json_frame_and_read_json_frame_round_trip():
+    a, b = socket.socketpair()
+
+    send_json_frame(a, {"mode": "status", "secret": "abc123"})
+
+    assert read_json_frame(b) == {"mode": "status", "secret": "abc123"}
+
+
+def test_send_bytes_frame_and_read_bytes_frame_round_trip():
+    a, b = socket.socketpair()
+
+    send_bytes_frame(a, b"some raw content, not text")
+
+    assert read_bytes_frame(b) == b"some raw content, not text"
+
+
+def test_send_preamble_succeeds_when_device_acks():
+    a, b = socket.socketpair()
+
+    def fake_device():
+        preamble = read_json_frame(b)
+        assert preamble == {"mode": "status", "secret": "right-secret"}
+        send_json_frame(b, {"ok": True})
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    send_preamble(a, "status", "right-secret")  # must not raise
+
+    device_thread.join(timeout=2.0)
+
+
+def test_send_preamble_raises_wifi_auth_error_when_device_rejects():
+    a, b = socket.socketpair()
+
+    def fake_device():
+        read_json_frame(b)
+        send_json_frame(b, {"ok": False, "error": "auth failed"})
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    with pytest.raises(WifiAuthError, match="auth failed"):
+        send_preamble(a, "status", "wrong-secret")
+
+    device_thread.join(timeout=2.0)

@@ -12,12 +12,12 @@ side exactly like a local function call — `tether` figures out which parts
 of the file belong on the MCU, uploads just that code, and handles framing,
 serialization, and routing calls over the wire.
 
-Targets ESP32 and similar MicroPython-capable boards. Serial and wifi (via
-the `tether` CLI's provisioning step) both work against real hardware
-today, including `mcu.connect("wifi:<ip>")` itself — a full PC-to-MCU call,
-an MCU-to-PC reverse call, and remote-exception propagation were all
-verified end-to-end against a real ESP32. BLE is planned but not yet usable
-against a real device — see Transports below.
+Targets ESP32 and similar MicroPython-capable boards. Serial, wifi, and BLE
+(via the `tether` CLI's provisioning step) all work against real hardware
+today, including `mcu.connect("wifi:<ip>")`/`mcu.connect("ble:<addr>")`
+themselves — a full PC-to-MCU call, an MCU-to-PC reverse call, and
+remote-exception propagation were all verified end-to-end against a real
+ESP32 over each transport. See Transports below.
 
 ## How it works
 
@@ -83,9 +83,9 @@ at once (`with board:` scopes which one is ambient for a block).
 
 | Transport | Address | Notes |
 |---|---|---|
-| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. The only transport that can push code to the board (over MicroPython's raw REPL). |
-| Wifi | `"wifi:<ip>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with the `tether` CLI (`tether provision-wifi`, see below). Both the CLI (`provision-wifi`/`status`/`unprovision-wifi`) and an actual `mcu.connect("wifi:<ip>")` session — a PC-to-MCU call, an MCU-to-PC reverse call, and remote-exception propagation — were run end-to-end against a real board. Requires a `tether_app.py` already on the board from a prior serial `mcu.connect(...)` session (wifi never pushes code, only serial does — see the note in "WiFi provisioning CLI" below). A provisioned board opens an **unauthenticated** TCP listener on every boot and accepts exactly one connection per boot cycle — anyone on the same network can connect first; if the connection drops, the board does not re-listen and needs a physical reset or a fresh `tether provision-wifi` run. **Checking `tether status` also drops the current listener** (see "WiFi provisioning CLI" below) — don't check status right before connecting; connect directly after `provision-wifi` instead. Credentials are stored in plaintext on-device (`/tether_wifi.json`) — the only realistic option on this hardware class, no secure storage exists. |
-| BLE | `"ble:<addr>"` | **Not usable against a real device yet**, same reason as wifi used to be — no on-device BLE listener exists. Planned. |
+| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. Pushes code over MicroPython's raw REPL — the only transport that works on a completely unprovisioned board (wifi/BLE need `tether provision-wifi`/`tether provision-ble` first; see below). |
+| Wifi | `"wifi:<ip>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with the `tether` CLI (`tether provision-wifi`, see below). **Now pushes code automatically** — `mcu.connect("wifi:<ip>")` slices, hash-checks, and uploads (if needed) before running, the same as serial does, no prior serial session required. **Authenticated by default** — every connection needs a shared secret (`tether provision-wifi` generates and prints one; pass it via `mcu.connect(secret=...)` or the `TETHER_WIFI_SECRET` env var) unless the board was provisioned with `--danger-unauthenticated`. `tether status --ip <ip>` is now fast and non-destructive (no reset). `board.reconnect()` now works over wifi too — sequential only, one connection at a time. Both the CLI (`provision-wifi`/`status`/`unprovision-wifi`) and an actual `mcu.connect("wifi:<ip>")` session — a PC-to-MCU call, an MCU-to-PC reverse call, and remote-exception propagation — were run end-to-end against a real board. Credentials and the shared secret are both stored in plaintext on-device (`/tether_wifi.json`) — the only realistic option on this hardware class, no secure storage exists. See "WiFi provisioning CLI" below for the full picture. |
+| BLE | `"ble:<addr>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with `tether provision-ble`. Same code-push/auth/status model as wifi (shared secret, `--danger-unauthenticated`, `tether status --ble-addr <addr>`), but reuses **one** BLE connection across status/upload/run instead of opening a fresh one per mode — connection setup is comparatively expensive over BLE. Wifi and BLE are mutually exclusive on one board (provisioning one warns before overwriting the other's `boot.py` — a board only auto-runs one at a time). **macOS note:** CoreBluetooth hides real BLE MAC addresses from apps for privacy; `mcu.connect("ble:<addr>")` on macOS needs the randomized UUID a BLE scan reports, not the MAC `tether provision-ble` prints (which is correct and usable as-is on Linux/BlueZ). |
 
 ## Walkthrough: blink an LED
 
@@ -116,7 +116,7 @@ The example hardcodes `Pin(2, Pin.OUT)` — pin 2 is the common onboard LED
 pin on many ESP32 dev boards; check yours and adjust if it doesn't light
 up.
 
-## WiFi provisioning CLI
+## WiFi & BLE provisioning CLI
 
 Install the `tether[cli]` extra to get the `tether` console script:
 
@@ -125,10 +125,11 @@ uv pip install -e ".[cli]"
 ```
 
 ```
-tether devices                                     # list connected boards
-tether provision-wifi --ssid SSID [--password PW]   # upload boot.py + credentials
-tether status                                       # check provisioned/connected state
-tether unprovision-wifi                             # remove stored credentials
+tether devices                                       # list connected boards
+tether provision-wifi --ssid SSID [--password PW]     # upload boot.py + credentials + a secret
+tether provision-ble [--danger-unauthenticated]       # upload boot.py + a secret, advertises the board
+tether status [--ip IP] [--secret S] [--ble-addr A] [--ble-secret S]  # check provisioned/connected state
+tether unprovision-wifi                               # remove stored credentials
 ```
 
 `--port` is optional everywhere — if more than one known device is
@@ -138,40 +139,86 @@ one. `--password` is prompted for (hidden input) if omitted from
 kills the board's wifi reachability (it only removes the stored
 credentials — the uploaded `boot.py` itself stays, harmlessly, and does
 nothing without them). `provision-wifi` uploads a small `boot.py` that
-auto-connects to wifi on every boot and bridges an accepted connection
-into the same dispatch loop serial uses — after it finishes, connect from
-Python with `mcu.connect("wifi:<ip>")`, using the IP `tether status`
-reports.
+auto-connects to wifi on every boot and, once connected, loops
+indefinitely accepting connections (one at a time) that push code, run
+it, or report status — after it finishes, connect from Python with
+`mcu.connect("wifi:<ip>")`, using the IP `tether status` reports.
 
-**Don't check `tether status` right before connecting — check it, note
-the IP, then connect directly next time instead.** `status` works by
-hard-resetting the board and interrupting whatever `boot.py` is doing to
-ask it questions, then leaves the board sitting at the plain interactive
-REPL rather than triggering a fresh reset afterward. Since `boot.py` only
-runs automatically on an actual reset (not on a raw-REPL exit), the
-listener it had opened is gone once `status` returns — even though
-`status` just reported "connected". A `mcu.connect("wifi:<ip>")` attempt
-right after a `status` check will time out. This was found by hardware
-testing, not anticipated in the original design; workaround for now is to
-avoid interleaving `status` checks with connection attempts (re-run
-`provision-wifi` to get a fresh, connectable boot cycle if you need to
-check status again). Fixing `status` to leave the board connectable
-afterward (e.g. resetting again after the query, matching
-`provision-wifi`'s own double-reset pattern) is a reasonable follow-up,
-not yet done.
+**`provision-wifi` prints a secret — save it, or you can't connect.** By
+default every `provision-wifi` run generates a fresh random shared secret
+and prints it once, right after the IP-related output:
 
-**Prerequisite:** wifi never pushes code — only serial does. `boot.py`
-bridges an accepted wifi connection into whatever `tether_app.py` is
-already on the board, and that file is only ever written by a normal
-serial `mcu.connect(...)` session. Run your script once over serial
-(`mcu.connect("serial:auto")`) *before* connecting to the same board over
-wifi, so there's something on-device for the wifi connection to reach —
-otherwise the board accepts the connection and then has nothing to run,
-and the PC side just times out waiting for a handshake reply. Also note:
-a wifi connection runs whatever `tether_app.py` was uploaded *last* over
-serial — there's no hash-check on the wifi path, so editing your script
-and reconnecting over wifi without an intervening serial run will
-silently run stale code.
+```
+Provisioned /dev/cu.usbserial-0001 for wifi network 'MyNetwork'. Board is restarting.
+Shared secret (save this - needed to connect): 3f9a1c...
+Run `tether status` in a few seconds to check connectivity.
+```
+
+There is no way to recover this secret later short of re-provisioning
+(which rotates it again). Pass it to `mcu.connect("wifi:<ip>",
+secret="...")`, or set it once as an environment variable so you don't
+have to pass it every time:
+
+```bash
+export TETHER_WIFI_SECRET=3f9a1c...
+```
+
+A wrong or missing secret raises `tether.WifiAuthError`, not a generic
+timeout — if you see that, double-check the secret you saved. If you
+deliberately don't want authentication (e.g. a trusted, isolated bench
+network), pass `--danger-unauthenticated` to `provision-wifi`: no secret
+is generated, and the board's listener accepts any connection from
+anyone on the network. This prints a loud warning but does not prompt for
+confirmation, so it stays scriptable.
+
+**`tether status --ip <ip>` is now the fast, non-destructive path.**
+Given `--ip` (and `--secret`/`TETHER_WIFI_SECRET` if the board is
+authenticated), `status` talks directly to the board's wifi listener —
+no reset, no interruption of anything it's doing. It only falls back to
+the older, serial-based raw-REPL diagnostic (which does reset the board)
+if the wifi connection attempt itself fails — meaning wifi never came up
+in the first place (bad password, out of range), not that the board is
+merely busy. Without `--ip`, `status` always uses the serial fallback
+directly, same as before.
+
+**Code push works automatically now.** `mcu.connect("wifi:<ip>")` slices
+your script, checks the on-device bundle hash (via a fast `status`-mode
+query), and uploads the full bundle first if it's missing or stale —
+the same slice → hash-check → upload-if-needed → run flow serial has
+always done. A prior serial `mcu.connect(...)` session is no longer a
+prerequisite for connecting over wifi.
+
+**Reconnecting works too.** `board.reconnect()` now succeeds over wifi
+(the board's accept-loop re-listens after each connection ends) — it's
+still sequential-only, one connection at a time, so you can't check
+`status` while a `run` session is actively live, only in between.
+
+### BLE
+
+`tether provision-ble [--danger-unauthenticated]` is the BLE equivalent of
+`provision-wifi` — no network credentials needed (BLE just advertises),
+but everything else matches: a fresh shared secret generated and printed
+by default (`mcu.connect(secret=...)` or `TETHER_BLE_SECRET` env var;
+`tether.WifiAuthError` on a bad/missing one, reused as-is for BLE — same
+exception class, both transports), `tether status --ble-addr <addr>
+[--ble-secret ...]` as the fast non-destructive path, and full code push
+(`mcu.connect("ble:<addr>")` slices/hash-checks/uploads exactly like wifi).
+
+**One real difference from wifi:** BLE connection setup is comparatively
+expensive, so `status`/`upload`/`run` all reuse a **single** BLE
+connection instead of wifi's one-connection-per-mode — only `run`
+finishing, an auth failure, or an unrecognized mode ends the session.
+
+**Wifi and BLE are mutually exclusive on one board** — MicroPython only
+auto-runs one `/boot.py`, so provisioning one warns (doesn't block) before
+overwriting the other's; the other's credentials file is left in place but
+nothing reads it anymore.
+
+**macOS-specific:** CoreBluetooth hides a device's real BLE MAC address
+from apps for privacy, exposing a randomized per-app UUID instead.
+`provision-ble` prints the board's real MAC (correct and directly usable
+on Linux/BlueZ) — on macOS, get the UUID to connect with from a BLE scan
+(e.g. `bleak.BleakScanner.discover()`) instead.
 
 ## Status
 
@@ -180,17 +227,26 @@ reconnect handling) is implemented and tested. Serial is fully working and
 has been verified against real ESP32 hardware, including reconnecting and
 re-running repeatedly.
 
-Wifi now works against real hardware end-to-end: `tether provision-wifi`,
-`tether status`, and `tether unprovision-wifi` were all run against a real
-ESP32, and a real `mcu.connect("wifi:<ip>")` session was verified too —
-a PC-to-MCU call, an MCU-to-PC reverse call, and remote-exception
-propagation all confirmed working over the socket bridge. See the
-Transports table above and "WiFi provisioning CLI" for wifi's current
-limitations (one connection per boot, unauthenticated listener, plaintext
-credentials, requires a prior serial run, and `status` dropping the
-current listener — found during this hardware verification pass).
+Wifi now works against real hardware end-to-end, including code push,
+shared-secret auth, non-interrupting status, and reconnect:
+`tether provision-wifi`, `tether status`, and `tether unprovision-wifi`
+were all run against a real ESP32, and a real `mcu.connect("wifi:<ip>")`
+session was verified too — a PC-to-MCU call, an MCU-to-PC reverse call,
+and remote-exception propagation all confirmed working over the socket
+bridge. See the Transports table above and "WiFi provisioning CLI" for
+the full picture and wifi's remaining, accepted limitations (sequential
+connections only, plaintext credentials/secret on-device, no
+TLS/challenge-response auth).
 
-BLE is PC-side client code only, covered by automated tests (a fake
-matching the BLE library's API) — there is currently no on-device BLE
-listener to connect to, so it doesn't work against a real board yet. See
-`docs/DESIGN.md` for the full architecture.
+BLE now works against real hardware end-to-end too, including code push,
+shared-secret auth, non-interrupting status, and reconnect:
+`tether provision-ble` and `tether status --ble-addr` were run against a
+real ESP32, and a real `mcu.connect("ble:<addr>")` session was verified —
+upload+run, script-edit propagation, `board.reconnect()` three times in a
+row with no physical reset (`@mcu.loop` tasks confirmed not to accumulate),
+auth rejection, and `--danger-unauthenticated`. Unlike wifi, BLE reuses one
+physical connection across status/upload/run rather than opening a fresh
+one per mode. See the Transports table above and `docs/DESIGN.md` for the
+full architecture and BLE's remaining, accepted limitations (sequential
+connections only, plaintext shared secret, no BLE pairing/bonding, no
+concurrent wifi+BLE on one board).
