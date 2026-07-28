@@ -102,7 +102,12 @@ def _check_other_transport_provisioned(ser: Any, other_config_path: str, other_n
         )
 
 
-@main.command("provision-wifi")
+@main.group("provision")
+def provision_group() -> None:
+    """Upload a boot.py that makes the board reachable over wifi or BLE."""
+
+
+@provision_group.command("wifi")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option("--ssid", required=True, help="WiFi network name.")
 @click.option("--password", default=None, help="WiFi password (prompted if omitted).")
@@ -158,7 +163,7 @@ def provision_wifi_command(
     click.echo("Run `tether status` in a few seconds to check connectivity.")
 
 
-@main.command("provision-ble")
+@provision_group.command("ble")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 @click.option(
     "--danger-unauthenticated",
@@ -201,7 +206,7 @@ def provision_ble_command(port: str | None, danger_unauthenticated: bool) -> Non
         # nothing servicing it. The MAC is a hardware property, unaffected
         # by which boot.py is running, so reading it here costs nothing -
         # and this keeps reset_board() the LAST serial operation, exactly
-        # as provision-wifi does.
+        # as provision wifi does.
         addr_stdout, _ = serial_transport.run_python(
             ser,
             b"import bluetooth\nb=bluetooth.BLE()\nb.active(True)\n"
@@ -356,14 +361,19 @@ def status_command(
         raise click.ClickException(f"could not parse status response: {exc}") from None
 
     if not provisioned:
-        click.echo("Not provisioned for wifi. Run `tether provision-wifi` first.")
+        click.echo("Not provisioned for wifi. Run `tether provision wifi` first.")
     elif connected:
         click.echo(f"Provisioned and connected. IP: {ip_from_serial}")
     else:
         click.echo("Provisioned but not currently connected to wifi.")
 
 
-@main.command("unprovision-wifi")
+@main.group("unprovision")
+def unprovision_group() -> None:
+    """Remove stored wifi/BLE credentials from a board."""
+
+
+@unprovision_group.command("wifi")
 @click.option("--port", default=None, help="Serial port (auto-detected if omitted).")
 def unprovision_wifi_command(port: str | None) -> None:
     """Remove stored WiFi credentials from a board.
@@ -371,7 +381,7 @@ def unprovision_wifi_command(port: str | None) -> None:
     Note: this only removes /tether_wifi.json - the auto-run boot.py
     itself is left in place (harmless without credentials: it does
     nothing and falls through to the idle REPL, same as a never-
-    provisioned board). Re-run `provision-wifi` to provision again.
+    provisioned board). Re-run `provision wifi` to provision again.
     """
     import beaupy
 

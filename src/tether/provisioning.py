@@ -688,7 +688,7 @@ def generate_wifi_boot(
     ssid: str, password: str, *, secret: str | None = None, danger_unauthenticated: bool = False
 ) -> dict[str, bytes]:
     """Return `{"/boot.py": ..., "/tether_wifi.json": ...}` file contents
-    for `tether provision-wifi` to upload. `boot.py` is a fixed template
+    for `tether provision wifi` to upload. `boot.py` is a fixed template
     (see `_BOOT_PY_TEMPLATE`'s own docstring) - only the config file
     contains credentials and the shared secret, so re-provisioning with
     new ones is a config-file-only re-upload.
@@ -714,7 +714,7 @@ def generate_ble_boot(
     secret: str | None = None, *, danger_unauthenticated: bool = False
 ) -> dict[str, bytes]:
     """Return `{"/boot.py": ..., "/tether_ble.json": ...}` file contents for
-    `tether provision-ble` to upload. Mirrors `generate_wifi_boot` exactly -
+    `tether provision ble` to upload. Mirrors `generate_wifi_boot` exactly -
     see its docstring - minus credentials, since BLE has no network to join:
     the config file carries only the shared secret.
     """

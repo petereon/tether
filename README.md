@@ -83,9 +83,9 @@ at once (`with board:` scopes which one is ambient for a block).
 
 | Transport | Address | Notes |
 |---|---|---|
-| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Works today. Pushes code over MicroPython's raw REPL — the only transport that works on a completely unprovisioned board (wifi/BLE need `tether provision-wifi`/`tether provision-ble` first; see below). |
-| Wifi | `"wifi:<ip>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with the `tether` CLI (`tether provision-wifi`, see below). **Now pushes code automatically** — `mcu.connect("wifi:<ip>")` slices, hash-checks, and uploads (if needed) before running, the same as serial does, no prior serial session required. **Authenticated by default** — every connection needs a shared secret (`tether provision-wifi` generates and prints one; pass it via `mcu.connect(secret=...)` or the `TETHER_WIFI_SECRET` env var) unless the board was provisioned with `--danger-unauthenticated`. `tether status --ip <ip>` is now fast and non-destructive (no reset). `board.reconnect()` now works over wifi too — sequential only, one connection at a time. Both the CLI (`provision-wifi`/`status`/`unprovision-wifi`) and an actual `mcu.connect("wifi:<ip>")` session — a PC-to-MCU call, an MCU-to-PC reverse call, and remote-exception propagation — were run end-to-end against a real board. Credentials and the shared secret are both stored in plaintext on-device (`/tether_wifi.json`) — the only realistic option on this hardware class, no secure storage exists. See "WiFi provisioning CLI" below for the full picture. |
-| BLE | `"ble:<addr>"` | **Works today**, verified against real ESP32 hardware, once a board has been provisioned with `tether provision-ble`. Same code-push/auth/status model as wifi (shared secret, `--danger-unauthenticated`, `tether status --ble-addr <addr>`), but reuses **one** BLE connection across status/upload/run instead of opening a fresh one per mode — connection setup is comparatively expensive over BLE. Wifi and BLE are mutually exclusive on one board (provisioning one warns before overwriting the other's `boot.py` — a board only auto-runs one at a time). **macOS note:** CoreBluetooth hides real BLE MAC addresses from apps for privacy; `mcu.connect("ble:<addr>")` on macOS needs the randomized UUID a BLE scan reports, not the MAC `tether provision-ble` prints (which is correct and usable as-is on Linux/BlueZ). |
+| Serial | `"serial:auto"` (USB auto-discovery) or an explicit port | Pushes code over MicroPython's raw REPL — the only transport that works on a completely unprovisioned board (wifi/BLE need `tether provision wifi`/`tether provision ble` first; see below). |
+| Wifi | `"wifi:<ip>"` | Once a board is provisioned (`tether provision wifi`, see below), `mcu.connect("wifi:<ip>")` slices, hash-checks, and uploads code automatically before running — same as serial, no prior serial session required. Authenticated by default — every connection needs a shared secret (`tether provision wifi` generates and prints one; pass it via `mcu.connect(secret=...)` or the `TETHER_WIFI_SECRET` env var) unless the board was provisioned with `--danger-unauthenticated`. `tether status --ip <ip>` is fast and non-destructive (no reset). `board.reconnect()` works over wifi too — sequential only, one connection at a time. Credentials and the shared secret are both stored in plaintext on-device (`/tether_wifi.json`) — the only realistic option on this hardware class, no secure storage exists. See "WiFi & BLE provisioning CLI" below for the full picture. |
+| BLE | `"ble:<addr>"` | Once a board is provisioned (`tether provision ble`, see below), same code-push/auth/status model as wifi (shared secret, `--danger-unauthenticated`, `tether status --ble-addr <addr>`), but reuses **one** BLE connection across status/upload/run instead of opening a fresh one per mode — connection setup is comparatively expensive over BLE. Wifi and BLE are mutually exclusive on one board (provisioning one warns before overwriting the other's `boot.py` — a board only auto-runs one at a time). **macOS note:** CoreBluetooth hides real BLE MAC addresses from apps for privacy; `mcu.connect("ble:<addr>")` on macOS needs the randomized UUID a BLE scan reports, not the MAC `tether provision ble` prints (correct and usable as-is on Linux/BlueZ). |
 
 ## Walkthrough: blink an LED
 
@@ -125,27 +125,27 @@ uv pip install -e ".[cli]"
 ```
 
 ```
-tether devices                                       # list connected boards
-tether provision-wifi --ssid SSID [--password PW]     # upload boot.py + credentials + a secret
-tether provision-ble [--danger-unauthenticated]       # upload boot.py + a secret, advertises the board
+tether devices                                        # list connected boards
+tether provision wifi --ssid SSID [--password PW]      # upload boot.py + credentials + a secret
+tether provision ble [--danger-unauthenticated]         # upload boot.py + a secret, advertises the board
 tether status [--ip IP] [--secret S] [--ble-addr A] [--ble-secret S]  # check provisioned/connected state
-tether unprovision-wifi                               # remove stored credentials
+tether unprovision wifi                                # remove stored credentials
 ```
 
 `--port` is optional everywhere — if more than one known device is
 connected and `--port` is omitted, you're prompted interactively to pick
 one. `--password` is prompted for (hidden input) if omitted from
-`provision-wifi`. `unprovision-wifi` asks for confirmation first, since it
+`provision wifi`. `unprovision wifi` asks for confirmation first, since it
 kills the board's wifi reachability (it only removes the stored
 credentials — the uploaded `boot.py` itself stays, harmlessly, and does
-nothing without them). `provision-wifi` uploads a small `boot.py` that
+nothing without them). `provision wifi` uploads a small `boot.py` that
 auto-connects to wifi on every boot and, once connected, loops
 indefinitely accepting connections (one at a time) that push code, run
 it, or report status — after it finishes, connect from Python with
 `mcu.connect("wifi:<ip>")`, using the IP `tether status` reports.
 
-**`provision-wifi` prints a secret — save it, or you can't connect.** By
-default every `provision-wifi` run generates a fresh random shared secret
+**`provision wifi` prints a secret — save it, or you can't connect.** By
+default every `provision wifi` run generates a fresh random shared secret
 and prints it once, right after the IP-related output:
 
 ```
@@ -166,7 +166,7 @@ export TETHER_WIFI_SECRET=3f9a1c...
 A wrong or missing secret raises `tether.WifiAuthError`, not a generic
 timeout — if you see that, double-check the secret you saved. If you
 deliberately don't want authentication (e.g. a trusted, isolated bench
-network), pass `--danger-unauthenticated` to `provision-wifi`: no secret
+network), pass `--danger-unauthenticated` to `provision wifi`: no secret
 is generated, and the board's listener accepts any connection from
 anyone on the network. This prints a loud warning but does not prompt for
 confirmation, so it stays scriptable.
@@ -195,8 +195,8 @@ still sequential-only, one connection at a time, so you can't check
 
 ### BLE
 
-`tether provision-ble [--danger-unauthenticated]` is the BLE equivalent of
-`provision-wifi` — no network credentials needed (BLE just advertises),
+`tether provision ble [--danger-unauthenticated]` is the BLE equivalent of
+`provision wifi` — no network credentials needed (BLE just advertises),
 but everything else matches: a fresh shared secret generated and printed
 by default (`mcu.connect(secret=...)` or `TETHER_BLE_SECRET` env var;
 `tether.WifiAuthError` on a bad/missing one, reused as-is for BLE — same
@@ -216,37 +216,18 @@ nothing reads it anymore.
 
 **macOS-specific:** CoreBluetooth hides a device's real BLE MAC address
 from apps for privacy, exposing a randomized per-app UUID instead.
-`provision-ble` prints the board's real MAC (correct and directly usable
+`provision ble` prints the board's real MAC (correct and directly usable
 on Linux/BlueZ) — on macOS, get the UUID to connect with from a BLE scan
 (e.g. `bleak.BleakScanner.discover()`) instead.
 
 ## Status
 
-Core functionality (slicing, the wire protocol, dispatch, multi-board and
-reconnect handling) is implemented and tested. Serial is fully working and
-has been verified against real ESP32 hardware, including reconnecting and
-re-running repeatedly.
-
-Wifi now works against real hardware end-to-end, including code push,
-shared-secret auth, non-interrupting status, and reconnect:
-`tether provision-wifi`, `tether status`, and `tether unprovision-wifi`
-were all run against a real ESP32, and a real `mcu.connect("wifi:<ip>")`
-session was verified too — a PC-to-MCU call, an MCU-to-PC reverse call,
-and remote-exception propagation all confirmed working over the socket
-bridge. See the Transports table above and "WiFi provisioning CLI" for
-the full picture and wifi's remaining, accepted limitations (sequential
-connections only, plaintext credentials/secret on-device, no
-TLS/challenge-response auth).
-
-BLE now works against real hardware end-to-end too, including code push,
-shared-secret auth, non-interrupting status, and reconnect:
-`tether provision-ble` and `tether status --ble-addr` were run against a
-real ESP32, and a real `mcu.connect("ble:<addr>")` session was verified —
-upload+run, script-edit propagation, `board.reconnect()` three times in a
-row with no physical reset (`@mcu.loop` tasks confirmed not to accumulate),
-auth rejection, and `--danger-unauthenticated`. Unlike wifi, BLE reuses one
-physical connection across status/upload/run rather than opening a fresh
-one per mode. See the Transports table above and `docs/DESIGN.md` for the
-full architecture and BLE's remaining, accepted limitations (sequential
-connections only, plaintext shared secret, no BLE pairing/bonding, no
+Serial, wifi, and BLE are all implemented and verified against real ESP32
+hardware, including code push, shared-secret auth (wifi/BLE), reconnecting,
+and re-running repeatedly. A PC-to-MCU call, an MCU-to-PC reverse call, and
+remote-exception propagation are confirmed working over each transport. See
+the Transports table above and "WiFi & BLE provisioning CLI" for the full
+picture, and `docs/DESIGN.md` for each transport's remaining, accepted
+limitations (sequential connections only, plaintext credentials/secret
+on-device, no TLS/challenge-response auth, no BLE pairing/bonding, no
 concurrent wifi+BLE on one board).

@@ -767,7 +767,7 @@ def connect(address: str, *, timeout: float = 10.0, secret: str | None = None) -
       "serial:auto" | "serial:/dev/ttyUSB0" | "wifi:<ip>" | "ble:<addr>" | "mock://"
 
     `secret` (wifi and BLE): the shared secret configured during
-    `tether provision-wifi`. Falls back to the TETHER_WIFI_SECRET or
+    `tether provision wifi`. Falls back to the TETHER_WIFI_SECRET or
     TETHER_BLE_SECRET environment variable if omitted (whichever matches
     the transport `address` selects). Required when the device has one
     configured (raises WifiAuthError if missing/wrong); ignored otherwise.
