@@ -93,9 +93,9 @@ def test_connect_raises_when_nothing_is_listening_on_the_port():
 def test_send_json_frame_and_read_json_frame_round_trip():
     a, b = socket.socketpair()
 
-    send_json_frame(a, {"mode": "status", "secret": "abc123"})
+    send_json_frame(a, {"nonce": "abc123"})
 
-    assert read_json_frame(b) == {"mode": "status", "secret": "abc123"}
+    assert read_json_frame(b) == {"nonce": "abc123"}
 
 
 def test_send_bytes_frame_and_read_bytes_frame_round_trip():
@@ -106,12 +106,18 @@ def test_send_bytes_frame_and_read_bytes_frame_round_trip():
     assert read_bytes_frame(b) == b"some raw content, not text"
 
 
-def test_send_preamble_succeeds_when_device_acks():
+def test_send_preamble_succeeds_when_device_presents_a_matching_nonce_response():
+    import hashlib
+    import hmac
+
     a, b = socket.socketpair()
 
     def fake_device():
+        nonce = b"0123456789abcdef"
+        send_json_frame(b, {"nonce": nonce.hex()})
         preamble = read_json_frame(b)
-        assert preamble == {"mode": "status", "secret": "right-secret"}
+        expected = hmac.new(b"right-secret", nonce, hashlib.sha256).hexdigest()
+        assert preamble == {"mode": "status", "response": expected}
         send_json_frame(b, {"ok": True})
 
     device_thread = threading.Thread(target=fake_device, daemon=True)
@@ -126,6 +132,7 @@ def test_send_preamble_raises_wifi_auth_error_when_device_rejects():
     a, b = socket.socketpair()
 
     def fake_device():
+        send_json_frame(b, {"nonce": b"0123456789abcdef".hex()})
         read_json_frame(b)
         send_json_frame(b, {"ok": False, "error": "auth failed"})
 

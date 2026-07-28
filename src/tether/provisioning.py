@@ -57,6 +57,35 @@ def _send_json_frame(_conn, _obj):
     _body = _json.dumps(_obj).encode()
     _conn.send(len(_body).to_bytes(4, "big") + _body)
 
+def _hexlify(_data):
+    return "".join("{{:02x}}".format(_b) for _b in _data)
+
+def _hmac_sha256(_key, _msg):
+    # Hand-rolled: MicroPython has hashlib.sha256 but no hmac module.
+    # Verified byte-for-byte against CPython's real hmac.new(key, msg,
+    # hashlib.sha256).digest() - both locally and on real ESP32 hardware
+    # via raw-REPL - before this was written.
+    #
+    # \\x00 (double backslash), not \x00: this text lives inside
+    # _MODE_HANDLER_FUNCTIONS_SRC, itself an f-string - a single \x00 here
+    # gets eagerly interpreted by CPython at THIS module's import time into
+    # a raw embedded NUL byte baked into the generated boot.py's source
+    # text, which MicroPython's own parser then mis-tokenizes (confirmed:
+    # a literal NUL byte sitting in source inside a byte-string literal
+    # parses to byte value 1, not 0, under the real micropython unix-port
+    # interpreter - not the same bug as a normal \x00 escape). Double-
+    # escaping here means the GENERATED file's source text carries the
+    # literal two-character escape sequence, which MicroPython correctly
+    # re-interprets as a single NUL byte when it parses that file.
+    _block_size = 64
+    if len(_key) > _block_size:
+        _key = _hashlib.sha256(_key).digest()
+    _key = _key + b"\\x00" * (_block_size - len(_key))
+    _o_key_pad = bytes(_b ^ 0x5C for _b in _key)
+    _i_key_pad = bytes(_b ^ 0x36 for _b in _key)
+    _inner = _hashlib.sha256(_i_key_pad + _msg).digest()
+    return _hashlib.sha256(_o_key_pad + _inner).digest()
+
 def _handle_status(_conn, _get_addr):
     _hash = None
     try:
@@ -196,6 +225,11 @@ except ImportError:
     import json as _json
 
 try:
+    import uhashlib as _hashlib
+except ImportError:
+    import hashlib as _hashlib
+
+try:
     with open("/tether_wifi.json") as _f:
         _cfg = _json.loads(_f.read())
 except OSError:
@@ -204,6 +238,7 @@ except OSError:
 if _cfg is not None:
     import network
     import time
+    import uos as _uos
 
     _wlan = network.WLAN(network.STA_IF)
     _wlan.active(True)
@@ -235,11 +270,17 @@ if _cfg is not None:
         while True:
             _conn, _client_addr = _srv.accept()
             try:
+                _expected_secret = _cfg.get("secret")
+                _nonce = _uos.urandom(16)
+                _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
                 _preamble = _read_json_frame(_conn)
                 _mode = _preamble.get("mode")
-                _secret = _preamble.get("secret")
-                _expected_secret = _cfg.get("secret")
-                if _expected_secret is not None and _secret != _expected_secret:
+                _response = _preamble.get("response")
+                if _expected_secret is not None:
+                    _expected_response = _hexlify(_hmac_sha256(_expected_secret.encode(), _nonce))
+                else:
+                    _expected_response = None
+                if _expected_secret is not None and _response != _expected_response:
                     _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
@@ -333,6 +374,11 @@ except ImportError:
     import json as _json
 
 try:
+    import uhashlib as _hashlib
+except ImportError:
+    import hashlib as _hashlib
+
+try:
     with open("/tether_ble.json") as _f:
         _cfg = _json.loads(_f.read())
 except OSError:
@@ -342,6 +388,7 @@ if _cfg is not None:
     import bluetooth as _bluetooth
     import time
     import gc as _gc
+    import uos as _uos
 
     # Module-scope (unlike wifi's _wifi_make_streams, which imports it
     # lazily inside itself): _ble_make_streams' nested reader class body
@@ -595,18 +642,31 @@ if _cfg is not None:
             time.sleep_ms(20)
         _conn = _BleConn()
         try:
+            # One nonce per physical connection, sent before the first
+            # preamble is even read - not per preamble like wifi's fresh-
+            # connection-per-mode model. Only the FIRST preamble on this
+            # connection needs to present a response to it; status/upload
+            # exchanges that follow on the SAME already-open connection
+            # skip the check entirely (see _BLE_BOOT_TEMPLATE's own module
+            # docstring on the one-connection-reused model).
+            _expected_secret = _cfg.get("secret")
+            _nonce = _uos.urandom(16)
+            _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
+            _authenticated = _expected_secret is None
             while True:
                 _preamble = _read_json_frame(_conn)
                 _mode = _preamble.get("mode")
-                _secret = _preamble.get("secret")
-                _expected_secret = _cfg.get("secret")
-                if _expected_secret is not None and _secret != _expected_secret:
-                    _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
-                    # Let the nack actually transmit before the disconnect
-                    # below tears the link down - see _NACK_FLUSH_MS.
-                    time.sleep_ms(_NACK_FLUSH_MS)
-                    break
-                elif _mode == "status":
+                if not _authenticated:
+                    _response = _preamble.get("response")
+                    _expected_response = _hexlify(_hmac_sha256(_expected_secret.encode(), _nonce))
+                    if _response != _expected_response:
+                        _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
+                        # Let the nack actually transmit before the disconnect
+                        # below tears the link down - see _NACK_FLUSH_MS.
+                        time.sleep_ms(_NACK_FLUSH_MS)
+                        break
+                    _authenticated = True
+                if _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
                     _handle_status(_conn, lambda: _ble_addr_str)
                 elif _mode == "upload":

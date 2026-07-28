@@ -1,6 +1,25 @@
+import hashlib
+import hmac
 import json
 
 from tether.provisioning import STATUS_SCRIPT, generate_ble_boot, generate_wifi_boot
+
+
+def _send_wifi_preamble(sock, mode, secret, send_json, read_json):
+    """Test helper standing in for tether.transports.wifi.send_preamble's
+    request half only (not its ack-read-and-raise half) - these
+    hand-written test clients want to inspect the raw ack dict directly
+    (including auth-failure acks), not have WifiAuthError raised for them.
+    Performs the same nonce-challenge round trip the real on-device
+    accept-loop now requires (see provisioning.py's _BOOT_PY_TEMPLATE):
+    read the nonce the device sends immediately on accept(), then send
+    HMAC-SHA256(secret, nonce) as the response (or None if unauthenticated).
+    """
+    nonce = bytes.fromhex(read_json(sock)["nonce"])
+    response = (
+        hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest() if secret is not None else None
+    )
+    send_json(sock, {"mode": mode, "response": response})
 
 
 def test_generate_wifi_boot_produces_boot_py_and_config():
@@ -401,13 +420,13 @@ def test_boot_py_status_mode_and_preamble_auth():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock)
         results["status_payload"] = read_json(sock)
         sock.close()
 
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "bogus", "secret": None})
+        _send_wifi_preamble(sock2, "bogus", None, send_json, read_json)
         results["unknown_mode_ack"] = read_json(sock2)
         sock2.close()
 
@@ -507,7 +526,7 @@ def test_boot_py_rejects_wrong_secret():
     def run_client():
         time.sleep(0.5)
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": "wrong-one"})
+        _send_wifi_preamble(sock, "status", "wrong-one", send_json, read_json)
         results["ack"] = read_json(sock)
         sock.close()
 
@@ -605,7 +624,7 @@ def test_boot_py_accepts_correct_secret():
     def run_client():
         time.sleep(0.5)
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "status", "secret": "the-real-secret"})
+        _send_wifi_preamble(sock, "status", "the-real-secret", send_json, read_json)
         results["ack"] = read_json(sock)
         results["payload"] = read_json(sock)
         sock.close()
@@ -733,7 +752,7 @@ def test_boot_py_survives_malformed_preamble_and_serves_next_connection():
         # 3. A subsequent, well-formed connection must still be served -
         # this is the real proof the accept-loop didn't crash.
         sock3 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock3, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock3, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock3)
         results["status_payload"] = read_json(sock3)
         sock3.close()
@@ -845,7 +864,7 @@ def test_boot_py_run_mode_survives_a_reconnect_without_a_reset():
 
     def do_one_run_session():
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "run", "secret": None})
+        _send_wifi_preamble(sock, "run", None, send_json, read_json)
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
 
@@ -1018,7 +1037,7 @@ def get_tick_total() -> int:
 
     def do_one_run_session(req_id):
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "run", "secret": None})
+        _send_wifi_preamble(sock, "run", None, send_json, read_json)
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
 
@@ -1174,7 +1193,7 @@ def test_boot_py_upload_mode_writes_files_verified_via_status():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         send_json(
@@ -1194,7 +1213,7 @@ def test_boot_py_upload_mode_writes_files_verified_via_status():
 
         time.sleep(0.5)
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock2, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock2)
         results["status_payload"] = read_json(sock2)
         sock2.close()
@@ -1323,7 +1342,7 @@ def test_boot_py_upload_mode_rejects_a_chunk_that_overflows_the_declared_file_si
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         # Declares a 5-byte file, then sends a single 10-byte chunk for it -
@@ -1465,7 +1484,7 @@ def test_boot_py_invalidates_stale_hash_when_an_upload_fails_partway():
         time.sleep(0.5)
 
         sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock, {"mode": "upload", "secret": None})
+        _send_wifi_preamble(sock, "upload", None, send_json, read_json)
         results["upload_ack"] = read_json(sock)
 
         # Same failure trigger as Fix 3's device-side guard test: a chunk
@@ -1480,7 +1499,7 @@ def test_boot_py_invalidates_stale_hash_when_an_upload_fails_partway():
 
         time.sleep(0.5)
         sock2 = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
-        send_json(sock2, {"mode": "status", "secret": None})
+        _send_wifi_preamble(sock2, "status", None, send_json, read_json)
         results["status_ack"] = read_json(sock2)
         results["status_payload"] = read_json(sock2)
         sock2.close()
@@ -1522,6 +1541,11 @@ class _FakeUos:
             raise OSError(2, "no such file")
     def mkdir(self, path):
         pass
+    def urandom(self, n):
+        # This fake replaces the whole uos module, and the accept loop now
+        # calls uos.urandom() once per connection for its nonce - a fixed
+        # value is fine, nothing here checks its actual randomness.
+        return bytes(n)
 
 _sys.modules["uos"] = _FakeUos()
 
@@ -1661,6 +1685,8 @@ class _FakeUos:
             del _files[path]
         else:
             raise OSError(2, "no such file")
+    def urandom(self, n):
+        return bytes(n)
 
 _sys.modules["uos"] = _FakeUos()
 
@@ -1870,7 +1896,11 @@ print("nack_flush_ms:", time.ticks_diff(_ble.disconnect_ticks[0], _ble.notify_ti
 
     assert "BOOT THREAD DIED" not in out, out
     assert "reply: {'ok': False, 'error': 'auth failed'}" in out, out
-    assert "total_notify_chunks: 1" in out, out
+    # 2, not 1: the device's one-per-connection nonce is its own
+    # notification, sent before Central.send_preamble() even presents a
+    # response - so a rejected preamble is nonce (1) + nack (2), not just
+    # the nack alone.
+    assert "total_notify_chunks: 2" in out, out
     assert "device_dropped_link: [0]" in out, out
     assert "readvertising: True" in out, out
 
@@ -2298,8 +2328,14 @@ _ble = bluetooth.BLE()
 _c = Central(_ble, mtu=23)  # BLE's pre-negotiation minimum: 20 usable bytes
 _c.connect()
 
+# Consume the device's one-per-connection nonce normally (not burst-written
+# - the device sends it, this doesn't exercise the write-burst path) before
+# hand-computing the response for the burst-written preamble below.
+_nonce = _c_unhexlify(_c.read_json_frame()["nonce"])
+_response = _c_hexlify(_c_hmac_sha256(b"s3cr3t", _nonce))
+
 # Every chunk lands before the device's read handler runs even once.
-_c.send_json_frame_burst({"mode": "status", "secret": "s3cr3t"})
+_c.send_json_frame_burst({"mode": "status", "response": _response})
 print("append_mode:", _ble._append[WRITE_VALUE_HANDLE])
 print("ack:", _c.read_json_frame())
 print("hash:", _c.read_json_frame()["tether_app_hash"])

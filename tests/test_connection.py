@@ -467,8 +467,16 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
             buf += conn.recv(length - len(buf))
         return buf
 
+    # Every connection now starts with the device sending a nonce before
+    # reading anything - see wifi.py's send_preamble docstring. This fake
+    # device doesn't simulate real auth (no secret is configured on the
+    # client side in these tests), so a fixed placeholder nonce is fine:
+    # the client only reads it and echoes back response=None.
+    fake_nonce = {"nonce": "00" * 16}
+
     # 1. status connection - reports no hash, so the client must upload.
     conn, _addr = sock.accept()
+    send_json(conn, fake_nonce)
     preamble = read_json(conn)
     assert preamble["mode"] == "status"
     send_json(conn, {"ok": True})
@@ -477,6 +485,7 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
 
     # 2. upload connection - receive and discard the manifest + file bytes.
     conn2, _addr = sock.accept()
+    send_json(conn2, fake_nonce)
     preamble2 = read_json(conn2)
     assert preamble2["mode"] == "upload"
     send_json(conn2, {"ok": True})
@@ -490,6 +499,7 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
 
     # 3. run connection - ack the preamble, then serve a real Dispatcher.
     conn3, _addr = sock.accept()
+    send_json(conn3, fake_nonce)
     preamble3 = read_json(conn3)
     assert preamble3["mode"] == "run"
     send_json(conn3, {"ok": True})
@@ -574,9 +584,12 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
     received_files: dict[str, bytes] = {}
     received_dirs: list = []
 
+    fake_nonce = {"nonce": "00" * 16}
+
     def fake_device():
         # 1. status connection - reports no hash, so the client must upload.
         conn, _ = server_sock.accept()
+        send_json(conn, fake_nonce)
         preamble = read_json(conn)
         assert preamble["mode"] == "status"
         send_json(conn, {"ok": True})
@@ -594,6 +607,7 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
 
         # 2. upload connection - receive the manifest, then each file's bytes.
         conn2, _ = server_sock.accept()
+        send_json(conn2, fake_nonce)
         preamble2 = read_json(conn2)
         assert preamble2["mode"] == "upload"
         send_json(conn2, {"ok": True})
@@ -612,6 +626,7 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
 
         # 3. run connection - ack the preamble, then answer the handshake.
         conn3, _ = server_sock.accept()
+        send_json(conn3, fake_nonce)
         preamble3 = read_json(conn3)
         assert preamble3["mode"] == "run"
         send_json(conn3, {"ok": True})
@@ -739,6 +754,15 @@ def add(a: int, b: int) -> int:
         def _notify_raw(self, data: bytes) -> None:
             self._client._pending_notify_cb(None, bytearray(data))
 
+        def send_nonce(self) -> None:
+            # Real device sends its one-per-connection nonce proactively,
+            # before reading anything - see provisioning.py's
+            # _BLE_BOOT_TEMPLATE. This fake doesn't simulate real auth (the
+            # response is never checked below), so a fixed placeholder is
+            # fine - the client only needs something to read and respond
+            # to before its first send_preamble() call proceeds.
+            self._notify({"nonce": "00" * 16})
+
         def _drain(self) -> None:
             while len(self._buffer) >= 4:
                 length = int.from_bytes(self._buffer[:4], "big")
@@ -805,6 +829,7 @@ def add(a: int, b: int) -> int:
 
         async def start_notify(self, char_uuid, callback):
             self._pending_notify_cb = callback
+            self._device.send_nonce()
 
         async def write_gatt_char(self, char_uuid, data, response=True):
             self._device.feed(data)
@@ -894,8 +919,11 @@ def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
     received_files: dict[str, bytes] = {}
     chunk_sizes: list[int] = []
 
+    fake_nonce = {"nonce": "00" * 16}
+
     def fake_device():
         conn, _ = server_sock.accept()
+        send_json(conn, fake_nonce)
         assert read_json(conn)["mode"] == "status"
         send_json(conn, {"ok": True})
         send_json(
@@ -911,6 +939,7 @@ def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
         conn.close()
 
         conn2, _ = server_sock.accept()
+        send_json(conn2, fake_nonce)
         assert read_json(conn2)["mode"] == "upload"
         send_json(conn2, {"ok": True})
         manifest = read_json(conn2)
@@ -926,6 +955,7 @@ def test_connect_wifi_chunks_a_file_larger_than_max_control_frame_size():
         conn2.close()
 
         conn3, _ = server_sock.accept()
+        send_json(conn3, fake_nonce)
         assert read_json(conn3)["mode"] == "run"
         send_json(conn3, {"ok": True})
 
@@ -1033,9 +1063,12 @@ def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
 
     results: dict = {"accepted": 0, "first_run_conn_closed": None}
 
+    fake_nonce = {"nonce": "00" * 16}
+
     def serve_status_and_upload_then_open_run_conn():
         conn, _addr = listener.accept()
         results["accepted"] += 1
+        send_json(conn, fake_nonce)
         assert read_json(conn)["mode"] == "status"
         send_json(conn, {"ok": True})
         send_json(conn, {"tether_app_hash": None})  # always force a re-upload, keeps this simple
@@ -1043,6 +1076,7 @@ def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
 
         conn2, _addr = listener.accept()
         results["accepted"] += 1
+        send_json(conn2, fake_nonce)
         assert read_json(conn2)["mode"] == "upload"
         send_json(conn2, {"ok": True})
         manifest = read_json(conn2)
@@ -1055,6 +1089,7 @@ def test_board_reconnect_over_wifi_closes_the_previous_connection_first():
 
         conn3, _addr = listener.accept()
         results["accepted"] += 1
+        send_json(conn3, fake_nonce)
         assert read_json(conn3)["mode"] == "run"
         send_json(conn3, {"ok": True})
         return conn3
@@ -1165,16 +1200,17 @@ def test_connect_wifi_respects_timeout_when_run_mode_preamble_is_never_acked():
         # status - report the matching hash so the client skips upload
         # entirely and goes straight to the run connection.
         conn, _addr = listener.accept()
+        send_json(conn, {"nonce": "00" * 16})
         assert read_json(conn)["mode"] == "status"
         send_json(conn, {"ok": True})
         send_json(conn, {"tether_app_hash": bundle_hash})
         conn.close()
 
-        # run - accept the connection, read the preamble, then do
-        # nothing: no ack, no close. Exactly the scenario the fix must
-        # bound.
+        # run - accept the connection, then do nothing: no nonce, no ack,
+        # no close. Exactly the scenario the fix must bound - the client's
+        # send_preamble() blocks reading the nonce it never gets, same as
+        # it would previously have blocked reading the ack.
         conn2, _addr = listener.accept()
-        read_json(conn2)  # the preamble frame itself
         time.sleep(10.0)  # outlives the test's own bounded timeout below
         conn2.close()
 
@@ -1283,6 +1319,13 @@ def test_connect_ble_refuses_to_strand_control_bytes_at_the_run_handover():
             body = json.dumps(obj).encode()
             return len(body).to_bytes(4, "big") + body
 
+        def send_nonce(self):
+            # The real device sends its one-per-connection nonce
+            # proactively, before reading anything - not in response to a
+            # write. This fake mirrors that from start_notify (BLE's
+            # closest analogue to "connection established").
+            self._client._notify_cb(None, bytearray(self._frame({"nonce": "00" * 16})))
+
         def feed(self, data):
             self._buffer += bytes(data)
             while len(self._buffer) >= 4:
@@ -1331,6 +1374,7 @@ def test_connect_ble_refuses_to_strand_control_bytes_at_the_run_handover():
 
         async def start_notify(self, char_uuid, callback):
             self._notify_cb = callback
+            self._device.send_nonce()
 
         async def write_gatt_char(self, char_uuid, data, response=True):
             self._device.feed(data)

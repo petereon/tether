@@ -233,5 +233,7 @@ remote-exception propagation are confirmed working over each transport. See
 the Transports table above and "WiFi & BLE provisioning CLI" for the full
 picture, and `docs/DESIGN.md` for each transport's remaining, accepted
 limitations (sequential connections only, plaintext credentials/secret
-on-device, no TLS/challenge-response auth, no BLE pairing/bonding, no
-concurrent wifi+BLE on one board).
+on-device, no TLS, no BLE pairing/bonding, no concurrent wifi+BLE on one
+board). Every connection is authenticated by an HMAC-SHA256 nonce
+challenge, not a plaintext secret sent as-is — see `docs/DESIGN.md`'s
+Transports table for how it works.

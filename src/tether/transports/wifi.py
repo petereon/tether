@@ -15,6 +15,8 @@ chunk.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import socket
 import struct
@@ -126,19 +128,34 @@ def read_bytes_frame(sock: Any) -> bytes:
 
 
 def send_preamble(sock: Any, mode: str, secret: str | None) -> None:
-    """Send the connection preamble (mode + shared secret) and wait for the
-    device's ack. Raises WifiAuthError if the device rejects it - every
-    mode gets an explicit ack/nack before any mode-specific work begins,
-    including `run` (one extra round trip, worth it so a bad secret always
-    surfaces as a clear WifiAuthError rather than a confusing downstream
-    failure specific to whichever mode was requested).
+    """Send the connection preamble (mode + a nonce-challenge response) and
+    wait for the device's ack. Raises WifiAuthError if the device rejects
+    it - every mode gets an explicit ack/nack before any mode-specific work
+    begins, including `run` (one extra round trip, worth it so a bad secret
+    always surfaces as a clear WifiAuthError rather than a confusing
+    downstream failure specific to whichever mode was requested).
+
+    The device sends a fresh nonce as the very first thing on every new
+    connection (wifi never reuses a connection across modes - see
+    connection.py's _connect_wifi), before this function sends anything.
+    The plaintext shared secret itself never crosses the wire: `response`
+    is HMAC-SHA256(secret, nonce), so a passive observer of the connection
+    learns neither the secret nor a value that lets it replay onto a future
+    (different-nonce) connection. `secret=None` (unauthenticated boards)
+    sends `response: None` - the device only checks it when a secret is
+    actually configured on its side (see _BOOT_PY_TEMPLATE).
     """
     from tether.errors import WifiAuthError
 
-    send_json_frame(sock, {"mode": mode, "secret": secret})
-    response = read_json_frame(sock)
-    if not response.get("ok", False):
-        raise WifiAuthError(response.get("error") or "connection rejected by device")
+    nonce_frame = read_json_frame(sock)
+    nonce = bytes.fromhex(nonce_frame["nonce"])
+    response = (
+        hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest() if secret is not None else None
+    )
+    send_json_frame(sock, {"mode": mode, "response": response})
+    ack = read_json_frame(sock)
+    if not ack.get("ok", False):
+        raise WifiAuthError(ack.get("error") or "connection rejected by device")
 
 
 def connect(

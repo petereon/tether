@@ -1729,6 +1729,56 @@ surfaced four worth acting on immediately rather than leaving parked:
 
   4 new/changed test files, 283 tests passing (was 278).
 
+5. **Shared-secret auth upgraded to an HMAC-SHA256 nonce-challenge**, so
+   the plaintext secret itself no longer crosses the wire (chunk 20/21's
+   own accepted limitation, and this gap review's recommended fix over a
+   full TLS stack, which doesn't fit the bundle/complexity budget on this
+   hardware class). The device sends a fresh `os.urandom(16)` nonce as the
+   very first thing on every accepted connection, before reading anything;
+   the client answers with `HMAC-SHA256(secret, nonce)` instead of the
+   secret itself. MicroPython has `hashlib.sha256` but no `hmac` module,
+   so the device runs a small hand-rolled HMAC-SHA256 (`_hmac_sha256` in
+   the shared `_MODE_HANDLER_FUNCTIONS_SRC`) - verified byte-for-byte
+   against CPython's real `hmac.new(key, msg, hashlib.sha256)` both
+   locally and on real ESP32 hardware; the PC side (`transports/wifi.py`'s
+   `send_preamble`, `transports/ble.py`'s `BleControlChannel.send_preamble`)
+   uses real stdlib `hmac`. BLE's one-connection-reused-across-modes model
+   (chunk 21) needed its own state: only the FIRST preamble on a physical
+   connection presents a nonce response (`BleControlChannel._authenticated`
+   PC-side, `_authenticated` device-side); later preambles on that same
+   already-open connection skip the check, matching the shape the
+   one-connection design already established.
+
+   **A real, non-obvious bug found and fixed via this chunk's own testing,
+   worth recording:** the hand-rolled HMAC's key-padding literal
+   (`b"\x00"`) sat inside `_MODE_HANDLER_FUNCTIONS_SRC`, itself an f-string
+   at THIS module's import time - a single backslash there gets eagerly
+   interpreted by CPython immediately, baking a raw embedded NUL byte into
+   the generated `boot.py`'s own source text (not the two-character escape
+   sequence). MicroPython's parser turned out to mis-tokenize a literal
+   NUL byte sitting inside a byte-string literal in source (confirmed via
+   direct reproduction under the real `micropython` unix-port: the parsed
+   byte value came out as `1`, not `0`) - producing a wrong HMAC on every
+   single connection, both wifi and BLE, authenticated or not. The
+   isolated hand-rolled algorithm itself was correct throughout (verified
+   against CPython's `hmac` before this was even wired into the accept
+   loop) - the bug was purely in how the literal round-tripped through a
+   second layer of Python-source-generating-Python-source, and needed a
+   real embedded-context reproduction (not an isolated unit test of the
+   function alone) to surface. Fixed with `b"\\x00"` (double backslash) in
+   the f-string, so the *generated* file's source text carries the literal
+   escape sequence for MicroPython's own parser to interpret. A few
+   existing test fakes that fully replace the on-device `uos` module
+   (predating this feature) also needed a `urandom()` method added, since
+   the accept loop now calls it once per connection.
+
+   Verified against real ESP32 hardware: wifi round-trip (correct secret
+   connects and reconnects; wrong secret raises `WifiAuthError`) confirmed
+   working end-to-end. 3 changed test files plus `tests/ble_fakes.py` and
+   `tests/test_connection.py`'s hand-rolled fake wifi/BLE devices (which
+   needed to start sending a nonce before reading a preamble, matching the
+   new protocol), 284 tests passing (was 283).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

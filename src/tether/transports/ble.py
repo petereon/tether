@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
+import hmac
 import json
 import queue
 import struct
@@ -219,6 +221,13 @@ class BleControlChannel:
         self._stream = stream
         self._timeout = timeout
         self._buffer = b""
+        # Unlike wifi (fresh connection, fresh nonce, per mode), one BLE
+        # connection is reused across every mode - so only the FIRST
+        # send_preamble() call on a given channel does the nonce-challenge
+        # round trip; every later call on the same (already-authenticated)
+        # connection just sends {mode}. See send_preamble's own docstring
+        # and _BLE_BOOT_TEMPLATE's matching device-side state.
+        self._authenticated = False
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buffer) < n:
@@ -252,16 +261,40 @@ class BleControlChannel:
         return self._recv_exact(length)
 
     def send_preamble(self, mode: str, secret: str | None) -> None:
-        """Send the connection preamble (mode + shared secret) and wait
-        for the device's ack. Raises WifiAuthError if the device rejects
-        it - matches wifi's send_preamble exactly (see transports/wifi.py).
+        """Send the connection preamble (mode, plus a nonce-challenge
+        response on the FIRST call this channel makes) and wait for the
+        device's ack. Raises WifiAuthError if the device rejects it -
+        same error type wifi's send_preamble uses (see transports/wifi.py),
+        reused rather than adding a BLE-specific auth error class.
+
+        The device sends one nonce per physical connection, immediately
+        after accepting it and before reading any preamble - not per mode,
+        since a BLE connection is reused across status -> upload -> run
+        (see the design's one-connection decision, BleControlChannel's own
+        class docstring, and _BLE_BOOT_TEMPLATE's matching device-side
+        state). This channel mirrors that: the nonce is read and answered
+        exactly once (`self._authenticated` below), and every later
+        send_preamble() call on the same channel sends just `{mode}` - the
+        device already knows this connection is authenticated and doesn't
+        expect (or check) a response on those later preambles.
         """
         from tether.errors import WifiAuthError
 
-        self.send_json_frame({"mode": mode, "secret": secret})
-        response = self.read_json_frame()
-        if not response.get("ok", False):
-            raise WifiAuthError(response.get("error") or "connection rejected by device")
+        if not self._authenticated:
+            nonce_frame = self.read_json_frame()
+            nonce = bytes.fromhex(nonce_frame["nonce"])
+            response = (
+                hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+                if secret is not None
+                else None
+            )
+            self.send_json_frame({"mode": mode, "response": response})
+            self._authenticated = True
+        else:
+            self.send_json_frame({"mode": mode})
+        ack = self.read_json_frame()
+        if not ack.get("ok", False):
+            raise WifiAuthError(ack.get("error") or "connection rejected by device")
 
 
 def connect(address: str, *, timeout: float = DEFAULT_TIMEOUT) -> BleStream:
