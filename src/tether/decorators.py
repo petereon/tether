@@ -164,7 +164,24 @@ class _McuNamespace:
 class _PcNamespace:
     """`@pc.export` decorator — MCU side gets an auto-generated proxy stub."""
 
-    def export(self, func: F | None = None) -> Callable[[F], F]:
+    # Same two-shape split as _McuNamespace.export, for the same reason: a
+    # bare `@pc.export` calls this with `func` already bound to the
+    # decorated function and returns it directly (Callable[[F], F] is wrong
+    # there - decorate() never runs a second time); `@pc.export()` calls it
+    # with `func=None` and gets back a decorator to apply next. Without the
+    # split, static analysis treated every bare `@pc.export`-decorated
+    # function as still needing a further decorator-call step - which
+    # doesn't happen at runtime, so call sites saw the wrong (decorator)
+    # type instead of the function's own signature. Unlike mcu.export,
+    # no `functools.wraps`/dispatch wrapper is involved here - `decorate`
+    # returns `fn` itself unchanged, so the corrected annotations need no
+    # `cast()` to be accurate.
+    @typing.overload
+    def export(self, func: F) -> F: ...
+    @typing.overload
+    def export(self, func: None = None) -> Callable[[F], F]: ...
+
+    def export(self, func: F | None = None) -> Callable[[F], F] | F:
         def decorate(fn: F) -> F:
             _validate_signature(fn)
             fn.__tether_export__ = ExportSpec(func=fn, side="pc")  # type: ignore[attr-defined]
