@@ -1975,6 +1975,41 @@ instructions all use local editable installs, `uv pip install -e
   2 changed files (`pyproject.toml`, `uv.lock`), no test/behavior changes
   - 299 tests passing, unchanged.
 
+- [x] **22. Wifi per-frame authentication** — done 2026-08-05
+  Closes the gap where only the wifi handshake itself was authenticated -
+  every frame after it rode the wire in the clear. Adds a generic,
+  transport-agnostic envelope codec (`tether.marshalling.frame_auth.
+  FrameAuthenticator`) wrapping every frame post-handshake in
+  `[4-byte outer-length][4-byte counter][inner frame][16-byte truncated
+  HMAC-SHA256 tag]`, session key reused from the handshake's own HMAC
+  output (no extra round trip), per-direction replay-protected counters,
+  hard-close-no-retry on any verification failure. Applies uniformly
+  across `status`/`upload`/`run` on the PC side (`wifi.py`, `connection.py`)
+  and the device side (new helpers in `provisioning.py`'s generated
+  boot.py, plus async `_AuthenticatedReader`/`_AuthenticatedWriter` wrapper
+  classes for `run` mode's uasyncio-based stream). Skipped entirely under
+  `--danger-unauthenticated`. Deliberately wifi-only - BLE explicitly out
+  of scope, tracked as a follow-up (the codec's configurable tag length
+  exists specifically for BLE's tighter MTU budget when that follow-up
+  lands). Breaking change: boards provisioned before this chunk need
+  `tether provision wifi` re-run - no negotiation/fallback was added. See
+  `docs/DESIGN.md`'s 2026-08-04 "Per-frame authentication" amendment for
+  the full design rationale and the grill-me interview that produced it.
+
+  **Remaining, accepted limitation:** this chunk has NOT been verified
+  against real ESP32 hardware (unlike chunks 19-21, which explicitly were)
+  - only against the `micropython` unix-port subprocess via
+  `tests/mpy_runner.py`. Flagging this explicitly rather than silently
+  treating subprocess-level verification as equivalent - real-hardware
+  verification (timing under the async wrapper classes' extra buffering,
+  real TCP behavior under a tampered/dropped connection) should happen
+  before this is considered as solid as the modes it's wrapping.
+
+  9 changed files (`errors.py`, new `marshalling/frame_auth.py`,
+  `transports/wifi.py`, `connection.py`, `provisioning.py`, plus tests in
+  `test_frame_auth.py` (new), `test_transport_wifi.py`, `test_connection.py`,
+  `test_provisioning.py`), 323 tests passing (was 299).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
