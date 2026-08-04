@@ -9,6 +9,7 @@ from tether import mcu, pc
 from tether._context import current_board
 from tether.connection import PROTOCOL_VERSION, _connect_wifi, connect, generate_bootstrap
 from tether.dispatch import Dispatcher
+from tether.errors import FrameAuthenticationError
 from tether.slicer import slice_mcu_bound
 from tether.transports.wifi import WifiStream
 
@@ -513,6 +514,134 @@ def _serve_one_device_connection(sock: socket.socket, *, handshake_version: int)
     # is asked to use, so the resulting BoardHandle exposes it here too.
     dispatcher.register("_mock_read_temp", lambda: 21.5)
     dispatcher.start()
+
+
+def _serve_one_authenticated_device_connection(
+    sock: socket.socket, *, handshake_version: int, secret: str, corrupt_status_reply: bool = False
+) -> None:
+    """Authenticated counterpart to _serve_one_device_connection (see its
+    own docstring above) - requires the real nonce-challenge response and
+    wraps every device->PC reply in a FrameAuthenticator envelope, proving
+    connection.py's session-key derivation and Task 2's authenticated
+    frame helpers round-trip against a well-behaved authenticated peer.
+    `corrupt_status_reply=True` flips a byte in the status reply's
+    envelope, for the rejection test below.
+    """
+    import hashlib
+    import hmac
+    import json
+    import struct
+
+    from tether.marshalling.frame_auth import FrameAuthenticator
+    from tether.transports.wifi import (
+        read_authenticated_bytes_frame,
+        read_authenticated_json_frame,
+        send_authenticated_json_frame,
+    )
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(conn):
+        header = conn.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += conn.recv(length - len(body))
+        return json.loads(body)
+
+    def send_json(conn, obj):
+        body = json.dumps(obj).encode()
+        conn.sendall(length_prefix.pack(len(body)) + body)
+
+    def accept_authenticated(conn, mode):
+        nonce = b"0123456789abcdef"
+        send_json(conn, {"nonce": nonce.hex()})
+        preamble = read_json(conn)
+        assert preamble["mode"] == mode
+        expected_response = hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+        assert preamble["response"] == expected_response
+        send_json(conn, {"ok": True})
+        return hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+
+    # 1. status connection.
+    conn, _addr = sock.accept()
+    session_key = accept_authenticated(conn, "status")
+    auth = FrameAuthenticator(session_key)
+    if corrupt_status_reply:
+        envelope = bytearray(auth.wrap(b'{"tether_app_hash": null}'))
+        envelope[-1] ^= 0xFF
+        conn.sendall(bytes(envelope))
+    else:
+        send_authenticated_json_frame(conn, auth, {"tether_app_hash": None})
+    conn.close()
+    if corrupt_status_reply:
+        return  # PC side is expected to raise and never reach upload/run
+
+    # 2. upload connection - receive and discard the manifest + file bytes.
+    conn2, _addr = sock.accept()
+    session_key2 = accept_authenticated(conn2, "upload")
+    recv_auth = FrameAuthenticator(session_key2)
+    send_auth = FrameAuthenticator(session_key2)
+    manifest = read_authenticated_json_frame(conn2, recv_auth)
+    for file_meta in manifest["files"]:
+        remaining = file_meta["size"]
+        while remaining > 0:
+            remaining -= len(read_authenticated_bytes_frame(conn2, recv_auth))
+    send_authenticated_json_frame(conn2, send_auth, {"ok": True})
+    conn2.close()
+
+    # 3. run connection - real WifiStream + Dispatcher, authenticated.
+    conn3, _addr = sock.accept()
+    session_key3 = accept_authenticated(conn3, "run")
+    stream = WifiStream(conn3)
+    stream.enable_authentication(session_key3)
+    dispatcher = Dispatcher(stream, stream)
+    dispatcher.register("__tether_handshake__", lambda: handshake_version)
+    dispatcher.register("_mock_read_temp", lambda: 21.5)
+    dispatcher.start()
+
+
+def test_connect_wifi_authenticates_status_upload_and_run_with_a_shared_secret():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    device_thread = threading.Thread(
+        target=_serve_one_authenticated_device_connection,
+        kwargs={"sock": listener, "handshake_version": PROTOCOL_VERSION, "secret": "the-secret"},
+        daemon=True,
+    )
+    device_thread.start()
+
+    board = connect(f"wifi:127.0.0.1:{port}", secret="the-secret", timeout=5.0)
+
+    assert board._mock_read_temp() == 21.5
+    device_thread.join(timeout=5.0)
+    listener.close()
+
+
+def test_connect_wifi_rejects_a_tampered_authenticated_status_reply():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    device_thread = threading.Thread(
+        target=_serve_one_authenticated_device_connection,
+        kwargs={
+            "sock": listener,
+            "handshake_version": PROTOCOL_VERSION,
+            "secret": "the-secret",
+            "corrupt_status_reply": True,
+        },
+        daemon=True,
+    )
+    device_thread.start()
+
+    with pytest.raises(FrameAuthenticationError):
+        connect(f"wifi:127.0.0.1:{port}", secret="the-secret", timeout=5.0)
+
+    device_thread.join(timeout=5.0)
+    listener.close()
 
 
 def test_connect_wifi_reaches_an_already_running_device_over_a_real_tcp_socket():

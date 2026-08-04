@@ -12,6 +12,7 @@ from typing import Any
 from tether._context import current_board
 from tether.dispatch import DEFAULT_TIMEOUT, Dispatcher
 from tether.errors import ProtocolVersionError
+from tether.marshalling.frame_auth import FrameAuthenticator
 from tether.slicer import generate_pc_stubs, slice_mcu_bound
 
 # Bumped whenever the wire protocol or dispatch runtime contract changes in
@@ -550,11 +551,15 @@ def _connect_wifi(
     last_stream: Any | None = None
 
     def _query_status(sock: Any) -> dict[str, Any]:
-        wifi_transport.send_preamble(sock, "status", resolved_secret)
-        return wifi_transport.read_json_frame(sock)
+        session_key = wifi_transport.send_preamble(sock, "status", resolved_secret)
+        if session_key is None:
+            return wifi_transport.read_json_frame(sock)
+        return wifi_transport.read_authenticated_json_frame(sock, FrameAuthenticator(session_key))
 
     def _upload(sock: Any) -> None:
-        wifi_transport.send_preamble(sock, "upload", resolved_secret)
+        session_key = wifi_transport.send_preamble(sock, "upload", resolved_secret)
+        send_auth = FrameAuthenticator(session_key) if session_key is not None else None
+        recv_auth = FrameAuthenticator(session_key) if session_key is not None else None
         # Full bundle (tether_runtime library + app + hash), same set and
         # same dirs-sorted-by-depth-by-the-client convention
         # _upload_if_needed uses for serial - see _gather_runtime_bundle.
@@ -563,7 +568,10 @@ def _connect_wifi(
             "dirs": list(dirs),
             "files": [{"path": path, "size": len(content)} for path, content in files.items()],
         }
-        wifi_transport.send_json_frame(sock, manifest)
+        if send_auth is not None:
+            wifi_transport.send_authenticated_json_frame(sock, send_auth, manifest)
+        else:
+            wifi_transport.send_json_frame(sock, manifest)
         # Split each file's content into slices no larger than
         # MAX_CONTROL_FRAME_SIZE (64 KiB) - the whole control channel's
         # invariant (design spec) is "no single frame ever needs to hold
@@ -580,8 +588,15 @@ def _connect_wifi(
         max_chunk = wifi_transport.MAX_CONTROL_FRAME_SIZE
         for content in files.values():
             for offset in range(0, len(content), max_chunk):
-                wifi_transport.send_bytes_frame(sock, content[offset : offset + max_chunk])
-        result = wifi_transport.read_json_frame(sock)
+                chunk = content[offset : offset + max_chunk]
+                if send_auth is not None:
+                    wifi_transport.send_authenticated_bytes_frame(sock, send_auth, chunk)
+                else:
+                    wifi_transport.send_bytes_frame(sock, chunk)
+        if recv_auth is not None:
+            result = wifi_transport.read_authenticated_json_frame(sock, recv_auth)
+        else:
+            result = wifi_transport.read_json_frame(sock)
         if not result.get("ok", False):
             raise RuntimeError(f"wifi upload failed: {result.get('error')}")
 
@@ -624,8 +639,10 @@ def _connect_wifi(
         stream = wifi_transport.connect(host, port, timeout=timeout, switch_to_blocking=False)
         last_stream = stream
         try:
-            wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
+            session_key = wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
             stream._sock.settimeout(None)
+            if session_key is not None:
+                stream.enable_authentication(session_key)
             return _start_and_handshake(
                 stream,
                 timeout=timeout,
