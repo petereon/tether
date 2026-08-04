@@ -86,20 +86,86 @@ def _hmac_sha256(_key, _msg):
     _inner = _hashlib.sha256(_i_key_pad + _msg).digest()
     return _hashlib.sha256(_o_key_pad + _inner).digest()
 
-def _handle_status(_conn, _get_addr):
+def _envelope_wrap(_session_key, _counter, _inner, _tag_length):
+    _counter_bytes = _counter.to_bytes(4, "big")
+    _tag = _hmac_sha256(_session_key, _counter_bytes + _inner)[:_tag_length]
+    _body = _counter_bytes + _inner + _tag
+    return len(_body).to_bytes(4, "big") + _body
+
+def _envelope_unwrap(_session_key, _expected_counter, _body, _tag_length):
+    if len(_body) < 4 + _tag_length:
+        raise OSError("authenticated frame too short")
+    _counter_bytes = _body[:4]
+    _tag = _body[-_tag_length:]
+    _inner = _body[4:-_tag_length]
+    _counter = int.from_bytes(_counter_bytes, "big")
+    if _counter != _expected_counter:
+        raise OSError("unexpected frame counter")
+    _expected_tag = _hmac_sha256(_session_key, _counter_bytes + _inner)[:_tag_length]
+    if _tag != _expected_tag:
+        raise OSError("frame authentication tag mismatch")
+    return _inner
+
+def _recv_frame(_conn, _session_key, _counter):
+    # Reads one frame - authenticated envelope-wrapped if `_session_key`
+    # is given, or the plain unauthenticated [4-byte length][bytes] format
+    # otherwise (matching _read_json_frame's own wire shape - this is used
+    # for the same control channel, just below the JSON layer). Returns
+    # (frame_bytes, next_counter); next_counter equals _counter unchanged
+    # when _session_key is None.
+    #
+    # The authenticated branch unwraps ONE extra [4-byte length] layer
+    # from the envelope's inner frame before returning - not redundant
+    # framing added on a whim, but required to interoperate with the PC
+    # side's tether.transports.wifi.send_authenticated_json_frame /
+    # send_authenticated_bytes_frame, which each wrap an already
+    # length-prefixed blob (_json_frame_bytes()/_bytes_frame_bytes(),
+    # matching plain send_json_frame()/send_bytes_frame()'s own wire
+    # shape) as the FrameAuthenticator's inner_frame, rather than the bare
+    # payload - see read_authenticated_json_frame's matching unwrap on
+    # that side. The plain (_session_key is None) branch has no such inner
+    # layer, since unauthenticated send_json_frame/read_json_frame only
+    # ever carry ONE length prefix total.
+    _header = _recv_exact(_conn, 4)
+    _length = int.from_bytes(_header, "big")
+    if _length > _MAX_CTRL_FRAME:
+        raise OSError("frame too large")
+    _body = _recv_exact(_conn, _length)
+    if _session_key is None:
+        return _body, _counter
+    _inner = _envelope_unwrap(_session_key, _counter, _body, _TAG_LENGTH)
+    _inner_length = int.from_bytes(_inner[:4], "big")
+    return _inner[4 : 4 + _inner_length], _counter + 1
+
+def _send_frame(_conn, _data, _session_key, _counter):
+    # Mirror of _recv_frame for sending. Returns next_counter. See
+    # _recv_frame's own comment above for why the authenticated branch
+    # adds an extra inner [4-byte length] layer around `_data` before
+    # handing it to _envelope_wrap - required to match what
+    # read_authenticated_json_frame/read_authenticated_bytes_frame expect
+    # to unwrap on the PC side.
+    if _session_key is None:
+        _conn.send(len(_data).to_bytes(4, "big") + _data)
+        return _counter
+    _framed = len(_data).to_bytes(4, "big") + _data
+    _conn.send(_envelope_wrap(_session_key, _counter, _framed, _TAG_LENGTH))
+    return _counter + 1
+
+def _handle_status(_conn, _get_addr, _session_key):
     _hash = None
     try:
         with open("/.tether_hash") as _hf:
             _hash = _hf.read()
     except OSError:
         pass
-    _send_json_frame(_conn, {{
+    _reply = {{
         "protocol_version": {PROTOCOL_VERSION},
         "tether_app_hash": _hash,
         "free_heap": _gc.mem_free(),
         "uptime_ms": time.ticks_diff(time.ticks_ms(), _boot_ms),
         "ip": _get_addr(),
-    }})
+    }}
+    _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, 0)
 
 def _handle_run(_conn, _make_streams):
     try:
@@ -145,7 +211,9 @@ def _handle_run(_conn, _make_streams):
             # it, each session's tick count stays roughly constant.
             _asyncio.new_event_loop()
 
-def _handle_upload(_conn):
+def _handle_upload(_conn, _session_key):
+    _recv_counter = 0
+    _send_counter = 0
     try:
         # Invalidate the OLD hash sentinel FIRST, before writing any
         # file - .tether_hash is written last on success (matching
@@ -167,7 +235,9 @@ def _handle_upload(_conn):
         except OSError:
             pass
 
-        _manifest = _read_json_frame(_conn)
+        _manifest_bytes, _recv_counter = _recv_frame(_conn, _session_key, _recv_counter)
+        _manifest = _json.loads(_manifest_bytes)
+
         for _d in _manifest.get("dirs", []):
             try:
                 import uos as _uos
@@ -180,30 +250,31 @@ def _handle_upload(_conn):
             _size = _file_meta["size"]
             _remaining = _size
             with open(_path, "wb") as _wf:
+                # A chunk bigger than what's still declared-remaining for
+                # THIS file must be rejected, not written anyway -
+                # otherwise _remaining goes negative and, in a multi-file
+                # upload, an oversized chunk would spill into what should
+                # have been the next file's own frames. The body is read
+                # in full by _recv_frame either way (needed to verify the
+                # envelope when authenticated), so this check happens
+                # after the read rather than before it - a behavior-
+                # neutral reordering from the prior unauthenticated-only
+                # code, still bounded by _MAX_CTRL_FRAME regardless. A
+                # compliant chunked client (PC-side _upload()) never
+                # sends a chunk like this.
                 while _remaining > 0:
-                    _header = _recv_exact(_conn, 4)
-                    _chunk_len = int.from_bytes(_header, "big")
-                    if _chunk_len > _MAX_CTRL_FRAME:
-                        raise OSError("upload chunk too large")
-                    # A chunk bigger than what's still declared-
-                    # remaining for THIS file must be rejected
-                    # immediately, not written anyway - otherwise
-                    # _remaining goes negative and, in a multi-file
-                    # upload, an oversized chunk would spill into
-                    # what should have been the next file's own
-                    # frames. A compliant chunked client (PC-side
-                    # _upload()) never sends a chunk like this.
-                    if _chunk_len > _remaining:
+                    _chunk_data, _recv_counter = _recv_frame(_conn, _session_key, _recv_counter)
+                    if len(_chunk_data) > _remaining:
                         raise OSError("upload chunk exceeds declared file size")
-                    _chunk_data = _recv_exact(_conn, _chunk_len)
                     _wf.write(_chunk_data)
                     _remaining -= len(_chunk_data)
-        _send_json_frame(_conn, {{"ok": True}})
+        _reply = {{"ok": True}}
     except Exception as _exc:
-        try:
-            _send_json_frame(_conn, {{"ok": False, "error": str(_exc)}})
-        except OSError:
-            pass
+        _reply = {{"ok": False, "error": str(_exc)}}
+    try:
+        _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, _send_counter)
+    except OSError:
+        pass
 """
 
 # Fixed template - never contains credentials or the shared secret (those
@@ -254,6 +325,7 @@ if _cfg is not None:
 
         _boot_ms = time.ticks_ms()
         _MAX_CTRL_FRAME = 65536
+        _TAG_LENGTH = 16  # must match tether.marshalling.frame_auth.DEFAULT_TAG_LENGTH
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "        ")}
         def _wifi_make_streams(_conn):
@@ -277,20 +349,22 @@ if _cfg is not None:
                 _mode = _preamble.get("mode")
                 _response = _preamble.get("response")
                 if _expected_secret is not None:
-                    _expected_response = _hexlify(_hmac_sha256(_expected_secret.encode(), _nonce))
+                    _session_key = _hmac_sha256(_expected_secret.encode(), _nonce)
+                    _expected_response = _hexlify(_session_key)
                 else:
+                    _session_key = None
                     _expected_response = None
                 if _expected_secret is not None and _response != _expected_response:
                     _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_status(_conn, lambda: _wlan.ifconfig()[0])
+                    _handle_status(_conn, lambda: _wlan.ifconfig()[0], _session_key)
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_run(_conn, _wifi_make_streams)
+                    _handle_run(_conn, _wifi_make_streams, _session_key)
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_upload(_conn)
+                    _handle_upload(_conn, _session_key)
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
             except Exception:
@@ -703,10 +777,16 @@ if _cfg is not None:
                     _authenticated = True
                 if _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_status(_conn, lambda: _ble_addr_str)
+                    # BLE has no per-frame authentication yet (out of
+                    # scope for this plan - see DESIGN.md's BLE row) -
+                    # _session_key stays None, which makes the shared
+                    # _handle_status/_handle_upload fall through to their
+                    # plain, unauthenticated wire format exactly as
+                    # before.
+                    _handle_status(_conn, lambda: _ble_addr_str, None)
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_upload(_conn)
+                    _handle_upload(_conn, None)
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
                     _handle_run(_conn, _ble_make_streams)
