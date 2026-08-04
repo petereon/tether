@@ -2004,6 +2004,156 @@ _sys.modules["uos"] = _FakeUos()
 
 
 @requires_micropython
+def test_boot_py_run_mode_rpc_is_frame_authenticated_when_secret_configured():
+    import hashlib
+    import hmac
+    import json as pc_json
+    import socket
+    import struct
+
+    from mpy_runner import run_micropython_background
+
+    from tether.marshalling import encode_frame
+    from tether.marshalling.frame_auth import FrameAuthenticator
+
+    test_port = 18778  # next unused port after the existing 18767-18777
+    secret = "the-secret"
+    boot_py = (
+        generate_wifi_boot("irrelevant", "irrelevant")["/boot.py"]
+        .decode()
+        .replace(str(8765), str(test_port))
+    )
+
+    sliced_source = """\
+@mcu.export
+def add(a: int, b: int) -> int:
+    return a + b
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+
+    length_prefix = struct.Struct(">I")
+
+    def read_json(sock):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        return pc_json.loads(body)
+
+    def send_json(sock, obj):
+        body = pc_json.dumps(obj).encode()
+        sock.sendall(length_prefix.pack(len(body)) + body)
+
+    def read_authenticated_result_frame(sock, auth):
+        header = sock.recv(4)
+        (length,) = length_prefix.unpack(header)
+        body = b""
+        while len(body) < length:
+            body += sock.recv(length - len(body))
+        inner = auth.unwrap(body)
+        # `inner` is the *entire* self-delimited encode_frame() block the
+        # device wrote in one writer.write() call - [4-byte inner
+        # length][msg-type][msgpack body] - not a bare [msg-type][body].
+        # That inner length header is what Dispatcher's own
+        # reader.readexactly(4) reads on the way in; strip it the same way
+        # here before indexing msg-type/body.
+        frame_body = inner[4:]
+        msg_type = frame_body[:1]
+        import msgpack
+
+        payload = msgpack.unpackb(frame_body[1:], raw=False)
+        return msg_type, payload
+
+    results = {}
+
+    def run_client():
+        import time
+
+        time.sleep(0.5)
+        sock = socket.create_connection(("127.0.0.1", test_port), timeout=5.0)
+        nonce_frame = read_json(sock)
+        nonce = bytes.fromhex(nonce_frame["nonce"])
+        response = hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+        send_json(sock, {"mode": "run", "response": response})
+        ack = read_json(sock)
+        assert ack == {"ok": True}, ack
+        session_key = hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+
+        send_auth = FrameAuthenticator(session_key)
+        recv_auth = FrameAuthenticator(session_key)
+
+        handshake = encode_frame(1, {"id": 1, "name": "__tether_handshake__", "args": []})
+        sock.sendall(send_auth.wrap(handshake))
+        msg_type, payload = read_authenticated_result_frame(sock, recv_auth)
+        assert msg_type == b"\x02", (msg_type, payload)  # MSG_RESULT
+
+        call = encode_frame(1, {"id": 2, "name": "add", "args": [3, 4]})
+        sock.sendall(send_auth.wrap(call))
+        msg_type, payload = read_authenticated_result_frame(sock, recv_auth)
+        assert msg_type == b"\x02", (msg_type, payload)
+        results["value"] = payload["value"]
+        sock.close()
+
+    import threading
+
+    client_thread = threading.Thread(target=run_client, daemon=True)
+    client_thread.start()
+
+    script = f"""
+import sys as _sys
+
+class _FakeWLAN:
+    def __init__(self, *a):
+        pass
+    def active(self, *a):
+        pass
+    def isconnected(self):
+        return True
+    def connect(self, *a):
+        pass
+    def ifconfig(self):
+        return ("10.0.0.5", "255.255.255.0", "10.0.0.1", "10.0.0.1")
+
+class _FakeNetwork:
+    STA_IF = 0
+    WLAN = _FakeWLAN
+
+_sys.modules["network"] = _FakeNetwork
+
+_files = {{
+    "/tether_wifi.json": '{{"ssid": "irrelevant", "password": "irrelevant", "secret": "{secret}"}}',
+    "/tether_app.py": {tether_app_source!r},
+}}
+
+class _FakeFile:
+    def __init__(self, content):
+        self._content = content
+    def read(self):
+        return self._content
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+_real_open = open
+def _fake_open(path, mode="r", *a, **kw):
+    if path in _files:
+        return _FakeFile(_files[path])
+    raise OSError(2, "no such file")
+import builtins
+builtins.open = _fake_open
+
+{boot_py}
+"""
+
+    run_micropython_background(script, run_for=5.0)
+    client_thread.join(timeout=10.0)
+
+    assert results.get("value") == 7, results
+
+
+@requires_micropython
 def test_real_pc_connect_wifi_against_real_on_device_boot_py():
     # The single test that would have caught Fix 1 (asyncio task-queue
     # accumulation across reconnects) and Fix 5 (reconnect deadlock) far

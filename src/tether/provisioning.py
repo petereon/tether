@@ -151,6 +151,45 @@ def _send_frame(_conn, _data, _session_key, _counter):
     _conn.send(_envelope_wrap(_session_key, _counter, _framed, _TAG_LENGTH))
     return _counter + 1
 
+class _AuthenticatedReader:
+    def __init__(self, _inner, _session_key, _tag_length):
+        self._inner = _inner
+        self._session_key = _session_key
+        self._tag_length = _tag_length
+        self._counter = 0
+        self._pending = b""
+
+    async def readexactly(self, _n):
+        while len(self._pending) < _n:
+            await self._fill_one_envelope()
+        _result = self._pending[:_n]
+        self._pending = self._pending[_n:]
+        return _result
+
+    async def _fill_one_envelope(self):
+        _header = await self._inner.readexactly(4)
+        _length = int.from_bytes(_header, "big")
+        if _length > _MAX_CTRL_FRAME:
+            raise OSError("authenticated frame too large")
+        _body = await self._inner.readexactly(_length)
+        _inner_bytes = _envelope_unwrap(self._session_key, self._counter, _body, self._tag_length)
+        self._counter += 1
+        self._pending += _inner_bytes
+
+class _AuthenticatedWriter:
+    def __init__(self, _inner, _session_key, _tag_length):
+        self._inner = _inner
+        self._session_key = _session_key
+        self._tag_length = _tag_length
+        self._counter = 0
+
+    def write(self, _data):
+        self._inner.write(_envelope_wrap(self._session_key, self._counter, _data, self._tag_length))
+        self._counter += 1
+
+    async def drain(self):
+        await self._inner.drain()
+
 def _handle_status(_conn, _get_addr, _session_key):
     _hash = None
     try:
@@ -167,7 +206,7 @@ def _handle_status(_conn, _get_addr, _session_key):
     }}
     _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, 0)
 
-def _handle_run(_conn, _make_streams):
+def _handle_run(_conn, _make_streams, _session_key):
     try:
         with open("/tether_app.py") as _f:
             _tether_app_src = _f.read()
@@ -177,7 +216,7 @@ def _handle_run(_conn, _make_streams):
     if _tether_app_src is not None:
         import uasyncio as _asyncio
 
-        _reader, _writer = _make_streams(_conn)
+        _reader, _writer = _make_streams(_conn, _session_key)
         try:
             exec(
                 _tether_app_src,
@@ -328,10 +367,17 @@ if _cfg is not None:
         _TAG_LENGTH = 16  # must match tether.marshalling.frame_auth.DEFAULT_TAG_LENGTH
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "        ")}
-        def _wifi_make_streams(_conn):
+        def _wifi_make_streams(_conn, _session_key):
             import uasyncio as _asyncio
 
-            return _asyncio.StreamReader(_conn), _asyncio.StreamWriter(_conn, {{}})
+            _reader = _asyncio.StreamReader(_conn)
+            _writer = _asyncio.StreamWriter(_conn, {{}})
+            if _session_key is None:
+                return _reader, _writer
+            return (
+                _AuthenticatedReader(_reader, _session_key, _TAG_LENGTH),
+                _AuthenticatedWriter(_writer, _session_key, _TAG_LENGTH),
+            )
 
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
         _srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
@@ -649,7 +695,10 @@ if _cfg is not None:
             _result, self._buffer = self._buffer, b""
             return _result
 
-    def _ble_make_streams(_conn):
+    def _ble_make_streams(_conn, _session_key):
+        # _session_key is always None here (BLE per-frame auth is out of
+        # scope for this plan) - accepted only so this matches the shared
+        # _handle_run's `_make_streams(_conn, _session_key)` call.
         # Seeded with whatever the synchronous preamble read over-consumed,
         # so no byte is lost handing this connection over to run mode.
         _leftover = [_conn.take_buffer()]
@@ -789,7 +838,10 @@ if _cfg is not None:
                     _handle_upload(_conn, None)
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_run(_conn, _ble_make_streams)
+                    # BLE per-frame auth is out of scope for this plan (see
+                    # the status/upload call sites' own comment above) -
+                    # _session_key is always None here.
+                    _handle_run(_conn, _ble_make_streams, None)
                     break
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
