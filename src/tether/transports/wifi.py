@@ -22,6 +22,9 @@ import socket
 import struct
 from typing import Any
 
+from tether.errors import FrameAuthenticationError
+from tether.marshalling.frame_auth import DEFAULT_TAG_LENGTH, FrameAuthenticator
+
 DEFAULT_PORT = 8765
 
 _RECV_CHUNK = 65536
@@ -42,16 +45,68 @@ class WifiStream:
     different transport). `.read()` blocks for at least one chunk of real
     data and returns b"" once the peer closes - exactly the "transport
     closed" signal Dispatcher._run_reader already relies on.
+
+    Call `enable_authentication()` once, right after a successful
+    handshake and before handing the stream to Dispatcher, to switch every
+    subsequent read()/write() to per-frame HMAC authentication (see
+    tether.marshalling.frame_auth and DESIGN.md's Per-frame authentication
+    note). Unauthenticated (--danger-unauthenticated boards) streams never
+    call this and behave exactly as before.
     """
 
     def __init__(self, sock: Any) -> None:
         self._sock = sock
+        self._send_auth: FrameAuthenticator | None = None
+        self._recv_auth: FrameAuthenticator | None = None
+
+    def enable_authentication(
+        self, session_key: bytes, tag_length: int = DEFAULT_TAG_LENGTH
+    ) -> None:
+        self._send_auth = FrameAuthenticator(session_key, tag_length)
+        self._recv_auth = FrameAuthenticator(session_key, tag_length)
 
     def read(self) -> bytes:
-        return self._sock.recv(_RECV_CHUNK)
+        if self._recv_auth is None:
+            return self._sock.recv(_RECV_CHUNK)
+        return self._read_authenticated_chunk()
+
+    def _read_authenticated_chunk(self) -> bytes:
+        # Reads and unwraps exactly one outer envelope, returning its inner
+        # bytes. FrameDecoder (tether.marshalling) doesn't care about
+        # read()'s chunk boundaries, only about the accumulated logical
+        # byte stream, so returning one envelope's worth per call is fine.
+        try:
+            header = self._recv_exact_or_empty(_LENGTH_PREFIX.size)
+            if not header:
+                return b""
+            (length,) = _LENGTH_PREFIX.unpack(header)
+            if length > MAX_CONTROL_FRAME_SIZE:
+                raise OSError(f"authenticated frame too large: declared {length} bytes")
+            body = self._recv_exact_or_empty(length)
+            if not body:
+                return b""
+            assert self._recv_auth is not None
+            return self._recv_auth.unwrap(body)
+        except FrameAuthenticationError:
+            self.close()
+            raise
+
+    def _recv_exact_or_empty(self, n: int) -> bytes:
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            chunk = self._sock.recv(remaining)
+            if not chunk:
+                return b""
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
 
     def write(self, data: bytes) -> None:
-        self._sock.sendall(data)
+        if self._send_auth is None:
+            self._sock.sendall(data)
+        else:
+            self._sock.sendall(self._send_auth.wrap(data))
 
     def close(self) -> None:
         # shutdown() before close() - not redundant. This process's own
@@ -90,6 +145,11 @@ def _recv_exact(sock: Any, n: int) -> bytes:
     return b"".join(chunks)
 
 
+def _json_frame_bytes(payload: dict[str, Any]) -> bytes:
+    body = json.dumps(payload).encode("utf-8")
+    return _LENGTH_PREFIX.pack(len(body)) + body
+
+
 def send_json_frame(sock: Any, payload: dict[str, Any]) -> None:
     """Send `[4-byte length][utf-8 json body]`. Used for the wifi
     preamble/status/upload control channel - deliberately not the msgpack
@@ -98,8 +158,7 @@ def send_json_frame(sock: Any, payload: dict[str, Any]) -> None:
     on a board this control channel is partly responsible for provisioning
     in the first place (see the design spec's 2026-07-26 correction).
     """
-    body = json.dumps(payload).encode("utf-8")
-    sock.sendall(_LENGTH_PREFIX.pack(len(body)) + body)
+    sock.sendall(_json_frame_bytes(payload))
 
 
 def read_json_frame(sock: Any) -> dict[str, Any]:
@@ -111,12 +170,16 @@ def read_json_frame(sock: Any) -> dict[str, Any]:
     return json.loads(body.decode("utf-8"))
 
 
+def _bytes_frame_bytes(data: bytes) -> bytes:
+    return _LENGTH_PREFIX.pack(len(data)) + data
+
+
 def send_bytes_frame(sock: Any, data: bytes) -> None:
     """Send `[4-byte length][raw bytes]` - used for upload mode's file
     content, which is not JSON-wrapped (JSON can't carry arbitrary binary
     cleanly, and there's no need to make it).
     """
-    sock.sendall(_LENGTH_PREFIX.pack(len(data)) + data)
+    sock.sendall(_bytes_frame_bytes(data))
 
 
 def read_bytes_frame(sock: Any) -> bytes:
@@ -127,7 +190,42 @@ def read_bytes_frame(sock: Any) -> bytes:
     return _recv_exact(sock, length)
 
 
-def send_preamble(sock: Any, mode: str, secret: str | None) -> None:
+def _read_authenticated_body(sock: Any) -> bytes:
+    header = _recv_exact(sock, _LENGTH_PREFIX.size)
+    (length,) = _LENGTH_PREFIX.unpack(header)
+    if length > MAX_CONTROL_FRAME_SIZE:
+        raise OSError(f"authenticated frame too large: declared {length} bytes")
+    return _recv_exact(sock, length)
+
+
+def send_authenticated_json_frame(sock: Any, authenticator: Any, payload: dict[str, Any]) -> None:
+    """Like send_json_frame, but wrapped in a per-frame HMAC envelope (see
+    tether.marshalling.frame_auth). Used for status/upload control-channel
+    traffic once a session key exists - never for the handshake itself
+    (send_preamble/send_json_frame/read_json_frame stay unauthenticated,
+    since no session key exists until the handshake completes).
+    """
+    sock.sendall(authenticator.wrap(_json_frame_bytes(payload)))
+
+
+def read_authenticated_json_frame(sock: Any, authenticator: Any) -> dict[str, Any]:
+    inner = authenticator.unwrap(_read_authenticated_body(sock))
+    (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
+    body = inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
+    return json.loads(body.decode("utf-8"))
+
+
+def send_authenticated_bytes_frame(sock: Any, authenticator: Any, data: bytes) -> None:
+    sock.sendall(authenticator.wrap(_bytes_frame_bytes(data)))
+
+
+def read_authenticated_bytes_frame(sock: Any, authenticator: Any) -> bytes:
+    inner = authenticator.unwrap(_read_authenticated_body(sock))
+    (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
+    return inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
+
+
+def send_preamble(sock: Any, mode: str, secret: str | None) -> bytes | None:
     """Send the connection preamble (mode + a nonce-challenge response) and
     wait for the device's ack. Raises WifiAuthError if the device rejects
     it - every mode gets an explicit ack/nack before any mode-specific work
@@ -144,18 +242,31 @@ def send_preamble(sock: Any, mode: str, secret: str | None) -> None:
     (different-nonce) connection. `secret=None` (unauthenticated boards)
     sends `response: None` - the device only checks it when a secret is
     actually configured on its side (see _BOOT_PY_TEMPLATE).
+
+    Returns the derived session key (see tether.marshalling.frame_auth) for
+    per-frame authentication of everything sent after this handshake, or
+    None when `secret` is None - matching the handshake's own "no secret,
+    no check" behavior (see DESIGN.md's Per-frame authentication note).
+    Computed from the SAME hmac.new(...) object as `response` (hexdigest
+    for the wire, digest for the session key) - one HMAC computation, not
+    two.
     """
     from tether.errors import WifiAuthError
 
     nonce_frame = read_json_frame(sock)
     nonce = bytes.fromhex(nonce_frame["nonce"])
-    response = (
-        hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest() if secret is not None else None
-    )
+    if secret is not None:
+        mac = hmac.new(secret.encode(), nonce, hashlib.sha256)
+        response = mac.hexdigest()
+        session_key = mac.digest()
+    else:
+        response = None
+        session_key = None
     send_json_frame(sock, {"mode": mode, "response": response})
     ack = read_json_frame(sock)
     if not ack.get("ok", False):
         raise WifiAuthError(ack.get("error") or "connection rejected by device")
+    return session_key
 
 
 def connect(

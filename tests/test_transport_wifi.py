@@ -1,14 +1,21 @@
+import hashlib
+import hmac
 import socket
 import threading
 
 import pytest
 
-from tether.errors import WifiAuthError
+from tether.errors import FrameAuthenticationError, WifiAuthError
+from tether.marshalling.frame_auth import FrameAuthenticator
 from tether.transports.wifi import (
     WifiStream,
     connect,
+    read_authenticated_bytes_frame,
+    read_authenticated_json_frame,
     read_bytes_frame,
     read_json_frame,
+    send_authenticated_bytes_frame,
+    send_authenticated_json_frame,
     send_bytes_frame,
     send_json_frame,
     send_preamble,
@@ -143,3 +150,97 @@ def test_send_preamble_raises_wifi_auth_error_when_device_rejects():
         send_preamble(a, "status", "wrong-secret")
 
     device_thread.join(timeout=2.0)
+
+
+def test_send_preamble_returns_the_session_key_when_a_secret_is_given():
+    a, b = socket.socketpair()
+    nonce = b"0123456789abcdef"
+
+    def fake_device():
+        send_json_frame(b, {"nonce": nonce.hex()})
+        read_json_frame(b)  # the preamble response, unused here
+        send_json_frame(b, {"ok": True})
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    session_key = send_preamble(a, "status", "right-secret")
+
+    device_thread.join(timeout=2.0)
+    assert session_key == hmac.new(b"right-secret", nonce, hashlib.sha256).digest()
+
+
+def test_send_preamble_returns_none_when_secret_is_none():
+    a, b = socket.socketpair()
+
+    def fake_device():
+        send_json_frame(b, {"nonce": "0123456789abcdef0123456789abcdef"[:32]})
+        read_json_frame(b)
+        send_json_frame(b, {"ok": True})
+
+    device_thread = threading.Thread(target=fake_device, daemon=True)
+    device_thread.start()
+
+    session_key = send_preamble(a, "status", None)
+
+    device_thread.join(timeout=2.0)
+    assert session_key is None
+
+
+def test_authenticated_json_frame_round_trips():
+    a, b = socket.socketpair()
+    auth_send = FrameAuthenticator(b"shared-key")
+    auth_recv = FrameAuthenticator(b"shared-key")
+
+    send_authenticated_json_frame(a, auth_send, {"hello": "world"})
+
+    assert read_authenticated_json_frame(b, auth_recv) == {"hello": "world"}
+
+
+def test_authenticated_bytes_frame_round_trips():
+    a, b = socket.socketpair()
+    auth_send = FrameAuthenticator(b"shared-key")
+    auth_recv = FrameAuthenticator(b"shared-key")
+
+    send_authenticated_bytes_frame(a, auth_send, b"some file content")
+
+    assert read_authenticated_bytes_frame(b, auth_recv) == b"some file content"
+
+
+def test_wifi_stream_authenticated_round_trip_both_directions():
+    a, b = socket.socketpair()
+    key = b"shared-session-key"
+    stream_a = WifiStream(a)
+    stream_b = WifiStream(b)
+    stream_a.enable_authentication(key)
+    stream_b.enable_authentication(key)
+
+    stream_a.write(b"from a to b")
+    assert stream_b.read() == b"from a to b"
+
+    stream_b.write(b"from b to a")
+    assert stream_a.read() == b"from b to a"
+
+
+def test_wifi_stream_read_raises_and_closes_on_a_tampered_frame():
+    a, b = socket.socketpair()
+    key = b"shared-session-key"
+    stream_a = WifiStream(a)
+    stream_b = WifiStream(b)
+    stream_a.enable_authentication(key)
+    stream_b.enable_authentication(key)
+
+    # Bypass stream_a.write() to inject a tampered envelope directly.
+    good_auth = FrameAuthenticator(key)
+    tampered = bytearray(good_auth.wrap(b"payload"))
+    tampered[-1] ^= 0xFF
+    a.sendall(bytes(tampered))
+
+    with pytest.raises(FrameAuthenticationError):
+        stream_b.read()
+
+    # Connection must be torn down - a further send on the peer socket
+    # eventually fails (shutdown() was called on stream_b's socket).
+    with pytest.raises(OSError):
+        for _ in range(50):
+            a.sendall(b"x")
