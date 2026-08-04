@@ -95,3 +95,23 @@ def test_unwrap_rejects_a_body_too_short_to_contain_counter_and_tag():
 
     with pytest.raises(FrameAuthenticationError):
         receiver.unwrap(b"short")
+
+
+def test_wrap_rejects_counter_exhaustion():
+    """Counter wraparound past 2^32 must raise FrameAuthenticationError."""
+    sender = FrameAuthenticator(b"key")
+    sender._counter = 2**32 + 1  # Force counter past the max
+
+    with pytest.raises(FrameAuthenticationError, match="frame counter exhausted"):
+        sender.wrap(b"payload")
+
+
+def test_unwrap_rejects_counter_exhaustion():
+    """Counter wraparound past 2^32 must raise FrameAuthenticationError before
+    other checks (like too-short or tag mismatch).
+    """
+    receiver = FrameAuthenticator(b"key")
+    receiver._counter = 2**32 + 1  # Force counter past the max
+
+    with pytest.raises(FrameAuthenticationError, match="frame counter exhausted"):
+        receiver.unwrap(b"short")
