@@ -2068,7 +2068,7 @@ instructions all use local editable installs, `uv pip install -e
   found on wifi's `--ip` equivalent.
 
   9 changed files (`transports/ble.py`, `connection.py`, `provisioning.py`,
-  `cli.py`, `docs/DESIGN.md`, plus tests in `test_transport_ble.py`,
+  `cli.py`, plus tests in `test_transport_ble.py`,
   `test_connection.py`, `test_provisioning.py`, `ble_fakes.py`, `test_cli.py`),
   344 tests passing (was 329).
 
