@@ -2353,11 +2353,13 @@ _c.connect()
 
 _ack1 = _c.send_preamble("status", "s3cr3t")
 # A secret is configured, so this connection is per-frame authenticated -
-# each _handle_status call sends its one reply on its own independently-
-# zeroed counter (see _handle_status's hardcoded _send_frame(..., 0)).
-_status1, _ = _c.read_authenticated_json_frame(_c.session_key, 0)
+# and the replay counter is CONNECTION-scoped, not per-mode-handler-call:
+# the second status reply comes back on counter 1, not a re-zeroed 0. The
+# counter argument is omitted so Central tracks it exactly as the real
+# PC-side BleControlChannel's one-per-connection FrameAuthenticator does.
+_status1, _ = _c.read_authenticated_json_frame(_c.session_key)
 _ack2 = _c.send_preamble("status", "s3cr3t")
-_status2, _ = _c.read_authenticated_json_frame(_c.session_key, 0)
+_status2, _ = _c.read_authenticated_json_frame(_c.session_key)
 
 print("ack1:", _ack1)
 print("hash1:", _status1["tether_app_hash"])
@@ -2407,17 +2409,20 @@ _hash = b"0badcafe"
 print("upload_ack:", _c.send_preamble("upload", "s3cr3t"))
 _key = _c.session_key
 # A secret is configured, so this connection is per-frame authenticated.
-_send_ctr = _c.send_authenticated_json_frame({"dirs": ["/lib"], "files": [
+# Counters are connection-scoped (Central tracks both directions itself,
+# like the real PC-side client), so the status reply below arrives on the
+# counter after the upload reply's - not on a re-zeroed one.
+_c.send_authenticated_json_frame({"dirs": ["/lib"], "files": [
     {"path": "/tether_app.py", "size": len(_app)},
     {"path": "/.tether_hash", "size": len(_hash)},
-]}, _key, 0)
-_send_ctr = _c.send_authenticated_bytes_frame(_app, _key, _send_ctr)
-_send_ctr = _c.send_authenticated_bytes_frame(_hash, _key, _send_ctr)
-_upload_result, _ = _c.read_authenticated_json_frame(_key, 0)
+]}, _key)
+_c.send_authenticated_bytes_frame(_app, _key)
+_c.send_authenticated_bytes_frame(_hash, _key)
+_upload_result, _ = _c.read_authenticated_json_frame(_key)
 print("upload_result:", _upload_result)
 
 print("status_ack:", _c.send_preamble("status", "s3cr3t"))
-_status, _ = _c.read_authenticated_json_frame(_key, 0)
+_status, _ = _c.read_authenticated_json_frame(_key)
 print("status_hash:", _status["tether_app_hash"])
 print("written_app:", _files["/tether_app.py"])
 """
@@ -2813,12 +2818,11 @@ _c.connect()
 
 _ack1 = _c.send_preamble("upload", "s3cr3t")
 _key = _c.session_key
-# _handle_upload tracks its own _recv_counter/_send_counter locals,
-# independently, both starting at 0 - NOT one running counter shared
-# between what we send and what we read back. The three sends below
-# (manifest, two chunks) share the recv-direction counter; the reply read
-# uses a completely separate, independently-zeroed send-direction counter.
-_send_ctr = _c.send_authenticated_json_frame(
+# The two DIRECTIONS have separate counters (what we send vs what we read
+# back), but each one is CONNECTION-scoped, not per-handler-call: the three
+# sends below (manifest, two chunks) advance the central->device counter,
+# and the upload reply arrives on the device->central counter's first value.
+_c.send_authenticated_json_frame(
     {{
         "dirs": [],
         "files": [
@@ -2827,18 +2831,19 @@ _send_ctr = _c.send_authenticated_json_frame(
         ],
     }},
     _key,
-    0,
 )
-_send_ctr = _c.send_authenticated_bytes_frame({file_content!r}, _key, _send_ctr)
-_send_ctr = _c.send_authenticated_bytes_frame({hash_content!r}, _key, _send_ctr)
-_result, _ = _c.read_authenticated_json_frame(_key, 0)
+_c.send_authenticated_bytes_frame({file_content!r}, _key)
+_c.send_authenticated_bytes_frame({hash_content!r}, _key)
+_result, _ = _c.read_authenticated_json_frame(_key)
 
-# status is a fresh call to _handle_status, which always sends its one reply
-# with a hardcoded counter of 0 (no state persists across mode-handler
-# calls on the same reused BLE connection) - so the read below also starts
-# at 0, not carried forward from the upload exchange above.
+# status is a fresh call to _handle_status, but it CONTINUES this
+# connection's send-direction counter rather than restarting it - the
+# device threads _send_counter from the upload handler into the status
+# handler, so this reply arrives on the value after the upload reply's.
+# Central tracks that itself (no explicit counter argument), exactly as the
+# real PC-side BleControlChannel does.
 _ack2 = _c.send_preamble("status", "s3cr3t")
-_status, _ = _c.read_authenticated_json_frame(_key, 0)
+_status, _ = _c.read_authenticated_json_frame(_key)
 
 print("ack1:", _ack1)
 print("upload_result:", _result)
@@ -2990,6 +2995,119 @@ print("call_value:", _payload2["value"])
     assert "handshake_type: b'\\x02'" in out, out
     assert "call_type: b'\\x02'" in out, out
     assert "call_value: 7" in out, out
+
+
+@requires_micropython
+def test_ble_boot_authenticated_counters_run_straight_through_status_upload_and_run():
+    # Post-final-review regression test for a real replay-counter lifecycle
+    # bug, and for the structural gap that let it ship: every other test in
+    # this file drives exactly ONE authenticated mode per connection, so
+    # nothing ever observed what happens to the counters at a mode SWITCH on
+    # BLE's single reused connection. PC-side tests fake the device and
+    # device-side tests fake the PC - neither crossed the boundary where the
+    # two counter sequences have to stay in lockstep.
+    #
+    # A full status -> upload -> run sequence over ONE connection, every
+    # frame authenticated, ending in a real add(3, 4) == 7 RPC round trip
+    # against the app the upload in the middle just wrote. The device must
+    # thread both counters through all three mode handlers for this to work:
+    # with the counters re-zeroed per handler call, the first frame after
+    # the first mode switch fails the receiver's counter check ("unexpected
+    # frame counter") and, under the hard-close-no-retry policy, the
+    # connection is dead on the spot.
+    from ble_fakes import combine_boot_py_with_driver
+
+    from tether.marshalling import encode_frame
+
+    boot_py = generate_ble_boot("s3cr3t")["/boot.py"].decode()
+
+    sliced_source = """\
+@mcu.export
+def add(a: int, b: int) -> int:
+    return a + b
+"""
+    tether_app_source = generate_bootstrap(sliced_source, "")
+    app_bytes = tether_app_source.encode()
+    hash_bytes = b"c0ffee01"
+
+    handshake = encode_frame(1, {"id": 1, "name": "__tether_handshake__", "args": []})
+    call = encode_frame(1, {"id": 2, "name": "add", "args": [3, 4]})
+
+    # No counter arguments anywhere below: Central tracks one pair for the
+    # whole connection, mirroring the real PC-side client (BleControlChannel
+    # builds ONE _send_auth/_recv_auth pair at handshake time and
+    # connection.py's _connect_ble hands those very instances to
+    # BleStream.enable_authentication() for run mode). Run-mode frames go
+    # through _send/_read_authenticated_frame directly - unlike the control
+    # channel, run traffic carries no extra inner length prefix (see
+    # test_ble_boot_run_mode_rpc_is_frame_authenticated_when_secret_configured).
+    driver = f"""
+import bluetooth
+import umsgpack
+
+_ble = bluetooth.BLE()
+_c = Central(_ble)
+_c.connect()
+
+# --- mode 1: status (device -> central counter starts) ---
+print("status_ack:", _c.send_preamble("status", "s3cr3t"))
+_key = _c.session_key
+_status, _ = _c.read_authenticated_json_frame(_key)
+print("hash_before:", _status["tether_app_hash"])
+
+# --- mode 2: upload, same connection, counters continue ---
+print("upload_ack:", _c.send_preamble("upload", "s3cr3t"))
+_c.send_authenticated_json_frame(
+    {{
+        "dirs": [],
+        "files": [
+            {{"path": "/tether_app.py", "size": {len(app_bytes)}}},
+            {{"path": "/.tether_hash", "size": {len(hash_bytes)}}},
+        ],
+    }},
+    _key,
+)
+_c.send_authenticated_bytes_frame({app_bytes!r}, _key)
+_c.send_authenticated_bytes_frame({hash_bytes!r}, _key)
+_upload_result, _ = _c.read_authenticated_json_frame(_key)
+print("upload_result:", _upload_result)
+
+# --- mode 3: run, same connection, counters continue again ---
+print("run_ack:", _c.send_preamble("run", "s3cr3t"))
+_c._send_authenticated_frame({handshake!r}, _key)
+_reply1, _ = _c._read_authenticated_frame(_key)
+print("handshake_type:", _reply1[4:][:1])
+
+_c._send_authenticated_frame({call!r}, _key)
+_reply2, _ = _c._read_authenticated_frame(_key)
+_frame2 = _reply2[4:]
+print("call_type:", _frame2[:1])
+print("call_value:", umsgpack.loads(_frame2[1:])["value"])
+
+# Neither sequence restarted at any mode switch: 5 frames sent (manifest,
+# two chunks, handshake, call) and 4 received (status reply, upload result,
+# handshake reply, call reply).
+print("counters:", _c.send_counter, _c.recv_counter)
+"""
+
+    combined = combine_boot_py_with_driver(
+        boot_py, driver, files={"/tether_ble.json": '{"secret": "s3cr3t"}'}
+    )
+    out = run_micropython(combined, timeout=20.0)
+
+    assert "BOOT THREAD DIED" not in out, out
+    assert "status_ack: {'ok': True}" in out, out
+    # Nothing uploaded yet on this fresh fake filesystem.
+    assert "hash_before: None" in out, out
+    assert "upload_ack: {'ok': True}" in out, out
+    assert "upload_result: {'ok': True}" in out, out
+    assert "run_ack: {'ok': True}" in out, out
+    assert "handshake_type: b'\\x02'" in out, out
+    assert "call_type: b'\\x02'" in out, out
+    # The headline: a real RPC answered correctly, by the app the
+    # authenticated upload on this same connection had just written.
+    assert "call_value: 7" in out, out
+    assert "counters: 5 4" in out, out
 
 
 def test_generate_ble_boot_produces_boot_py_and_config():
