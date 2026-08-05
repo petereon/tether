@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from tether.errors import WifiAuthError
+from tether.errors import FrameAuthenticationError, WifiAuthError
 from tether.marshalling.frame_auth import FrameAuthenticator
 from tether.transports.ble import BLE_TAG_LENGTH, BleControlChannel, BleStream, connect
 
@@ -354,6 +354,57 @@ def test_ble_stream_enable_authentication_uses_the_given_authenticator_pair():
     # rebuild one at counter=1 to confirm the envelope really is counter 1,
     # not counter 0 (which would mean enable_authentication started fresh).
     assert verify_auth.unwrap(envelope[4:]) == b"first run-mode frame"
+
+
+def test_ble_stream_read_raises_and_closes_on_a_tampered_frame():
+    # Fail-loud policy (DESIGN.md's BLE row, frame_auth.py's own docstring):
+    # a tag/counter mismatch must close the connection immediately, never
+    # retry - mirrors WifiStream's already-shipped
+    # test_wifi_stream_read_raises_and_closes_on_a_tampered_frame
+    # (tests/test_transport_wifi.py). For run mode, this close() is the
+    # ONLY thing that tears down the BLE link on tampering - Dispatcher's
+    # reader thread never calls it itself.
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    key = b"shared-session-key"
+    send_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    recv_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    stream.enable_authentication(send_auth, recv_auth)
+
+    good_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    tampered = bytearray(good_auth.wrap(b"payload"))
+    tampered[-1] ^= 0xFF
+    stream.on_notify(None, tampered)
+
+    with pytest.raises(FrameAuthenticationError):
+        stream.read()
+
+    assert client.disconnected is True
+
+
+def test_control_channel_read_authenticated_json_frame_raises_and_closes_on_a_tampered_frame():
+    # Same fail-loud requirement as above, but for the status/upload
+    # control-channel path (BleControlChannel), which owns its own
+    # authenticator pair independent of BleStream's (run mode only enables
+    # authentication on the stream once control-channel work is done - see
+    # enable_authentication's docstring). The channel doesn't own the
+    # physical connection, so it must close via self._stream.close().
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+    key = b"shared-session-key"
+    channel._recv_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+
+    good_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    inner = len(b"hello").to_bytes(4, "big") + b"hello"
+    tampered = bytearray(good_auth.wrap(inner))
+    tampered[-1] ^= 0xFF
+    stream.on_notify(None, tampered)
+
+    with pytest.raises(FrameAuthenticationError):
+        channel.read_authenticated_json_frame()
+
+    assert client.disconnected is True
 
 
 def test_stream_read_with_a_timeout_raises_oserror_not_queue_empty():

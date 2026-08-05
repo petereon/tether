@@ -39,6 +39,7 @@ import struct
 import threading
 from typing import Any
 
+from tether.errors import FrameAuthenticationError
 from tether.marshalling.frame_auth import FrameAuthenticator
 
 # Custom 128-bit UUIDs for tether's GATT service - arbitrary but fixed, so
@@ -86,6 +87,15 @@ class BleStream:
         self._queue: queue.Queue[bytes] = queue.Queue()
         self._send_auth: FrameAuthenticator | None = None
         self._recv_auth: FrameAuthenticator | None = None
+        # Leftover raw bytes for the authenticated (run-mode) read path only
+        # - a single notification chunk off self._queue can carry more (or
+        # less) than one call to _recv_exact_raw asked for, same reassembly
+        # problem BleControlChannel._buffer already solves one layer up for
+        # the control channel. Without this, bytes belonging to the NEXT
+        # header/body read would be silently swallowed into the current
+        # one. Not needed for the unauthenticated path, which never slices
+        # a queue chunk - it hands whatever it got straight back.
+        self._read_buffer = b""
 
     def enable_authentication(
         self, send_auth: FrameAuthenticator, recv_auth: FrameAuthenticator
@@ -138,11 +148,14 @@ class BleStream:
         if not body:
             return b""
         assert self._recv_auth is not None
-        return self._recv_auth.unwrap(body)
+        try:
+            return self._recv_auth.unwrap(body)
+        except FrameAuthenticationError:
+            self.close()
+            raise
 
     def _recv_exact_raw(self, n: int, timeout: float | None) -> bytes:
-        buf = b""
-        while len(buf) < n:
+        while len(self._read_buffer) < n:
             if timeout is None:
                 chunk = self._queue.get()
             else:
@@ -152,8 +165,9 @@ class BleStream:
                     raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
             if not chunk:
                 return b""
-            buf += chunk
-        return buf
+            self._read_buffer += chunk
+        result, self._read_buffer = self._read_buffer[:n], self._read_buffer[n:]
+        return result
 
     def write(self, data: bytes, timeout: float | None = None) -> None:
         """`timeout=None` (the default) blocks indefinitely - correct for
@@ -328,19 +342,35 @@ class BleControlChannel:
         return self._recv_exact(length)
 
     def _read_authenticated_body(self) -> bytes:
+        """Read one complete outer envelope off the wire and return its
+        unwrapped inner frame bytes. Both authenticated readers below share
+        this single unwrap call site so the fail-loud close-on-tamper
+        behavior only needs to live in one place - see DESIGN.md's BLE row
+        and frame_auth.py's own docstring: any tag/counter mismatch MUST
+        close the connection immediately, never retry, matching
+        WifiStream._read_authenticated_chunk's same pattern (transports/wifi.py).
+        """
         header = self._recv_exact(_LENGTH_PREFIX.size)
         (length,) = _LENGTH_PREFIX.unpack(header)
         if length > MAX_CONTROL_FRAME_SIZE:
             raise OSError(f"authenticated frame too large: declared {length} bytes")
-        return self._recv_exact(length)
+        body = self._recv_exact(length)
+        assert self._recv_auth is not None
+        try:
+            return self._recv_auth.unwrap(body)
+        except FrameAuthenticationError:
+            # The channel doesn't own the physical connection - BleStream
+            # does - so tear it down via the stream, same as
+            # BleStream._read_authenticated_chunk does for run mode.
+            self._stream.close()
+            raise
 
     def send_authenticated_json_frame(self, payload: dict[str, Any]) -> None:
         assert self._send_auth is not None
         self._stream.write(self._send_auth.wrap(self._json_frame_bytes(payload)), self._timeout)
 
     def read_authenticated_json_frame(self) -> dict[str, Any]:
-        assert self._recv_auth is not None
-        inner = self._recv_auth.unwrap(self._read_authenticated_body())
+        inner = self._read_authenticated_body()
         (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
         body = inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
         return json.loads(body.decode("utf-8"))
@@ -350,8 +380,7 @@ class BleControlChannel:
         self._stream.write(self._send_auth.wrap(self._bytes_frame_bytes(data)), self._timeout)
 
     def read_authenticated_bytes_frame(self) -> bytes:
-        assert self._recv_auth is not None
-        inner = self._recv_auth.unwrap(self._read_authenticated_body())
+        inner = self._read_authenticated_body()
         (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
         return inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
 
