@@ -2008,19 +2008,38 @@ instructions all use local editable installs, `uv pip install -e
   re-provision hint to frame-auth failures against stale boards. See
   DESIGN.md's **Correction (2026-08-05)** in the same amendment.
 
-  **Remaining, accepted limitation:** this chunk has NOT been verified
-  against real ESP32 hardware (unlike chunks 19-21, which explicitly were)
-  - only against the `micropython` unix-port subprocess via
-  `tests/mpy_runner.py`. Flagging this explicitly rather than silently
-  treating subprocess-level verification as equivalent - real-hardware
-  verification (timing under the async wrapper classes' extra buffering,
-  real TCP behavior under a tampered/dropped connection) should happen
-  before this is considered as solid as the modes it's wrapping.
+  **Real-hardware verification (2026-08-05):** verified end-to-end against
+  a real ESP32 over real wifi (`tether provision wifi`, then `tether
+  status --ip`, then a full `mcu.connect("wifi:<ip>", secret=...)` session).
+  All three modes confirmed working with the domain-separated session key:
+  `status` (authenticated reply round-trips correctly), `upload`
+  (legitimate zero-file and real-bundle uploads succeed; a deliberately
+  tampered chunk is rejected with a clean authenticated `{"ok": False,
+  "error": "frame authentication tag mismatch"}` reply, not a crash or
+  silent acceptance), and `run` (real RPC calls - `add(3, 4) == 7`, string
+  echo - round-tripped over authenticated frames both directions).
 
-  9 changed files (`errors.py`, new `marshalling/frame_auth.py`,
-  `transports/wifi.py`, `connection.py`, `provisioning.py`, plus tests in
+  **Real bug found by this verification, fixed before merge:** `tether
+  status --ip` (`cli.py::status_command`) has its own independent
+  `send_preamble()`/reply-read call pair, separate from
+  `connection.py::_query_status()` (which Task 3 already updated) - nobody
+  had wired per-frame authentication into this second call site, so it
+  tried to parse the device's now-enveloped (binary) authenticated status
+  reply as plain JSON and crashed with `UnicodeDecodeError`. Fixed to
+  mirror `_query_status()`'s own session-key branch exactly, including
+  reusing `connection.py`'s `_hint_if_frame_auth_failure` for a stale-board
+  hint. Root cause of the miss: every existing test for this command
+  monkeypatched `send_preamble` to implicitly return `None` (the
+  unauthenticated case) - added
+  `test_status_command_uses_authenticated_read_when_session_key_present`
+  (`tests/test_cli.py`) as a regression guard for the authenticated branch
+  specifically, so this class of gap can't silently recur.
+
+  10 changed files (`errors.py`, new `marshalling/frame_auth.py`,
+  `transports/wifi.py`, `connection.py`, `provisioning.py`, `cli.py`,
+  `dispatch/__init__.py`, `docs/DESIGN.md`, plus tests in
   `test_frame_auth.py` (new), `test_transport_wifi.py`, `test_connection.py`,
-  `test_provisioning.py`), 323 tests passing (was 299).
+  `test_provisioning.py`, `test_cli.py`), 329 tests passing (was 299).
 
 ---
 

@@ -395,6 +395,10 @@ def status_command(
                 return
 
     if ip:
+        from tether.connection import _hint_if_frame_auth_failure
+        from tether.errors import FrameAuthenticationError
+        from tether.marshalling.frame_auth import FrameAuthenticator
+
         resolved_secret = secret if secret is not None else os.environ.get("TETHER_WIFI_SECRET")
         payload = None
         try:
@@ -404,12 +408,19 @@ def status_command(
         if sock is not None:
             try:
                 try:
-                    wifi_transport.send_preamble(sock, "status", resolved_secret)
-                    payload = wifi_transport.read_json_frame(sock)
+                    session_key = wifi_transport.send_preamble(sock, "status", resolved_secret)
+                    if session_key is None:
+                        payload = wifi_transport.read_json_frame(sock)
+                    else:
+                        payload = wifi_transport.read_authenticated_json_frame(
+                            sock, FrameAuthenticator(session_key)
+                        )
                 except WifiAuthError:
                     raise click.ClickException(
                         f"wifi auth failed for {ip} - check --secret/TETHER_WIFI_SECRET"
                     ) from None
+                except FrameAuthenticationError as exc:
+                    raise click.ClickException(str(_hint_if_frame_auth_failure(exc))) from None
                 except OSError:
                     # device became unreachable mid-exchange - fall through
                     # to the raw-REPL fallback below, same as a failed
