@@ -11,7 +11,8 @@ from typing import Any
 
 from tether._context import current_board
 from tether.dispatch import DEFAULT_TIMEOUT, Dispatcher
-from tether.errors import ProtocolVersionError
+from tether.errors import FrameAuthenticationError, MCUDisconnectedError, ProtocolVersionError
+from tether.marshalling.frame_auth import FrameAuthenticator
 from tether.slicer import generate_pc_stubs, slice_mcu_bound
 
 # Bumped whenever the wire protocol or dispatch runtime contract changes in
@@ -249,6 +250,31 @@ def _capture_caller() -> tuple[str, Path, dict[str, Any], dict[str, Callable[...
 
 def _hash_bundle(bootstrap: str) -> str:
     return hashlib.sha256(bootstrap.encode()).hexdigest()
+
+
+def _hint_if_frame_auth_failure(exc: Exception) -> Exception:
+    """If `exc` is (or wraps, for run mode's Dispatcher-mediated path) a
+    FrameAuthenticationError, return a new exception of the same type with
+    an actionable hint appended - the likely cause is a board provisioned
+    before per-frame authentication shipped (2026-08-05), which needs
+    `tether provision wifi` re-run (this is a breaking wire change with no
+    negotiation/fallback - see DESIGN.md's Per-frame authentication note).
+    Returns `exc` unchanged for any other exception type.
+
+    Run mode needs the second (wrapped) case because Dispatcher's reader
+    thread converts ANY read exception into MCUDisconnectedError, so the
+    FrameAuthenticationError only survives as text by then.
+    """
+    hint = (
+        " (if this board was provisioned before per-frame authentication "
+        "shipped, re-run `tether provision wifi` - this is a breaking wire "
+        "change with no fallback, see DESIGN.md)"
+    )
+    if isinstance(exc, FrameAuthenticationError):
+        return FrameAuthenticationError(str(exc) + hint)
+    if isinstance(exc, MCUDisconnectedError) and "FrameAuthenticationError" in str(exc):
+        return MCUDisconnectedError(str(exc) + hint)
+    return exc
 
 
 def _start_and_handshake(
@@ -550,11 +576,26 @@ def _connect_wifi(
     last_stream: Any | None = None
 
     def _query_status(sock: Any) -> dict[str, Any]:
-        wifi_transport.send_preamble(sock, "status", resolved_secret)
-        return wifi_transport.read_json_frame(sock)
+        session_key = wifi_transport.send_preamble(sock, "status", resolved_secret)
+        if session_key is None:
+            return wifi_transport.read_json_frame(sock)
+        try:
+            return wifi_transport.read_authenticated_json_frame(
+                sock, FrameAuthenticator(session_key)
+            )
+        except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+            raise _hint_if_frame_auth_failure(exc) from exc
 
     def _upload(sock: Any) -> None:
-        wifi_transport.send_preamble(sock, "upload", resolved_secret)
+        try:
+            _upload_frames(sock)
+        except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+            raise _hint_if_frame_auth_failure(exc) from exc
+
+    def _upload_frames(sock: Any) -> None:
+        session_key = wifi_transport.send_preamble(sock, "upload", resolved_secret)
+        send_auth = FrameAuthenticator(session_key) if session_key is not None else None
+        recv_auth = FrameAuthenticator(session_key) if session_key is not None else None
         # Full bundle (tether_runtime library + app + hash), same set and
         # same dirs-sorted-by-depth-by-the-client convention
         # _upload_if_needed uses for serial - see _gather_runtime_bundle.
@@ -563,7 +604,10 @@ def _connect_wifi(
             "dirs": list(dirs),
             "files": [{"path": path, "size": len(content)} for path, content in files.items()],
         }
-        wifi_transport.send_json_frame(sock, manifest)
+        if send_auth is not None:
+            wifi_transport.send_authenticated_json_frame(sock, send_auth, manifest)
+        else:
+            wifi_transport.send_json_frame(sock, manifest)
         # Split each file's content into slices no larger than
         # MAX_CONTROL_FRAME_SIZE (64 KiB) - the whole control channel's
         # invariant (design spec) is "no single frame ever needs to hold
@@ -580,8 +624,15 @@ def _connect_wifi(
         max_chunk = wifi_transport.MAX_CONTROL_FRAME_SIZE
         for content in files.values():
             for offset in range(0, len(content), max_chunk):
-                wifi_transport.send_bytes_frame(sock, content[offset : offset + max_chunk])
-        result = wifi_transport.read_json_frame(sock)
+                chunk = content[offset : offset + max_chunk]
+                if send_auth is not None:
+                    wifi_transport.send_authenticated_bytes_frame(sock, send_auth, chunk)
+                else:
+                    wifi_transport.send_bytes_frame(sock, chunk)
+        if recv_auth is not None:
+            result = wifi_transport.read_authenticated_json_frame(sock, recv_auth)
+        else:
+            result = wifi_transport.read_json_frame(sock)
         if not result.get("ok", False):
             raise RuntimeError(f"wifi upload failed: {result.get('error')}")
 
@@ -624,15 +675,20 @@ def _connect_wifi(
         stream = wifi_transport.connect(host, port, timeout=timeout, switch_to_blocking=False)
         last_stream = stream
         try:
-            wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
+            session_key = wifi_transport.send_preamble(stream._sock, "run", resolved_secret)
             stream._sock.settimeout(None)
-            return _start_and_handshake(
-                stream,
-                timeout=timeout,
-                mismatch_hint="update tether or the on-device runtime",
-                pc_handlers=pc_handlers,
-                board=board,
-            )
+            if session_key is not None:
+                stream.enable_authentication(session_key)
+            try:
+                return _start_and_handshake(
+                    stream,
+                    timeout=timeout,
+                    mismatch_hint="update tether or the on-device runtime",
+                    pc_handlers=pc_handlers,
+                    board=board,
+                )
+            except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+                raise _hint_if_frame_auth_failure(exc) from exc
         except BaseException:
             stream.close()
             last_stream = None

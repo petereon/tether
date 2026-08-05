@@ -1975,6 +1975,72 @@ instructions all use local editable installs, `uv pip install -e
   2 changed files (`pyproject.toml`, `uv.lock`), no test/behavior changes
   - 299 tests passing, unchanged.
 
+- [x] **22. Wifi per-frame authentication** — done 2026-08-05
+  Closes the gap where only the wifi handshake itself was authenticated -
+  every frame after it rode the wire in the clear. Adds a generic,
+  transport-agnostic envelope codec (`tether.marshalling.frame_auth.
+  FrameAuthenticator`) wrapping every frame post-handshake in
+  `[4-byte outer-length][4-byte counter][inner frame][16-byte truncated
+  HMAC-SHA256 tag]`, session key reused from the handshake's own HMAC
+  output (no extra round trip), per-direction replay-protected counters,
+  hard-close-no-retry on any verification failure. Applies uniformly
+  across `status`/`upload`/`run` on the PC side (`wifi.py`, `connection.py`)
+  and the device side (new helpers in `provisioning.py`'s generated
+  boot.py, plus async `_AuthenticatedReader`/`_AuthenticatedWriter` wrapper
+  classes for `run` mode's uasyncio-based stream). Skipped entirely under
+  `--danger-unauthenticated`. Deliberately wifi-only - BLE explicitly out
+  of scope, tracked as a follow-up (the codec's configurable tag length
+  exists specifically for BLE's tighter MTU budget when that follow-up
+  lands). Breaking change: boards provisioned before this chunk need
+  `tether provision wifi` re-run - no negotiation/fallback was added. See
+  `docs/DESIGN.md`'s 2026-08-04 "Per-frame authentication" amendment for
+  the full design rationale and the grill-me interview that produced it.
+
+  **Post-review correction (2026-08-05), before merge:** the session-key
+  derivation described above ("reused from the handshake's own HMAC
+  output") was a security bug - it made the session key identical to the
+  `response` field sent in the clear during the handshake, so any observer
+  could recover the frame key and forge frames. Fixed by domain-separating
+  the two: `session_key = HMAC-SHA256(secret, "tether-frame-key" || nonce)`.
+  Same review also widened the authenticated *outer*-envelope length bounds
+  by a fixed `ENVELOPE_OVERHEAD` (24 bytes), so a legitimate 64 KiB payload
+  is no longer rejected as "frame too large" once wrapped, and added a
+  re-provision hint to frame-auth failures against stale boards. See
+  DESIGN.md's **Correction (2026-08-05)** in the same amendment.
+
+  **Real-hardware verification (2026-08-05):** verified end-to-end against
+  a real ESP32 over real wifi (`tether provision wifi`, then `tether
+  status --ip`, then a full `mcu.connect("wifi:<ip>", secret=...)` session).
+  All three modes confirmed working with the domain-separated session key:
+  `status` (authenticated reply round-trips correctly), `upload`
+  (legitimate zero-file and real-bundle uploads succeed; a deliberately
+  tampered chunk is rejected with a clean authenticated `{"ok": False,
+  "error": "frame authentication tag mismatch"}` reply, not a crash or
+  silent acceptance), and `run` (real RPC calls - `add(3, 4) == 7`, string
+  echo - round-tripped over authenticated frames both directions).
+
+  **Real bug found by this verification, fixed before merge:** `tether
+  status --ip` (`cli.py::status_command`) has its own independent
+  `send_preamble()`/reply-read call pair, separate from
+  `connection.py::_query_status()` (which Task 3 already updated) - nobody
+  had wired per-frame authentication into this second call site, so it
+  tried to parse the device's now-enveloped (binary) authenticated status
+  reply as plain JSON and crashed with `UnicodeDecodeError`. Fixed to
+  mirror `_query_status()`'s own session-key branch exactly, including
+  reusing `connection.py`'s `_hint_if_frame_auth_failure` for a stale-board
+  hint. Root cause of the miss: every existing test for this command
+  monkeypatched `send_preamble` to implicitly return `None` (the
+  unauthenticated case) - added
+  `test_status_command_uses_authenticated_read_when_session_key_present`
+  (`tests/test_cli.py`) as a regression guard for the authenticated branch
+  specifically, so this class of gap can't silently recur.
+
+  10 changed files (`errors.py`, new `marshalling/frame_auth.py`,
+  `transports/wifi.py`, `connection.py`, `provisioning.py`, `cli.py`,
+  `dispatch/__init__.py`, `docs/DESIGN.md`, plus tests in
+  `test_frame_auth.py` (new), `test_transport_wifi.py`, `test_connection.py`,
+  `test_provisioning.py`, `test_cli.py`), 329 tests passing (was 299).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

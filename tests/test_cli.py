@@ -294,6 +294,65 @@ def test_status_command_tries_wifi_socket_first(monkeypatch):
     assert ("reset_board",) not in calls
 
 
+def test_status_command_uses_authenticated_read_when_session_key_present(monkeypatch):
+    # Regression test: found against real ESP32 hardware (2026-08-05) -
+    # status_command had its own separate send_preamble()/read_json_frame()
+    # call pair that was never updated when per-frame authentication
+    # shipped, so it tried to parse the device's now-enveloped (binary)
+    # authenticated reply as plain JSON and crashed with a
+    # UnicodeDecodeError. test_status_command_tries_wifi_socket_first above
+    # never caught this because its fake_send_preamble implicitly returns
+    # None (the unauthenticated case) - this test exercises the
+    # authenticated branch specifically.
+    calls = []
+
+    class _FakeSocket:
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    session_key = b"a-fake-32-byte-session-key-here"
+
+    def fake_send_preamble(sock, mode, secret):
+        calls.append(("preamble", mode))
+        return session_key
+
+    def fake_read_authenticated_json_frame(sock, authenticator):
+        calls.append(("authenticated_status_payload", authenticator))
+        return {
+            "protocol_version": 1,
+            "tether_app_hash": "abc123",
+            "free_heap": 50000,
+            "uptime_ms": 1234,
+            "ip": "192.168.1.50",
+        }
+
+    def fail_if_called(*a, **kw):
+        raise AssertionError("plain read_json_frame must not be called when a session key exists")
+
+    monkeypatch.setattr("socket.create_connection", lambda *a, **kw: _FakeSocket())
+    monkeypatch.setattr("tether.transports.wifi.send_preamble", fake_send_preamble)
+    monkeypatch.setattr("tether.transports.wifi.read_json_frame", fail_if_called)
+    monkeypatch.setattr(
+        "tether.transports.wifi.read_authenticated_json_frame", fake_read_authenticated_json_frame
+    )
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board",
+        lambda ser: calls.append(("reset_board",)),
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--port", "/dev/ttyUSB0", "--ip", "192.168.1.50", "--secret", "the-secret"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "192.168.1.50" in result.output
+    assert [name for name, *_ in calls] == ["preamble", "authenticated_status_payload"]
+    assert calls[1][1].__class__.__name__ == "FrameAuthenticator"
+
+
 def test_status_command_falls_back_to_raw_repl_when_wifi_socket_unreachable(monkeypatch):
     import json
 

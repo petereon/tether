@@ -37,3 +37,13 @@ class WifiAuthError(TetherError):
     """The wifi listener rejected this connection's shared secret (or its
     absence) during the mode-selection preamble.
     """
+
+
+class FrameAuthenticationError(TetherError):
+    """A per-frame HMAC tag or replay counter failed verification on an
+    authenticated wifi (or future BLE) connection.
+
+    Always fatal: the connection is closed immediately after this is
+    raised, never retried on the same frame - see DESIGN.md § Transports'
+    Wifi row, "Per-frame authentication".
+    """
