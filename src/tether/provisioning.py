@@ -133,11 +133,11 @@ def _recv_frame(_conn, _session_key, _counter):
     # which legitimately runs _ENVELOPE_OVERHEAD bytes larger than the
     # payload it carries (counter + tag + the inner length prefix above) -
     # bounding it at the bare _MAX_CTRL_FRAME would reject a legal
-    # max-size upload chunk. Split rather than shared for a second reason
-    # too: _ENVELOPE_OVERHEAD (like _TAG_LENGTH already) is only defined
-    # by the wifi template, and this source is shared with BLE, whose
-    # _session_key is always None - so the name must stay confined to the
-    # authenticated branch BLE never reaches.
+    # max-size upload chunk. Both _TAG_LENGTH and _ENVELOPE_OVERHEAD are
+    # defined by BOTH templates that embed this source, with different
+    # values (wifi 16/24, BLE 8/16 - see each template's own constants),
+    # and BLE reaches the authenticated branch for real, so neither name
+    # may be assumed wifi-only here.
     _header = _recv_exact(_conn, 4)
     _length = int.from_bytes(_header, "big")
     if _session_key is None:
@@ -166,11 +166,16 @@ def _send_frame(_conn, _data, _session_key, _counter):
     return _counter + 1
 
 class _AuthenticatedReader:
-    def __init__(self, _inner, _session_key, _tag_length):
+    # `_counter` is where this direction's replay counter is PICKED UP, not
+    # necessarily 0: on BLE one physical connection carries a whole
+    # status/upload/run sequence and the counters run straight through it
+    # (see _BLE_BOOT_TEMPLATE's session loop). Wifi passes 0 because a wifi
+    # connection only ever serves one mode before closing.
+    def __init__(self, _inner, _session_key, _tag_length, _counter):
         self._inner = _inner
         self._session_key = _session_key
         self._tag_length = _tag_length
-        self._counter = 0
+        self._counter = _counter
         self._pending = b""
 
     async def readexactly(self, _n):
@@ -193,11 +198,12 @@ class _AuthenticatedReader:
         self._pending += _inner_bytes
 
 class _AuthenticatedWriter:
-    def __init__(self, _inner, _session_key, _tag_length):
+    # See _AuthenticatedReader's note on `_counter` above.
+    def __init__(self, _inner, _session_key, _tag_length, _counter):
         self._inner = _inner
         self._session_key = _session_key
         self._tag_length = _tag_length
-        self._counter = 0
+        self._counter = _counter
 
     def write(self, _data):
         self._inner.write(_envelope_wrap(self._session_key, self._counter, _data, self._tag_length))
@@ -206,7 +212,12 @@ class _AuthenticatedWriter:
     async def drain(self):
         await self._inner.drain()
 
-def _handle_status(_conn, _get_addr, _session_key):
+def _handle_status(_conn, _get_addr, _session_key, _send_counter):
+    # Takes the send-direction counter in and hands the advanced one back
+    # rather than assuming this call owns the whole connection's counter
+    # lifetime. Wifi's caller passes 0 and discards the result (one handler
+    # call IS the whole connection there); BLE's caller keeps it, because
+    # the very next mode on the same connection continues from it.
     _hash = None
     try:
         with open("/.tether_hash") as _hf:
@@ -220,9 +231,9 @@ def _handle_status(_conn, _get_addr, _session_key):
         "uptime_ms": time.ticks_diff(time.ticks_ms(), _boot_ms),
         "ip": _get_addr(),
     }}
-    _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, 0)
+    return _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, _send_counter)
 
-def _handle_run(_conn, _make_streams, _session_key):
+def _handle_run(_conn, _make_streams, _session_key, _recv_counter, _send_counter):
     try:
         with open("/tether_app.py") as _f:
             _tether_app_src = _f.read()
@@ -232,7 +243,7 @@ def _handle_run(_conn, _make_streams, _session_key):
     if _tether_app_src is not None:
         import uasyncio as _asyncio
 
-        _reader, _writer = _make_streams(_conn, _session_key)
+        _reader, _writer = _make_streams(_conn, _session_key, _recv_counter, _send_counter)
         try:
             exec(
                 _tether_app_src,
@@ -266,9 +277,10 @@ def _handle_run(_conn, _make_streams, _session_key):
             # it, each session's tick count stays roughly constant.
             _asyncio.new_event_loop()
 
-def _handle_upload(_conn, _session_key):
-    _recv_counter = 0
-    _send_counter = 0
+def _handle_upload(_conn, _session_key, _recv_counter, _send_counter):
+    # Both directions' counters come in as parameters and go back out
+    # advanced - see _handle_status's own note above for why they are no
+    # longer assumed to start fresh at 0 on every call.
     try:
         # Invalidate the OLD hash sentinel FIRST, before writing any
         # file - .tether_hash is written last on success (matching
@@ -327,9 +339,15 @@ def _handle_upload(_conn, _session_key):
     except Exception as _exc:
         _reply = {{"ok": False, "error": str(_exc)}}
     try:
-        _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, _send_counter)
+        _send_counter = _send_frame(_conn, _json.dumps(_reply).encode(), _session_key, _send_counter)
     except OSError:
+        # Deliberately leaves _send_counter where it was: the reply never
+        # made it onto the wire, so the peer's own recv-direction counter
+        # did not advance either, and a later mode on this same (BLE)
+        # connection must continue from the unadvanced value or every
+        # subsequent frame is off by one.
         pass
+    return _recv_counter, _send_counter
 """
 
 # Fixed template - never contains credentials or the shared secret (those
@@ -384,7 +402,7 @@ if _cfg is not None:
         _ENVELOPE_OVERHEAD = 24  # must match tether.marshalling.frame_auth.ENVELOPE_OVERHEAD
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "        ")}
-        def _wifi_make_streams(_conn, _session_key):
+        def _wifi_make_streams(_conn, _session_key, _recv_counter, _send_counter):
             import uasyncio as _asyncio
 
             _reader = _asyncio.StreamReader(_conn)
@@ -392,8 +410,8 @@ if _cfg is not None:
             if _session_key is None:
                 return _reader, _writer
             return (
-                _AuthenticatedReader(_reader, _session_key, _TAG_LENGTH),
-                _AuthenticatedWriter(_writer, _session_key, _TAG_LENGTH),
+                _AuthenticatedReader(_reader, _session_key, _TAG_LENGTH, _recv_counter),
+                _AuthenticatedWriter(_writer, _session_key, _TAG_LENGTH, _send_counter),
             )
 
         _addr = _socket.getaddrinfo("0.0.0.0", {DEFAULT_PORT})[0][-1]
@@ -432,15 +450,23 @@ if _cfg is not None:
                     _expected_response = None
                 if _expected_secret is not None and _response != _expected_response:
                     _send_json_frame(_conn, {{"ok": False, "error": "auth failed"}})
+                # Literal 0s, and the returned counters discarded: this loop
+                # serves exactly ONE mode per accepted connection and then
+                # closes it (below), so every handler call legitimately owns
+                # a fresh counter pair - unlike BLE, which reuses one
+                # connection across modes and must thread them through (see
+                # _BLE_BOOT_TEMPLATE's session loop). Passing 0 explicitly
+                # only makes visible what these handlers used to hardcode
+                # internally; wifi's wire behavior is unchanged.
                 elif _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_status(_conn, lambda: _wlan.ifconfig()[0], _session_key)
+                    _handle_status(_conn, lambda: _wlan.ifconfig()[0], _session_key, 0)
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_run(_conn, _wifi_make_streams, _session_key)
+                    _handle_run(_conn, _wifi_make_streams, _session_key, 0, 0)
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_upload(_conn, _session_key)
+                    _handle_upload(_conn, _session_key, 0, 0)
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
             except Exception:
@@ -548,6 +574,8 @@ if _cfg is not None:
 
     _boot_ms = time.ticks_ms()
     _MAX_CTRL_FRAME = 65536
+    _TAG_LENGTH = 8  # must match tether.transports.ble.BLE_TAG_LENGTH
+    _ENVELOPE_OVERHEAD = 16  # must match ble.py's own constant (see Task 1)
     _ADV_PAYLOAD = {_BLE_ADV_PAYLOAD!r}
     _ADV_INTERVAL_US = 100000
     # How long to wait for a requested disconnect's IRQ to confirm the link
@@ -725,10 +753,7 @@ if _cfg is not None:
             _result, self._buffer = self._buffer, b""
             return _result
 
-    def _ble_make_streams(_conn, _session_key):
-        # _session_key is always None here (BLE per-frame auth is out of
-        # scope for this plan) - accepted only so this matches the shared
-        # _handle_run's `_make_streams(_conn, _session_key)` call.
+    def _ble_make_streams(_conn, _session_key, _recv_counter, _send_counter):
         # Seeded with whatever the synchronous preamble read over-consumed,
         # so no byte is lost handing this connection over to run mode.
         _leftover = [_conn.take_buffer()]
@@ -753,7 +778,18 @@ if _cfg is not None:
             async def drain(self):
                 await _asyncio.sleep_ms(0)
 
-        return _BleAsyncReader(), _BleAsyncWriter()
+        if _session_key is None:
+            return _BleAsyncReader(), _BleAsyncWriter()
+        # Seeded with the counters this connection has already reached
+        # across any preceding status/upload exchanges - run mode continues
+        # the same two counter sequences, it does not restart them. The PC
+        # side does exactly this too: connection.py's _connect_ble hands
+        # BleStream.enable_authentication() the SAME FrameAuthenticator
+        # pair BleControlChannel has been using since the handshake.
+        return (
+            _AuthenticatedReader(_BleAsyncReader(), _session_key, _TAG_LENGTH, _recv_counter),
+            _AuthenticatedWriter(_BleAsyncWriter(), _session_key, _TAG_LENGTH, _send_counter),
+        )
 
     def _start_advertising():
         \"\"\"True once the board is actually advertising again. NimBLE
@@ -824,6 +860,22 @@ if _cfg is not None:
             _expected_secret = _cfg.get("secret")
             _nonce = _uos.urandom(16)
             _authenticated = _expected_secret is None
+            _session_key = (
+                None
+                if _expected_secret is None
+                else _hmac_sha256(_expected_secret.encode(), b"tether-frame-key" + _nonce)
+            )
+            # Connection-scoped, NOT per-mode: one physical BLE connection
+            # carries a whole status/upload/run sequence, and both the
+            # session key and these two counters must live for its entire
+            # lifetime (DESIGN.md, BLE row, per-frame authentication). The
+            # PC side's BleControlChannel keeps one _send_auth/_recv_auth
+            # pair per connection for exactly this reason; a handler that
+            # restarted at 0 on its second call would desync the two sides
+            # on the very next frame, and the hard-close-no-retry policy
+            # turns that straight into a dead connection.
+            _recv_counter = 0
+            _send_counter = 0
             _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
             # Resend on a timer until the central's first preamble actually
             # lands in _queue - see _NONCE_RESEND_MS's own comment above for
@@ -856,22 +908,17 @@ if _cfg is not None:
                     _authenticated = True
                 if _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    # BLE has no per-frame authentication yet (out of
-                    # scope for this plan - see DESIGN.md's BLE row) -
-                    # _session_key stays None, which makes the shared
-                    # _handle_status/_handle_upload fall through to their
-                    # plain, unauthenticated wire format exactly as
-                    # before.
-                    _handle_status(_conn, lambda: _ble_addr_str, None)
+                    _send_counter = _handle_status(
+                        _conn, lambda: _ble_addr_str, _session_key, _send_counter
+                    )
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_upload(_conn, None)
+                    _recv_counter, _send_counter = _handle_upload(
+                        _conn, _session_key, _recv_counter, _send_counter
+                    )
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    # BLE per-frame auth is out of scope for this plan (see
-                    # the status/upload call sites' own comment above) -
-                    # _session_key is always None here.
-                    _handle_run(_conn, _ble_make_streams, None)
+                    _handle_run(_conn, _ble_make_streams, _session_key, _recv_counter, _send_counter)
                     break
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})

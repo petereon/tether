@@ -405,6 +405,24 @@ class Central:
         # answers it - later calls on the same (simulated) connection just
         # send {mode}. See transports/ble.py's send_preamble docstring.
         self._authenticated = False
+        # Set by send_preamble() once a secret is presented, mirroring
+        # BleControlChannel's own session-key caching - test driver scripts
+        # read this back to drive the authenticated frame helpers below.
+        self.session_key = None
+        # Connection-scoped replay counters, one per direction, mirroring
+        # the real PC-side client: BleControlChannel builds ONE
+        # _send_auth/_recv_auth FrameAuthenticator pair when the handshake
+        # completes and keeps it for the whole physical connection - across
+        # every status/upload preamble and on into run mode, where
+        # connection.py's _connect_ble hands those very same instances to
+        # BleStream.enable_authentication(). Counters therefore run
+        # straight through mode switches and never reset mid-connection,
+        # which is exactly what the device does too. Driver scripts that
+        # omit the `counter` argument to the helpers below get this
+        # tracking for free; passing one explicitly (for a deliberately
+        # out-of-sequence or tampered frame) still works and re-syncs these.
+        self.send_counter = 0  # central -> device
+        self.recv_counter = 0  # device -> central
 
     def connect(self):
         self._ble._simulate_connect(self._conn)
@@ -463,13 +481,59 @@ class Central:
             _nonce = _c_unhexlify(_nonce_frame["nonce"])
             if secret is not None:
                 _response = _c_hexlify(_c_hmac_sha256(secret.encode(), _nonce))
+                self.session_key = self._derive_session_key(secret, _nonce)
             else:
                 _response = None
+                self.session_key = None
             self.send_json_frame({"mode": mode, "response": _response})
             self._authenticated = True
         else:
             self.send_json_frame({"mode": mode})
         return self.read_json_frame()
+
+    def _derive_session_key(self, secret, nonce):
+        return _c_hmac_sha256(secret.encode(), b"tether-frame-key" + nonce)
+
+    def send_authenticated_json_frame(self, obj, session_key, counter=None):
+        _body = _cjson.dumps(obj).encode()
+        _inner = len(_body).to_bytes(4, "big") + _body
+        return self._send_authenticated_frame(_inner, session_key, counter)
+
+    def send_authenticated_bytes_frame(self, data, session_key, counter=None):
+        _inner = len(data).to_bytes(4, "big") + data
+        return self._send_authenticated_frame(_inner, session_key, counter)
+
+    def _send_authenticated_frame(self, inner, session_key, counter=None):
+        if counter is None:
+            counter = self.send_counter
+        _counter_bytes = counter.to_bytes(4, "big")
+        _tag = _c_hmac_sha256(session_key, _counter_bytes + inner)[:8]
+        _envelope = _counter_bytes + inner + _tag
+        self.write(len(_envelope).to_bytes(4, "big") + _envelope)
+        self.send_counter = counter + 1
+        return counter + 1
+
+    def read_authenticated_json_frame(self, session_key, counter=None):
+        _inner, _next_counter = self._read_authenticated_frame(session_key, counter)
+        _length = int.from_bytes(_inner[:4], "big")
+        return _cjson.loads(_inner[4 : 4 + _length]), _next_counter
+
+    def _read_authenticated_frame(self, session_key, counter=None):
+        if counter is None:
+            counter = self.recv_counter
+        _length = int.from_bytes(self.recv_exact(4), "big")
+        _body = self.recv_exact(_length)
+        _counter_bytes = _body[:4]
+        _tag = _body[-8:]
+        _inner = _body[4:-8]
+        _got_counter = int.from_bytes(_counter_bytes, "big")
+        if _got_counter != counter:
+            raise OSError("unexpected frame counter")
+        _expected_tag = _c_hmac_sha256(session_key, _counter_bytes + _inner)[:8]
+        if _tag != _expected_tag:
+            raise OSError("frame authentication tag mismatch")
+        self.recv_counter = counter + 1
+        return _inner, counter + 1
 """
 
 

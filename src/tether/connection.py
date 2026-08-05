@@ -761,8 +761,14 @@ def _connect_ble(
             # long-lived Dispatcher needs.
             channel = ble_transport.BleControlChannel(stream, timeout=timeout)
 
-            channel.send_preamble("status", resolved_secret)
-            status = channel.read_json_frame()
+            session_key = channel.send_preamble("status", resolved_secret)
+            if session_key is None:
+                status = channel.read_json_frame()
+            else:
+                try:
+                    status = channel.read_authenticated_json_frame()
+                except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+                    raise _hint_if_frame_auth_failure(exc) from exc
 
             if status.get("tether_app_hash") != bundle_hash:
                 channel.send_preamble("upload", resolved_secret)
@@ -773,12 +779,25 @@ def _connect_ble(
                         {"path": path, "size": len(content)} for path, content in files.items()
                     ],
                 }
-                channel.send_json_frame(manifest)
+                if session_key is None:
+                    channel.send_json_frame(manifest)
+                else:
+                    channel.send_authenticated_json_frame(manifest)
                 max_chunk = ble_transport.MAX_CONTROL_FRAME_SIZE
                 for content in files.values():
                     for offset in range(0, len(content), max_chunk):
-                        channel.send_bytes_frame(content[offset : offset + max_chunk])
-                result = channel.read_json_frame()
+                        chunk = content[offset : offset + max_chunk]
+                        if session_key is None:
+                            channel.send_bytes_frame(chunk)
+                        else:
+                            channel.send_authenticated_bytes_frame(chunk)
+                if session_key is None:
+                    result = channel.read_json_frame()
+                else:
+                    try:
+                        result = channel.read_authenticated_json_frame()
+                    except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+                        raise _hint_if_frame_auth_failure(exc) from exc
                 if not result.get("ok", False):
                     raise RuntimeError(f"BLE upload failed: {result.get('error')}")
 
@@ -800,13 +819,18 @@ def _connect_ble(
                 "the run-mode handover - they would be lost handing the raw stream to the "
                 "Dispatcher (the device side drains its own buffer here via take_buffer())"
             )
-            return _start_and_handshake(
-                stream,
-                timeout=timeout,
-                mismatch_hint="update tether or the on-device runtime",
-                pc_handlers=pc_handlers,
-                board=board,
-            )
+            if session_key is not None:
+                stream.enable_authentication(channel._send_auth, channel._recv_auth)
+            try:
+                return _start_and_handshake(
+                    stream,
+                    timeout=timeout,
+                    mismatch_hint="update tether or the on-device runtime",
+                    pc_handlers=pc_handlers,
+                    board=board,
+                )
+            except (FrameAuthenticationError, MCUDisconnectedError) as exc:
+                raise _hint_if_frame_auth_failure(exc) from exc
         except BaseException:
             stream.close()
             last_stream = None

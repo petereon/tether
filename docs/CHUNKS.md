@@ -2041,6 +2041,70 @@ instructions all use local editable installs, `uv pip install -e
   `test_frame_auth.py` (new), `test_transport_wifi.py`, `test_connection.py`,
   `test_provisioning.py`, `test_cli.py`), 329 tests passing (was 299).
 
+- [x] **23. BLE per-frame authentication** — done 2026-08-05
+  Extends chunk 22's wifi per-frame authentication to BLE, closing the
+  same gap (only the handshake was authenticated; every frame after it
+  rode the wire in the clear). Reuses `tether.marshalling.frame_auth.FrameAuthenticator`
+  and the device-side `_AuthenticatedReader`/`_AuthenticatedWriter`
+  classes completely unchanged. Three deliberate divergences from wifi,
+  all driven by BLE's structural differences (see `docs/DESIGN.md`'s BLE
+  row, "Per-frame authentication (2026-08-06)" for the full rationale):
+  (1) session key and replay counters are scoped to the whole physical BLE
+  connection, not per mode, since BLE reuses one connection across
+  `status`→`upload`→`run` (wifi opens a fresh connection per mode) - `BleControlChannel`
+  derives and caches the session key once, `BleStream.enable_authentication()`
+  takes an existing authenticator pair (not a session key) specifically to
+  preserve counter continuity across the mode-switch boundary; (2) 8-byte
+  tag (not wifi's 16) - a latency-overhead tradeoff, not a correctness
+  one, since BLE's chunking is transparent to frame size and has no hard
+  rejection ceiling to defend the way wifi's `MAX_CONTROL_FRAME_SIZE` did;
+  (3) BLE's existing custom async stream adapter (`_BleAsyncReader`/`_BleAsyncWriter`)
+  is wrapped by the SAME `_AuthenticatedReader`/`_AuthenticatedWriter`
+  wifi's run mode uses, unchanged - both already exposed the
+  `readexactly`/`write`/`drain` interface those classes expect. Also fixed
+  proactively (before any hardware verification, unlike wifi's
+  post-merge fix): `tether status --ble-addr`'s own independent
+  preamble/reply-read code path in `cli.py`, the exact same bug class
+  found on wifi's `--ip` equivalent.
+
+  **NOT yet verified against real BLE hardware.** Unlike chunk 22's wifi
+  equivalent (see its **Real-hardware verification (2026-08-05)** callout
+  above), everything in this chunk is verified only against the fake BLE
+  peripheral (`tests/ble_fakes.py`) under the real `micropython` unix-port
+  interpreter. No `mcu.connect("ble:<addr>")` session against a real ESP32
+  has been run with per-frame authentication enabled. The `cli.py`
+  `--ble-addr` fix above was likewise made proactively by analogy with
+  wifi's, not in response to an observed hardware failure. A real-hardware
+  pass is still outstanding for this chunk.
+
+  **Post-final-review fix (2026-08-05), replay-counter lifecycle:** the
+  shared mode handlers (`_MODE_HANDLER_FUNCTIONS_SRC` in `provisioning.py`)
+  assumed every handler call owned its connection's entire counter
+  lifetime - `_handle_status` sent on a hardcoded `0`, `_handle_upload`
+  initialized fresh `0`s, and `_AuthenticatedReader`/`_AuthenticatedWriter`
+  hardcoded `self._counter = 0`. True for wifi (one handler call per
+  connection, then close), wrong for BLE, where one connection carries a
+  whole `status`→`upload`→`run` sequence and the counters must run straight
+  through it. The real consequence: the second authenticated frame of every
+  BLE session arrived with counter 0 while the PC expected 1, raising
+  `FrameAuthenticationError: unexpected frame counter` and - under the
+  hard-close-no-retry policy - killing the connection outright. Fixed by
+  threading both counters as explicit parameters/return values through the
+  shared block and having BLE's session loop carry them across mode
+  switches; wifi's accept loop passes literal `0`s and discards the
+  returns, so its generated `boot.py` is behavior-identical (verified: all
+  wifi tests unchanged and green, and a diff of the generated wifi
+  `boot.py` shows only the signature plumbing, no changed values). No test
+  caught this because none drove the real PC-side counter tracking against
+  the real device-side accept loop across multiple modes on one connection
+  - added `test_ble_boot_authenticated_counters_run_straight_through_status_upload_and_run`
+  (`test_provisioning.py`) to close exactly that gap.
+
+  10 changed files (`transports/ble.py`, `connection.py`, `provisioning.py`,
+  `cli.py`, `docs/DESIGN.md`, plus tests in `test_transport_ble.py`,
+  `test_connection.py`, `test_provisioning.py`, `ble_fakes.py`, `test_cli.py`),
+  345 tests passing (was 329).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)

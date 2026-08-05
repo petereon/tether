@@ -827,13 +827,17 @@ def test_connect_wifi_uploads_when_hash_differs_then_runs():
 
 
 def test_connect_ble_uploads_when_hash_differs_then_runs_over_one_connection():
+    import hashlib
+    import hmac
     import json
     import sys
     import types
     from unittest.mock import patch
 
     from tether.connection import _connect_ble
+    from tether.marshalling.frame_auth import FrameAuthenticator
     from tether.slicer import slice_mcu_bound
+    from tether.transports.ble import BLE_TAG_LENGTH
 
     source = """
 from tether import mcu
@@ -852,6 +856,21 @@ def add(a: int, b: int) -> int:
     export_specs = {"add": object()}  # exact value unused by this path; presence is what matters
 
     received_modes = []
+
+    # This test authenticates (secret="test-secret" below), so - since
+    # Task 2 wires dial() to actually use the authenticated frame helpers
+    # whenever a session key exists - the fake device must speak the real
+    # authenticated envelope too, not just plain length-prefixed JSON.
+    # Preamble mode/ack frames stay plain always (BleControlChannel.send_preamble
+    # never wraps those - see its docstring); everything else exchanged
+    # after the first preamble (status reply, manifest, file content, upload
+    # result, and the run-mode RPC traffic once BleStream.enable_authentication
+    # kicks in) is wrapped with a FrameAuthenticator derived from the SAME
+    # nonce+secret formula BleControlChannel.send_preamble uses, so this
+    # fake's session key matches the client's independently-derived one.
+    secret = "test-secret"
+    nonce = bytes.fromhex("00" * 16)
+    session_key = hmac.new(secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256).digest()
 
     class _FakeDevice:
         """Stateful fake device: parses length-prefixed JSON/byte frames
@@ -876,6 +895,11 @@ def add(a: int, b: int) -> int:
             self._buffer = b""
             self._state = "await_preamble"
             self._pending_files: list[dict] = []
+            # Two independent instances/counters, one per direction - same
+            # requirement as the real client side (BleControlChannel._send_auth/
+            # _recv_auth) and the same session_key both sides derive.
+            self._send_auth = FrameAuthenticator(session_key, BLE_TAG_LENGTH)
+            self._recv_auth = FrameAuthenticator(session_key, BLE_TAG_LENGTH)
 
         def feed(self, data: bytes) -> None:
             self._buffer += bytes(data)
@@ -889,14 +913,20 @@ def add(a: int, b: int) -> int:
         def _notify_raw(self, data: bytes) -> None:
             self._client._pending_notify_cb(None, bytearray(data))
 
+        def _notify_authenticated_json(self, payload: dict) -> None:
+            body = json.dumps(payload).encode()
+            inner = len(body).to_bytes(4, "big") + body
+            self._notify_raw(self._send_auth.wrap(inner))
+
         def send_nonce(self) -> None:
             # Real device sends its one-per-connection nonce proactively,
             # before reading anything - see provisioning.py's
             # _BLE_BOOT_TEMPLATE. This fake doesn't simulate real auth (the
             # response is never checked below), so a fixed placeholder is
             # fine - the client only needs something to read and respond
-            # to before its first send_preamble() call proceeds.
-            self._notify({"nonce": "00" * 16})
+            # to before its first send_preamble() call proceeds. It must
+            # match `nonce` above so both sides derive the same session key.
+            self._notify({"nonce": nonce.hex()})
 
         def _drain(self) -> None:
             while len(self._buffer) >= 4:
@@ -909,12 +939,14 @@ def add(a: int, b: int) -> int:
 
         def _handle_frame(self, body: bytes) -> None:
             if self._state == "await_preamble":
+                # Preamble mode/ack frames are always plain, even on an
+                # authenticated connection - see this test's docstring note.
                 preamble = json.loads(body)
                 mode = preamble["mode"]
                 self._received_modes.append(mode)
                 self._notify({"ok": True})
                 if mode == "status":
-                    self._notify(
+                    self._notify_authenticated_json(
                         {
                             "protocol_version": PROTOCOL_VERSION,
                             "tether_app_hash": None,
@@ -928,25 +960,39 @@ def add(a: int, b: int) -> int:
                 elif mode == "run":
                     self._state = "await_handshake"
             elif self._state == "await_manifest":
-                manifest = json.loads(body)
+                inner = self._recv_auth.unwrap(body)
+                inner_length = int.from_bytes(inner[:4], "big")
+                manifest = json.loads(inner[4 : 4 + inner_length])
                 self._pending_files = list(manifest["files"])
                 self._state = "await_file_content" if self._pending_files else "await_preamble"
                 if not self._pending_files:
-                    self._notify({"ok": True})
+                    self._notify_authenticated_json({"ok": True})
             elif self._state == "await_file_content":
+                self._recv_auth.unwrap(body)  # advances the replay counter; content unused
                 self._pending_files.pop(0)  # one frame == one file, see class docstring
                 if self._pending_files:
                     return  # still expecting more files' content frames
-                self._notify({"ok": True})
+                self._notify_authenticated_json({"ok": True})
                 self._state = "await_preamble"
             elif self._state == "await_handshake":
                 import msgpack
 
-                request = msgpack.unpackb(body[1:], raw=False)
+                # Once authenticated, `inner` is the FULL encode_frame()
+                # output (its own [4-byte length][msg-type][msgpack] header,
+                # marshalling/__init__.py) - the authenticated envelope wraps
+                # that whole thing as an opaque blob, unlike the control
+                # channel's json/bytes helpers which build a fresh inner
+                # length prefix themselves. One more strip is needed before
+                # the msgpack body, matching encode_frame's own format.
+                inner = self._recv_auth.unwrap(body)
+                inner_length = int.from_bytes(inner[:4], "big")
+                frame_body = inner[4 : 4 + inner_length]
+                request = msgpack.unpackb(frame_body[1:], raw=False)
                 assert request["name"] == "__tether_handshake__"
                 from tether.marshalling import encode_frame
 
-                self._notify_raw(encode_frame(2, {"id": request["id"], "value": PROTOCOL_VERSION}))
+                response_frame = encode_frame(2, {"id": request["id"], "value": PROTOCOL_VERSION})
+                self._notify_raw(self._send_auth.wrap(response_frame))
                 self._state = "done"
 
     class _FakeBleakClient:
@@ -1525,6 +1571,149 @@ def test_connect_ble_refuses_to_strand_control_bytes_at_the_run_handover():
         pytest.raises(AssertionError, match="run-mode handover"),
     ):
         _connect_ble("AA:BB:CC:DD:EE:FF", bootstrap, {}, frozenset(), {}, timeout=2.0)
+
+
+def test_connect_ble_derives_a_session_key_and_reuses_it_across_modes(monkeypatch):
+    # BLE reuses ONE physical connection across status -> upload -> run
+    # (unlike wifi's fresh-connection-per-mode), so send_preamble derives
+    # the session key once and caches it on the channel; dial() must reuse
+    # that SAME cached authenticator pair for enable_authentication rather
+    # than deriving anything itself, or run mode's counters would restart
+    # at 0 while the device's real counters keep advancing.
+    calls = []
+    created_channels = []
+    session_key = b"a-fake-session-key-32-bytes-lo!!"
+
+    from tether.connection import _connect_ble, _hash_bundle
+
+    # Matches the real bundle_hash _connect_ble computes for bootstrap="" -
+    # so the status reply matches and no upload is triggered (per the "no
+    # upload - hash already matched" intent of this test).
+    bundle_hash = _hash_bundle("")
+
+    class _FakeStream:
+        def __init__(self):
+            self.enable_authentication_args = None
+
+        def enable_authentication(self, send_auth, recv_auth):
+            self.enable_authentication_args = (send_auth, recv_auth)
+            calls.append("enable_authentication")
+
+        def close(self):
+            calls.append("close")
+
+    class _FakeChannel:
+        def __init__(self, stream, *, timeout=None):
+            calls.append("channel_created")
+            self._send_auth = object()
+            self._recv_auth = object()
+            self._buffer = b""
+            created_channels.append(self)
+
+        def send_preamble(self, mode, secret):
+            calls.append(f"preamble:{mode}")
+            return session_key
+
+        def read_authenticated_json_frame(self):
+            return {
+                "tether_app_hash": bundle_hash,
+                "protocol_version": 1,
+                "ip": "aa:bb:cc:dd:ee:ff",
+            }
+
+    fake_stream_holder = []
+
+    def fake_connect(addr, timeout=10.0):
+        s = _FakeStream()
+        fake_stream_holder.append(s)
+        return s
+
+    class _FakeDispatcher:
+        # dial() only needs SOMETHING truthy back, but BoardHandle.__init__
+        # sets `dispatcher.board = self` on it - a plain object() has no
+        # __dict__ and rejects attribute assignment, so a bare stand-in
+        # class is needed instead.
+        pass
+
+    monkeypatch.setattr("tether.transports.ble.connect", fake_connect)
+    monkeypatch.setattr("tether.transports.ble.BleControlChannel", _FakeChannel)
+    monkeypatch.setattr(
+        "tether.connection._start_and_handshake", lambda stream, **kw: _FakeDispatcher()
+    )
+
+    _connect_ble(
+        "aa:bb:cc:dd:ee:ff",
+        bootstrap="",
+        export_specs={},
+        exported_names=frozenset(),
+        pc_handlers={},
+        timeout=5.0,
+        secret="the-secret",
+    )
+
+    assert calls == [
+        "channel_created",
+        "preamble:status",
+        "preamble:run",
+        "enable_authentication",
+    ], calls
+    channel = created_channels[0]
+    stream = fake_stream_holder[0]
+    assert stream.enable_authentication_args == (channel._send_auth, channel._recv_auth)
+
+
+def test_connect_ble_skips_authentication_when_secret_is_none(monkeypatch):
+    calls = []
+
+    from tether.connection import _connect_ble, _hash_bundle
+
+    bundle_hash = _hash_bundle("")
+
+    class _FakeStream:
+        def enable_authentication(self, send_auth, recv_auth):
+            calls.append("enable_authentication")
+
+        def close(self):
+            pass
+
+    class _FakeChannel:
+        def __init__(self, stream, *, timeout=None):
+            self._send_auth = None
+            self._recv_auth = None
+            self._buffer = b""
+
+        def send_preamble(self, mode, secret):
+            calls.append(f"preamble:{mode}")
+
+        def read_json_frame(self):
+            return {
+                "tether_app_hash": bundle_hash,
+                "protocol_version": 1,
+                "ip": "aa:bb:cc:dd:ee:ff",
+            }
+
+    class _FakeDispatcher:
+        # See the sibling test's comment - BoardHandle assigns
+        # `dispatcher.board`, which a plain object() can't accept.
+        pass
+
+    monkeypatch.setattr("tether.transports.ble.connect", lambda addr, timeout=10.0: _FakeStream())
+    monkeypatch.setattr("tether.transports.ble.BleControlChannel", _FakeChannel)
+    monkeypatch.setattr(
+        "tether.connection._start_and_handshake", lambda stream, **kw: _FakeDispatcher()
+    )
+
+    _connect_ble(
+        "aa:bb:cc:dd:ee:ff",
+        bootstrap="",
+        export_specs={},
+        exported_names=frozenset(),
+        pc_handlers={},
+        timeout=5.0,
+        secret=None,
+    )
+
+    assert "enable_authentication" not in calls, calls
 
 
 def test_frame_auth_failure_gets_a_re_provision_hint():

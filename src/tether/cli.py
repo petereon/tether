@@ -374,15 +374,23 @@ def status_command(
             # serial", not a bug to surface.
             stream = None
         if stream is not None:
+            from tether.connection import _hint_if_frame_auth_failure
+            from tether.errors import FrameAuthenticationError
+
             try:
                 try:
                     channel = ble_transport.BleControlChannel(stream, timeout=ble_timeout)
-                    channel.send_preamble("status", resolved_ble_secret)
-                    payload = channel.read_json_frame()
+                    session_key = channel.send_preamble("status", resolved_ble_secret)
+                    if session_key is None:
+                        payload = channel.read_json_frame()
+                    else:
+                        payload = channel.read_authenticated_json_frame()
                 except WifiAuthError:
                     raise click.ClickException(
                         f"BLE auth failed for {ble_addr} - check --ble-secret/TETHER_BLE_SECRET"
                     ) from None
+                except FrameAuthenticationError as exc:
+                    raise click.ClickException(str(_hint_if_frame_auth_failure(exc))) from None
                 except OSError:
                     # device became unreachable mid-exchange - fall through
                     # to the raw-REPL fallback below, same as a failed
