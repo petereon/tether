@@ -2041,6 +2041,37 @@ instructions all use local editable installs, `uv pip install -e
   `test_frame_auth.py` (new), `test_transport_wifi.py`, `test_connection.py`,
   `test_provisioning.py`, `test_cli.py`), 329 tests passing (was 299).
 
+- [x] **23. BLE per-frame authentication** — done 2026-08-05
+  Extends chunk 22's wifi per-frame authentication to BLE, closing the
+  same gap (only the handshake was authenticated; every frame after it
+  rode the wire in the clear). Reuses `tether.marshalling.frame_auth.FrameAuthenticator`
+  and the device-side `_AuthenticatedReader`/`_AuthenticatedWriter`
+  classes completely unchanged. Three deliberate divergences from wifi,
+  all driven by BLE's structural differences (see `docs/DESIGN.md`'s BLE
+  row, "Per-frame authentication (2026-08-06)" for the full rationale):
+  (1) session key and replay counters are scoped to the whole physical BLE
+  connection, not per mode, since BLE reuses one connection across
+  `status`→`upload`→`run` (wifi opens a fresh connection per mode) - `BleControlChannel`
+  derives and caches the session key once, `BleStream.enable_authentication()`
+  takes an existing authenticator pair (not a session key) specifically to
+  preserve counter continuity across the mode-switch boundary; (2) 8-byte
+  tag (not wifi's 16) - a latency-overhead tradeoff, not a correctness
+  one, since BLE's chunking is transparent to frame size and has no hard
+  rejection ceiling to defend the way wifi's `MAX_CONTROL_FRAME_SIZE` did;
+  (3) BLE's existing custom async stream adapter (`_BleAsyncReader`/`_BleAsyncWriter`)
+  is wrapped by the SAME `_AuthenticatedReader`/`_AuthenticatedWriter`
+  wifi's run mode uses, unchanged - both already exposed the
+  `readexactly`/`write`/`drain` interface those classes expect. Also fixed
+  proactively (before any hardware verification, unlike wifi's
+  post-merge fix): `tether status --ble-addr`'s own independent
+  preamble/reply-read code path in `cli.py`, the exact same bug class
+  found on wifi's `--ip` equivalent.
+
+  9 changed files (`transports/ble.py`, `connection.py`, `provisioning.py`,
+  `cli.py`, `docs/DESIGN.md`, plus tests in `test_transport_ble.py`,
+  `test_connection.py`, `test_provisioning.py`, `ble_fakes.py`, `test_cli.py`),
+  344 tests passing (was 329).
+
 ---
 
 ## Explicitly out of scope for these chunks (see DESIGN.md § Non-goals)
