@@ -642,7 +642,9 @@ def test_boot_py_accepts_correct_secret():
         # test_boot_py_status_reply_is_frame_authenticated_when_secret_configured
         # for the dedicated test of this; this one just needs to read past
         # it correctly to keep verifying the payload contents themselves.
-        session_key = hmac.new(b"the-real-secret", nonce, hashlib.sha256).digest()
+        session_key = hmac.new(
+            b"the-real-secret", b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
         results["payload"] = read_authenticated_json_frame(sock, FrameAuthenticator(session_key))
         sock.close()
 
@@ -1662,7 +1664,9 @@ def test_boot_py_status_reply_is_frame_authenticated_when_secret_configured():
         send_json(sock, {"mode": "status", "response": response})
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
-        session_key = hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+        session_key = hmac.new(
+            secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
         results["status"] = read_authenticated_json_frame(sock, FrameAuthenticator(session_key))
         sock.close()
 
@@ -1781,7 +1785,9 @@ def test_boot_py_upload_mode_authenticates_the_manifest_and_chunks():
         send_json(sock, {"mode": "upload", "response": response})
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
-        session_key = hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+        session_key = hmac.new(
+            secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
         send_auth = FrameAuthenticator(session_key)
         recv_auth = FrameAuthenticator(session_key)
 
@@ -1920,7 +1926,9 @@ def test_boot_py_upload_mode_rejects_a_tampered_chunk():
         send_json(sock, {"mode": "upload", "response": response})
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
-        session_key = hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+        session_key = hmac.new(
+            secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
         send_auth = FrameAuthenticator(session_key)
         recv_auth = FrameAuthenticator(session_key)
 
@@ -2078,7 +2086,9 @@ def add(a: int, b: int) -> int:
         send_json(sock, {"mode": "run", "response": response})
         ack = read_json(sock)
         assert ack == {"ok": True}, ack
-        session_key = hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+        session_key = hmac.new(
+            secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
 
         send_auth = FrameAuthenticator(session_key)
         recv_auth = FrameAuthenticator(session_key)

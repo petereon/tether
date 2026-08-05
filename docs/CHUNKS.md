@@ -1996,6 +1996,18 @@ instructions all use local editable installs, `uv pip install -e
   `docs/DESIGN.md`'s 2026-08-04 "Per-frame authentication" amendment for
   the full design rationale and the grill-me interview that produced it.
 
+  **Post-review correction (2026-08-05), before merge:** the session-key
+  derivation described above ("reused from the handshake's own HMAC
+  output") was a security bug - it made the session key identical to the
+  `response` field sent in the clear during the handshake, so any observer
+  could recover the frame key and forge frames. Fixed by domain-separating
+  the two: `session_key = HMAC-SHA256(secret, "tether-frame-key" || nonce)`.
+  Same review also widened the authenticated *outer*-envelope length bounds
+  by a fixed `ENVELOPE_OVERHEAD` (24 bytes), so a legitimate 64 KiB payload
+  is no longer rejected as "frame too large" once wrapped, and added a
+  re-provision hint to frame-auth failures against stale boards. See
+  DESIGN.md's **Correction (2026-08-05)** in the same amendment.
+
   **Remaining, accepted limitation:** this chunk has NOT been verified
   against real ESP32 hardware (unlike chunks 19-21, which explicitly were)
   - only against the `micropython` unix-port subprocess via

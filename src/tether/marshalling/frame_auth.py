@@ -35,6 +35,21 @@ _MAX_COUNTER = 2**32 - 1
 
 DEFAULT_TAG_LENGTH = 16
 
+# Max additional bytes any authenticated envelope adds over its plain
+# equivalent: 4-byte counter + tag_length (16 by default) = 20 for
+# run-mode's raw RPC framing, plus another 4 bytes for the JSON/bytes
+# control-channel's own inner length prefix (upload/status) = 24. Use the
+# larger figure (24) uniformly for both cases for simplicity - a few bytes
+# of unused slack for run mode is harmless, and it avoids needing two
+# different constants threaded through four call sites.
+#
+# Receivers bounding an authenticated OUTER envelope's declared length
+# must allow MAX_CONTROL_FRAME_SIZE + this, or a legitimate max-size
+# payload gets rejected as "frame too large" purely because of the
+# envelope wrapped around it. Inner/payload bounds stay untouched - they
+# still bound the real payload at MAX_CONTROL_FRAME_SIZE.
+ENVELOPE_OVERHEAD = 24
+
 
 class FrameAuthenticator:
     """One direction of a per-frame HMAC envelope. Pure/no I/O - callers

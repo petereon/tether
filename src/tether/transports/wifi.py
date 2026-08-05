@@ -23,7 +23,11 @@ import struct
 from typing import Any
 
 from tether.errors import FrameAuthenticationError
-from tether.marshalling.frame_auth import DEFAULT_TAG_LENGTH, FrameAuthenticator
+from tether.marshalling.frame_auth import (
+    DEFAULT_TAG_LENGTH,
+    ENVELOPE_OVERHEAD,
+    FrameAuthenticator,
+)
 
 DEFAULT_PORT = 8765
 
@@ -80,7 +84,12 @@ class WifiStream:
             if not header:
                 return b""
             (length,) = _LENGTH_PREFIX.unpack(header)
-            if length > MAX_CONTROL_FRAME_SIZE:
+            # + ENVELOPE_OVERHEAD: `length` is the OUTER envelope's body,
+            # which legitimately exceeds a max-size payload by the
+            # counter/tag (and, on the control channel, the inner length
+            # prefix). Bounding it at the bare payload limit would reject
+            # a legal 64 KiB frame. See frame_auth.ENVELOPE_OVERHEAD.
+            if length > MAX_CONTROL_FRAME_SIZE + ENVELOPE_OVERHEAD:
                 raise OSError(f"authenticated frame too large: declared {length} bytes")
             body = self._recv_exact_or_empty(length)
             if not body:
@@ -193,7 +202,9 @@ def read_bytes_frame(sock: Any) -> bytes:
 def _read_authenticated_body(sock: Any) -> bytes:
     header = _recv_exact(sock, _LENGTH_PREFIX.size)
     (length,) = _LENGTH_PREFIX.unpack(header)
-    if length > MAX_CONTROL_FRAME_SIZE:
+    # + ENVELOPE_OVERHEAD - see _read_authenticated_chunk's matching
+    # comment: this bounds the outer envelope, not the payload inside it.
+    if length > MAX_CONTROL_FRAME_SIZE + ENVELOPE_OVERHEAD:
         raise OSError(f"authenticated frame too large: declared {length} bytes")
     return _recv_exact(sock, length)
 
@@ -247,18 +258,29 @@ def send_preamble(sock: Any, mode: str, secret: str | None) -> bytes | None:
     per-frame authentication of everything sent after this handshake, or
     None when `secret` is None - matching the handshake's own "no secret,
     no check" behavior (see DESIGN.md's Per-frame authentication note).
-    Computed from the SAME hmac.new(...) object as `response` (hexdigest
-    for the wire, digest for the session key) - one HMAC computation, not
-    two.
+
+    The session key is a SECOND, domain-separated HMAC over the same
+    secret and nonce - `HMAC-SHA256(secret, b"tether-frame-key" + nonce)`,
+    not the same computation as `response`. This separation is
+    load-bearing, not stylistic: `response` is sent over the wire in the
+    clear, so if the session key were the same HMAC's raw digest (as it
+    originally was), any passive observer of the handshake could read
+    `response`, hex-decode it, and hold the exact key needed to forge,
+    tamper with, inject, or replay authenticated frames - defeating the
+    entire point of per-frame authentication. Prefixing a distinct,
+    constant label before the nonce makes the two HMAC inputs disjoint, so
+    the wire-visible response reveals nothing about the session key.
+    Costs one extra local hash, no extra round trip.
     """
     from tether.errors import WifiAuthError
 
     nonce_frame = read_json_frame(sock)
     nonce = bytes.fromhex(nonce_frame["nonce"])
     if secret is not None:
-        mac = hmac.new(secret.encode(), nonce, hashlib.sha256)
-        response = mac.hexdigest()
-        session_key = mac.digest()
+        response = hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+        session_key = hmac.new(
+            secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+        ).digest()
     else:
         response = None
         session_key = None

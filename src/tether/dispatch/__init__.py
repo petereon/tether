@@ -210,7 +210,14 @@ class Dispatcher:
                 for msg_type, payload in self._decoder.pull_frames():
                     self._route_frame(msg_type, payload)
         except Exception as exc:  # noqa: BLE001 - any transport failure must not strand callers
-            self._fail_all_pending(f"transport read failed: {exc}")
+            # Type name as well as message: this is the ONLY surviving
+            # trace of what actually killed the reader once the original
+            # exception is collapsed into MCUDisconnectedError. Callers
+            # that want to react to a specific cause have nothing else to
+            # go on - see connection._hint_if_frame_auth_failure, which
+            # recognizes a FrameAuthenticationError here to explain that a
+            # stale board needs re-provisioning.
+            self._fail_all_pending(f"transport read failed: {type(exc).__name__}: {exc}")
             return
         self._fail_all_pending("transport closed")
 

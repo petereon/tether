@@ -8,6 +8,7 @@ import pytest
 from tether.errors import FrameAuthenticationError, WifiAuthError
 from tether.marshalling.frame_auth import FrameAuthenticator
 from tether.transports.wifi import (
+    MAX_CONTROL_FRAME_SIZE,
     WifiStream,
     connect,
     read_authenticated_bytes_frame,
@@ -167,7 +168,10 @@ def test_send_preamble_returns_the_session_key_when_a_secret_is_given():
     session_key = send_preamble(a, "status", "right-secret")
 
     device_thread.join(timeout=2.0)
-    assert session_key == hmac.new(b"right-secret", nonce, hashlib.sha256).digest()
+    assert (
+        session_key
+        == hmac.new(b"right-secret", b"tether-frame-key" + nonce, hashlib.sha256).digest()
+    )
 
 
 def test_send_preamble_returns_none_when_secret_is_none():
@@ -220,6 +224,50 @@ def test_wifi_stream_authenticated_round_trip_both_directions():
 
     stream_b.write(b"from b to a")
     assert stream_a.read() == b"from b to a"
+
+
+def test_authenticated_bytes_frame_round_trips_a_max_size_payload():
+    # A payload at exactly MAX_CONTROL_FRAME_SIZE is legal, but the
+    # envelope wrapped around it (4-byte counter + 4-byte inner length
+    # prefix + 16-byte tag) makes the OUTER declared length larger than
+    # that bound. Bounding the outer length at MAX_CONTROL_FRAME_SIZE
+    # rejected legitimate max-size upload chunks - see
+    # frame_auth.ENVELOPE_OVERHEAD.
+    a, b = socket.socketpair()
+    payload = b"x" * MAX_CONTROL_FRAME_SIZE
+    auth_send = FrameAuthenticator(b"shared-key")
+    auth_recv = FrameAuthenticator(b"shared-key")
+
+    # Send from a thread: the framed payload far exceeds the socketpair's
+    # buffer, so sendall() blocks until the reader drains it.
+    sender = threading.Thread(
+        target=send_authenticated_bytes_frame, args=(a, auth_send, payload), daemon=True
+    )
+    sender.start()
+
+    assert read_authenticated_bytes_frame(b, auth_recv) == payload
+
+    sender.join(timeout=5.0)
+    assert not sender.is_alive()
+
+
+def test_wifi_stream_authenticated_round_trip_of_a_max_size_payload():
+    # Same boundary as above, one layer down: WifiStream's own
+    # authenticated read path has its own outer-length bound to widen.
+    a, b = socket.socketpair()
+    payload = b"y" * MAX_CONTROL_FRAME_SIZE
+    stream_a = WifiStream(a)
+    stream_b = WifiStream(b)
+    stream_a.enable_authentication(b"shared-session-key")
+    stream_b.enable_authentication(b"shared-session-key")
+
+    sender = threading.Thread(target=stream_a.write, args=(payload,), daemon=True)
+    sender.start()
+
+    assert stream_b.read() == payload
+
+    sender.join(timeout=5.0)
+    assert not sender.is_alive()
 
 
 def test_wifi_stream_read_raises_and_closes_on_a_tampered_frame():

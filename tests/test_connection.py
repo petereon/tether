@@ -7,9 +7,15 @@ import pytest
 
 from tether import mcu, pc
 from tether._context import current_board
-from tether.connection import PROTOCOL_VERSION, _connect_wifi, connect, generate_bootstrap
+from tether.connection import (
+    PROTOCOL_VERSION,
+    _connect_wifi,
+    _hint_if_frame_auth_failure,
+    connect,
+    generate_bootstrap,
+)
 from tether.dispatch import Dispatcher
-from tether.errors import FrameAuthenticationError
+from tether.errors import FrameAuthenticationError, MCUDisconnectedError
 from tether.slicer import slice_mcu_bound
 from tether.transports.wifi import WifiStream
 
@@ -561,7 +567,7 @@ def _serve_one_authenticated_device_connection(
         expected_response = hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
         assert preamble["response"] == expected_response
         send_json(conn, {"ok": True})
-        return hmac.new(secret.encode(), nonce, hashlib.sha256).digest()
+        return hmac.new(secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256).digest()
 
     # 1. status connection.
     conn, _addr = sock.accept()
@@ -1519,3 +1525,34 @@ def test_connect_ble_refuses_to_strand_control_bytes_at_the_run_handover():
         pytest.raises(AssertionError, match="run-mode handover"),
     ):
         _connect_ble("AA:BB:CC:DD:EE:FF", bootstrap, {}, frozenset(), {}, timeout=2.0)
+
+
+def test_frame_auth_failure_gets_a_re_provision_hint():
+    # A board provisioned before per-frame authentication shipped fails
+    # with a bare FrameAuthenticationError, which says nothing about the
+    # actual cause (a breaking wire change) or the fix.
+    hinted = _hint_if_frame_auth_failure(FrameAuthenticationError("tag mismatch"))
+
+    assert isinstance(hinted, FrameAuthenticationError)
+    assert "tag mismatch" in str(hinted)
+    assert "tether provision wifi" in str(hinted)
+
+
+def test_frame_auth_failure_hint_survives_the_run_mode_disconnect_wrapping():
+    # Run mode never sees the FrameAuthenticationError itself: Dispatcher's
+    # reader thread collapses any read failure into MCUDisconnectedError,
+    # keeping only the type name and message as text.
+    wrapped = MCUDisconnectedError("transport read failed: FrameAuthenticationError: tag mismatch")
+
+    hinted = _hint_if_frame_auth_failure(wrapped)
+
+    assert isinstance(hinted, MCUDisconnectedError)
+    assert "tether provision wifi" in str(hinted)
+
+
+def test_unrelated_exceptions_are_returned_untouched():
+    disconnect = MCUDisconnectedError("transport closed")
+    other = ValueError("nothing to do with framing")
+
+    assert _hint_if_frame_auth_failure(disconnect) is disconnect
+    assert _hint_if_frame_auth_failure(other) is other

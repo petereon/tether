@@ -126,13 +126,27 @@ def _recv_frame(_conn, _session_key, _counter):
     # that side. The plain (_session_key is None) branch has no such inner
     # layer, since unauthenticated send_json_frame/read_json_frame only
     # ever carry ONE length prefix total.
+    #
+    # The two branches bound `_length` differently on purpose. The plain
+    # branch's length IS the payload, so _MAX_CTRL_FRAME bounds it
+    # directly. The authenticated branch's length is the OUTER envelope,
+    # which legitimately runs _ENVELOPE_OVERHEAD bytes larger than the
+    # payload it carries (counter + tag + the inner length prefix above) -
+    # bounding it at the bare _MAX_CTRL_FRAME would reject a legal
+    # max-size upload chunk. Split rather than shared for a second reason
+    # too: _ENVELOPE_OVERHEAD (like _TAG_LENGTH already) is only defined
+    # by the wifi template, and this source is shared with BLE, whose
+    # _session_key is always None - so the name must stay confined to the
+    # authenticated branch BLE never reaches.
     _header = _recv_exact(_conn, 4)
     _length = int.from_bytes(_header, "big")
-    if _length > _MAX_CTRL_FRAME:
+    if _session_key is None:
+        if _length > _MAX_CTRL_FRAME:
+            raise OSError("frame too large")
+        return _recv_exact(_conn, _length), _counter
+    if _length > _MAX_CTRL_FRAME + _ENVELOPE_OVERHEAD:
         raise OSError("frame too large")
     _body = _recv_exact(_conn, _length)
-    if _session_key is None:
-        return _body, _counter
     _inner = _envelope_unwrap(_session_key, _counter, _body, _TAG_LENGTH)
     _inner_length = int.from_bytes(_inner[:4], "big")
     return _inner[4 : 4 + _inner_length], _counter + 1
@@ -169,7 +183,9 @@ class _AuthenticatedReader:
     async def _fill_one_envelope(self):
         _header = await self._inner.readexactly(4)
         _length = int.from_bytes(_header, "big")
-        if _length > _MAX_CTRL_FRAME:
+        # + _ENVELOPE_OVERHEAD - see _recv_frame's comment: this bounds
+        # the outer envelope, not the payload inside it.
+        if _length > _MAX_CTRL_FRAME + _ENVELOPE_OVERHEAD:
             raise OSError("authenticated frame too large")
         _body = await self._inner.readexactly(_length)
         _inner_bytes = _envelope_unwrap(self._session_key, self._counter, _body, self._tag_length)
@@ -365,6 +381,7 @@ if _cfg is not None:
         _boot_ms = time.ticks_ms()
         _MAX_CTRL_FRAME = 65536
         _TAG_LENGTH = 16  # must match tether.marshalling.frame_auth.DEFAULT_TAG_LENGTH
+        _ENVELOPE_OVERHEAD = 24  # must match tether.marshalling.frame_auth.ENVELOPE_OVERHEAD
 
 {textwrap.indent(_MODE_HANDLER_FUNCTIONS_SRC, "        ")}
         def _wifi_make_streams(_conn, _session_key):
@@ -394,9 +411,22 @@ if _cfg is not None:
                 _preamble = _read_json_frame(_conn)
                 _mode = _preamble.get("mode")
                 _response = _preamble.get("response")
+                # Two SEPARATE HMACs over the same secret and nonce, not
+                # one reused twice. _expected_response goes out on the
+                # wire in the clear; if _session_key were the same digest
+                # (as it originally was) any passive observer of this
+                # handshake could hex-decode the response into the frame
+                # key and forge/replay authenticated frames. The
+                # b"tether-frame-key" prefix domain-separates the two.
+                # Mirrors tether.transports.wifi.send_preamble exactly -
+                # the two derivations must stay identical.
                 if _expected_secret is not None:
-                    _session_key = _hmac_sha256(_expected_secret.encode(), _nonce)
-                    _expected_response = _hexlify(_session_key)
+                    _expected_response = _hexlify(
+                        _hmac_sha256(_expected_secret.encode(), _nonce)
+                    )
+                    _session_key = _hmac_sha256(
+                        _expected_secret.encode(), b"tether-frame-key" + _nonce
+                    )
                 else:
                     _session_key = None
                     _expected_response = None
