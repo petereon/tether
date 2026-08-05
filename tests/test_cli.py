@@ -826,6 +826,59 @@ def test_status_ble_addr_tries_ble_first_non_destructively(monkeypatch):
     assert timeouts and all(t is not None for t in timeouts), calls
 
 
+def test_status_ble_addr_uses_authenticated_read_when_session_key_present(monkeypatch):
+    # Same bug class as wifi's test_status_command_uses_authenticated_read_when_session_key_present
+    # (found against real ESP32 hardware, 2026-08-05) - status_command's
+    # BLE branch has its own separate send_preamble()/read_json_frame()
+    # pair, never updated for per-frame authentication. Fixing proactively
+    # here rather than waiting for BLE hardware to find it too.
+    calls = []
+
+    class _FakeStream:
+        def close(self):
+            calls.append(("close",))
+
+    session_key = b"a-fake-32-byte-session-key-here"
+
+    class _FakeChannel:
+        def __init__(self, stream, *, timeout=None):
+            calls.append(("channel_timeout", timeout))
+
+        def send_preamble(self, mode, secret):
+            calls.append(("preamble", mode))
+            return session_key
+
+        def read_authenticated_json_frame(self):
+            calls.append(("authenticated_status_payload",))
+            return {
+                "protocol_version": 1,
+                "tether_app_hash": "abc123",
+                "free_heap": 50000,
+                "uptime_ms": 1234,
+                "ip": "aa:bb:cc:dd:ee:ff",
+            }
+
+        def read_json_frame(self):
+            raise AssertionError(
+                "plain read_json_frame must not be called when a session key exists"
+            )
+
+    monkeypatch.setattr("tether.transports.ble.connect", lambda addr, timeout=5.0: _FakeStream())
+    monkeypatch.setattr("tether.transports.ble.BleControlChannel", _FakeChannel)
+    monkeypatch.setattr(
+        "tether.transports.serial.reset_board", lambda ser: calls.append(("reset_board",))
+    )
+
+    result = CliRunner().invoke(
+        main, ["status", "--ble-addr", "AA:BB:CC:DD:EE:FF", "--ble-secret", "s3cr3t"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "aa:bb:cc:dd:ee:ff" in result.output.lower()
+    assert ("authenticated_status_payload",) in calls
+    assert ("reset_board",) not in calls
+
+
 def test_status_ble_addr_falls_back_to_serial_when_ble_unreachable(monkeypatch):
     def raise_unreachable(addr, timeout=5.0):
         raise OSError("connection refused")
