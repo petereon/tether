@@ -548,6 +548,8 @@ if _cfg is not None:
 
     _boot_ms = time.ticks_ms()
     _MAX_CTRL_FRAME = 65536
+    _TAG_LENGTH = 8  # must match tether.transports.ble.BLE_TAG_LENGTH
+    _ENVELOPE_OVERHEAD = 16  # must match ble.py's own constant (see Task 1)
     _ADV_PAYLOAD = {_BLE_ADV_PAYLOAD!r}
     _ADV_INTERVAL_US = 100000
     # How long to wait for a requested disconnect's IRQ to confirm the link
@@ -726,9 +728,6 @@ if _cfg is not None:
             return _result
 
     def _ble_make_streams(_conn, _session_key):
-        # _session_key is always None here (BLE per-frame auth is out of
-        # scope for this plan) - accepted only so this matches the shared
-        # _handle_run's `_make_streams(_conn, _session_key)` call.
         # Seeded with whatever the synchronous preamble read over-consumed,
         # so no byte is lost handing this connection over to run mode.
         _leftover = [_conn.take_buffer()]
@@ -753,7 +752,12 @@ if _cfg is not None:
             async def drain(self):
                 await _asyncio.sleep_ms(0)
 
-        return _BleAsyncReader(), _BleAsyncWriter()
+        if _session_key is None:
+            return _BleAsyncReader(), _BleAsyncWriter()
+        return (
+            _AuthenticatedReader(_BleAsyncReader(), _session_key, _TAG_LENGTH),
+            _AuthenticatedWriter(_BleAsyncWriter(), _session_key, _TAG_LENGTH),
+        )
 
     def _start_advertising():
         \"\"\"True once the board is actually advertising again. NimBLE
@@ -824,6 +828,11 @@ if _cfg is not None:
             _expected_secret = _cfg.get("secret")
             _nonce = _uos.urandom(16)
             _authenticated = _expected_secret is None
+            _session_key = (
+                None
+                if _expected_secret is None
+                else _hmac_sha256(_expected_secret.encode(), b"tether-frame-key" + _nonce)
+            )
             _send_json_frame(_conn, {{"nonce": _hexlify(_nonce)}})
             # Resend on a timer until the central's first preamble actually
             # lands in _queue - see _NONCE_RESEND_MS's own comment above for
@@ -856,22 +865,13 @@ if _cfg is not None:
                     _authenticated = True
                 if _mode == "status":
                     _send_json_frame(_conn, {{"ok": True}})
-                    # BLE has no per-frame authentication yet (out of
-                    # scope for this plan - see DESIGN.md's BLE row) -
-                    # _session_key stays None, which makes the shared
-                    # _handle_status/_handle_upload fall through to their
-                    # plain, unauthenticated wire format exactly as
-                    # before.
-                    _handle_status(_conn, lambda: _ble_addr_str, None)
+                    _handle_status(_conn, lambda: _ble_addr_str, _session_key)
                 elif _mode == "upload":
                     _send_json_frame(_conn, {{"ok": True}})
-                    _handle_upload(_conn, None)
+                    _handle_upload(_conn, _session_key)
                 elif _mode == "run":
                     _send_json_frame(_conn, {{"ok": True}})
-                    # BLE per-frame auth is out of scope for this plan (see
-                    # the status/upload call sites' own comment above) -
-                    # _session_key is always None here.
-                    _handle_run(_conn, _ble_make_streams, None)
+                    _handle_run(_conn, _ble_make_streams, _session_key)
                     break
                 else:
                     _send_json_frame(_conn, {{"ok": False, "error": "unknown mode"}})
