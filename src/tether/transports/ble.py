@@ -39,6 +39,8 @@ import struct
 import threading
 from typing import Any
 
+from tether.marshalling.frame_auth import FrameAuthenticator
+
 # Custom 128-bit UUIDs for tether's GATT service - arbitrary but fixed, so
 # the on-device peripheral (provisioning.py's _BLE_BOOT_TEMPLATE, which
 # hardcodes the same three strings - see
@@ -56,6 +58,16 @@ DEFAULT_TIMEOUT = 10.0
 # negotiated MTU to get the usable payload size per GATT write.
 _ATT_HEADER_OVERHEAD = 3
 
+# Half of wifi's DEFAULT_TAG_LENGTH (16) - BLE's chunking is transparent
+# to frame size (unlike wifi's hard MAX_CONTROL_FRAME_SIZE ceiling), so
+# this isn't a correctness constraint, it's a latency one: every BLE write
+# is a full round trip, and this halves how often the envelope's overhead
+# spills a small frame into one more chunk. See DESIGN.md's BLE row,
+# "Per-frame authentication (2026-08-06)" for the full tradeoff.
+BLE_TAG_LENGTH = 8
+
+_LENGTH_PREFIX = struct.Struct(">I")
+
 
 class BleStream:
     """Duplex stream bridging a connected `bleak.BleakClient` (async,
@@ -72,6 +84,24 @@ class BleStream:
         self._loop = loop
         self._write_char_uuid = write_char_uuid
         self._queue: queue.Queue[bytes] = queue.Queue()
+        self._send_auth: FrameAuthenticator | None = None
+        self._recv_auth: FrameAuthenticator | None = None
+
+    def enable_authentication(
+        self, send_auth: FrameAuthenticator, recv_auth: FrameAuthenticator
+    ) -> None:
+        """Switch every subsequent read()/write() on this stream to per-frame
+        HMAC authentication, using the EXACT authenticator instances given -
+        not derived fresh from a session key. Call once, right before handing
+        this stream to Dispatcher for run mode, passing the same instances
+        BleControlChannel already used for status/upload on this connection
+        (channel._send_auth/channel._recv_auth) - BLE reuses one physical
+        connection across every mode (see DESIGN.md's BLE row), so the replay
+        counters must continue from wherever the control channel left them,
+        not restart at 0.
+        """
+        self._send_auth = send_auth
+        self._recv_auth = recv_auth
 
     def read(self, timeout: float | None = None) -> bytes:
         """Return the next chunk of device->PC bytes (b"" once the link
@@ -90,12 +120,40 @@ class BleStream:
         escape: every caller above here is written against the
         OSError/empty-bytes contract the serial and wifi streams use.
         """
-        if timeout is None:
-            return self._queue.get()
-        try:
-            return self._queue.get(timeout=timeout)
-        except queue.Empty:
-            raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
+        if self._recv_auth is None:
+            if timeout is None:
+                return self._queue.get()
+            try:
+                return self._queue.get(timeout=timeout)
+            except queue.Empty:
+                raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
+        return self._read_authenticated_chunk(timeout)
+
+    def _read_authenticated_chunk(self, timeout: float | None) -> bytes:
+        header = self._recv_exact_raw(_LENGTH_PREFIX.size, timeout)
+        if not header:
+            return b""
+        (length,) = _LENGTH_PREFIX.unpack(header)
+        body = self._recv_exact_raw(length, timeout)
+        if not body:
+            return b""
+        assert self._recv_auth is not None
+        return self._recv_auth.unwrap(body)
+
+    def _recv_exact_raw(self, n: int, timeout: float | None) -> bytes:
+        buf = b""
+        while len(buf) < n:
+            if timeout is None:
+                chunk = self._queue.get()
+            else:
+                try:
+                    chunk = self._queue.get(timeout=timeout)
+                except queue.Empty:
+                    raise OSError(f"timed out after {timeout}s waiting for BLE data") from None
+            if not chunk:
+                return b""
+            buf += chunk
+        return buf
 
     def write(self, data: bytes, timeout: float | None = None) -> None:
         """`timeout=None` (the default) blocks indefinitely - correct for
@@ -108,6 +166,8 @@ class BleStream:
         to have no timeout at all, silently inheriting whatever
         `.result()`'s own default (block forever) did.
         """
+        if self._send_auth is not None:
+            data = self._send_auth.wrap(data)
         # GATT writes are capped by the negotiated ATT MTU - split anything
         # larger into multiple writes. FrameDecoder (marshalling/__init__.py)
         # already reassembles arbitrarily-chunked reads into whole frames on
@@ -184,8 +244,6 @@ class BleStream:
         self._loop.call_soon_threadsafe(self._loop.stop)
 
 
-_LENGTH_PREFIX = struct.Struct(">I")
-
 # Same resource-safety bound as wifi's control channel (transports/wifi.py)
 # and the RPC layer's MAX_FRAME_SIZE - a declared length this large would
 # risk buffering an unbounded amount of attacker/bug-controlled data before
@@ -228,6 +286,9 @@ class BleControlChannel:
         # connection just sends {mode}. See send_preamble's own docstring
         # and _BLE_BOOT_TEMPLATE's matching device-side state.
         self._authenticated = False
+        self._session_key: bytes | None = None
+        self._send_auth: FrameAuthenticator | None = None
+        self._recv_auth: FrameAuthenticator | None = None
 
     def _recv_exact(self, n: int) -> bytes:
         while len(self._buffer) < n:
@@ -238,9 +299,15 @@ class BleControlChannel:
         result, self._buffer = self._buffer[:n], self._buffer[n:]
         return result
 
-    def send_json_frame(self, payload: dict[str, Any]) -> None:
+    def _json_frame_bytes(self, payload: dict[str, Any]) -> bytes:
         body = json.dumps(payload).encode("utf-8")
-        self._stream.write(_LENGTH_PREFIX.pack(len(body)) + body, self._timeout)
+        return _LENGTH_PREFIX.pack(len(body)) + body
+
+    def _bytes_frame_bytes(self, data: bytes) -> bytes:
+        return _LENGTH_PREFIX.pack(len(data)) + data
+
+    def send_json_frame(self, payload: dict[str, Any]) -> None:
+        self._stream.write(self._json_frame_bytes(payload), self._timeout)
 
     def read_json_frame(self) -> dict[str, Any]:
         header = self._recv_exact(_LENGTH_PREFIX.size)
@@ -251,7 +318,7 @@ class BleControlChannel:
         return json.loads(body.decode("utf-8"))
 
     def send_bytes_frame(self, data: bytes) -> None:
-        self._stream.write(_LENGTH_PREFIX.pack(len(data)) + data, self._timeout)
+        self._stream.write(self._bytes_frame_bytes(data), self._timeout)
 
     def read_bytes_frame(self) -> bytes:
         header = self._recv_exact(_LENGTH_PREFIX.size)
@@ -260,7 +327,35 @@ class BleControlChannel:
             raise OSError(f"control frame too large: declared {length} bytes")
         return self._recv_exact(length)
 
-    def send_preamble(self, mode: str, secret: str | None) -> None:
+    def _read_authenticated_body(self) -> bytes:
+        header = self._recv_exact(_LENGTH_PREFIX.size)
+        (length,) = _LENGTH_PREFIX.unpack(header)
+        if length > MAX_CONTROL_FRAME_SIZE:
+            raise OSError(f"authenticated frame too large: declared {length} bytes")
+        return self._recv_exact(length)
+
+    def send_authenticated_json_frame(self, payload: dict[str, Any]) -> None:
+        assert self._send_auth is not None
+        self._stream.write(self._send_auth.wrap(self._json_frame_bytes(payload)), self._timeout)
+
+    def read_authenticated_json_frame(self) -> dict[str, Any]:
+        assert self._recv_auth is not None
+        inner = self._recv_auth.unwrap(self._read_authenticated_body())
+        (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
+        body = inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
+        return json.loads(body.decode("utf-8"))
+
+    def send_authenticated_bytes_frame(self, data: bytes) -> None:
+        assert self._send_auth is not None
+        self._stream.write(self._send_auth.wrap(self._bytes_frame_bytes(data)), self._timeout)
+
+    def read_authenticated_bytes_frame(self) -> bytes:
+        assert self._recv_auth is not None
+        inner = self._recv_auth.unwrap(self._read_authenticated_body())
+        (length,) = _LENGTH_PREFIX.unpack_from(inner, 0)
+        return inner[_LENGTH_PREFIX.size : _LENGTH_PREFIX.size + length]
+
+    def send_preamble(self, mode: str, secret: str | None) -> bytes | None:
         """Send the connection preamble (mode, plus a nonce-challenge
         response on the FIRST call this channel makes) and wait for the
         device's ack. Raises WifiAuthError if the device rejects it -
@@ -277,17 +372,26 @@ class BleControlChannel:
         send_preamble() call on the same channel sends just `{mode}` - the
         device already knows this connection is authenticated and doesn't
         expect (or check) a response on those later preambles.
+
+        Returns the connection's session key for per-frame authentication
+        (derived once, on the first call, and cached - every later call on
+        this same channel returns the SAME key, matching the domain-separated
+        derivation wifi's send_preamble uses), or None when `secret` is None.
         """
         from tether.errors import WifiAuthError
 
         if not self._authenticated:
             nonce_frame = self.read_json_frame()
             nonce = bytes.fromhex(nonce_frame["nonce"])
-            response = (
-                hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
-                if secret is not None
-                else None
-            )
+            if secret is not None:
+                response = hmac.new(secret.encode(), nonce, hashlib.sha256).hexdigest()
+                self._session_key = hmac.new(
+                    secret.encode(), b"tether-frame-key" + nonce, hashlib.sha256
+                ).digest()
+                self._send_auth = FrameAuthenticator(self._session_key, BLE_TAG_LENGTH)
+                self._recv_auth = FrameAuthenticator(self._session_key, BLE_TAG_LENGTH)
+            else:
+                response = None
             self.send_json_frame({"mode": mode, "response": response})
             self._authenticated = True
         else:
@@ -295,6 +399,7 @@ class BleControlChannel:
         ack = self.read_json_frame()
         if not ack.get("ok", False):
             raise WifiAuthError(ack.get("error") or "connection rejected by device")
+        return self._session_key
 
 
 def connect(address: str, *, timeout: float = DEFAULT_TIMEOUT) -> BleStream:

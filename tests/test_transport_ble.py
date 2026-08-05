@@ -1,11 +1,14 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import threading
 
 import pytest
 
 from tether.errors import WifiAuthError
-from tether.transports.ble import BleControlChannel, BleStream, connect
+from tether.marshalling.frame_auth import FrameAuthenticator
+from tether.transports.ble import BLE_TAG_LENGTH, BleControlChannel, BleStream, connect
 
 _WRITE_CHAR = "write-char-uuid"
 
@@ -242,6 +245,115 @@ def test_send_preamble_only_reads_a_nonce_on_the_first_call():
 
     sent = json.loads(b"".join(client.writes)[4:])
     assert sent == {"mode": "upload"}
+
+
+def test_send_preamble_returns_the_session_key_when_a_secret_is_given():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+    nonce = b"0123456789abcdef"
+
+    _queue_frames(stream, {"nonce": nonce.hex()}, {"ok": True})
+
+    session_key = channel.send_preamble("status", "right-secret")
+
+    assert (
+        session_key
+        == hmac.new(b"right-secret", b"tether-frame-key" + nonce, hashlib.sha256).digest()
+    )
+
+
+def test_send_preamble_returns_none_when_secret_is_none():
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    _queue_frames(stream, {"nonce": b"0123456789abcdef".hex()}, {"ok": True})
+
+    session_key = channel.send_preamble("status", None)
+
+    assert session_key is None
+
+
+def test_send_preamble_returns_the_same_cached_session_key_across_mode_switches():
+    # BLE reuses one connection across modes - only the FIRST send_preamble()
+    # call derives a session key (it's the only call that reads a nonce at
+    # all); every later call on the same channel must return that SAME key,
+    # not None and not a freshly re-derived one.
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    channel = BleControlChannel(stream)
+
+    _queue_frames(stream, {"nonce": b"0123456789abcdef".hex()}, {"ok": True}, {"ok": True})
+
+    first = channel.send_preamble("status", "right-secret")
+    second = channel.send_preamble("upload", "right-secret")
+
+    assert first == second
+    assert first is not None
+
+
+def test_authenticated_json_frame_round_trips():
+    client_a = _FakeBleakClient()
+    stream_a = BleStream(client_a, _running_loop(), _WRITE_CHAR)
+    channel_a = BleControlChannel(stream_a)
+    client_b = _FakeBleakClient()
+    stream_b = BleStream(client_b, _running_loop(), _WRITE_CHAR)
+    channel_b = BleControlChannel(stream_b)
+
+    key = b"shared-session-key"
+    channel_a._send_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    channel_b._recv_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+
+    channel_a.send_authenticated_json_frame({"hello": "world"})
+    # BleStream.write() sent via client_a; feed the same bytes into
+    # stream_b as if they'd arrived over the air, matching how every other
+    # test_transport_ble.py test bridges two independent fake clients.
+    stream_b.on_notify(None, bytearray(b"".join(client_a.writes)))
+
+    assert channel_b.read_authenticated_json_frame() == {"hello": "world"}
+
+
+def test_authenticated_bytes_frame_round_trips():
+    client_a = _FakeBleakClient()
+    stream_a = BleStream(client_a, _running_loop(), _WRITE_CHAR)
+    channel_a = BleControlChannel(stream_a)
+    client_b = _FakeBleakClient()
+    stream_b = BleStream(client_b, _running_loop(), _WRITE_CHAR)
+    channel_b = BleControlChannel(stream_b)
+
+    key = b"shared-session-key"
+    channel_a._send_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    channel_b._recv_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+
+    channel_a.send_authenticated_bytes_frame(b"some file content")
+    stream_b.on_notify(None, bytearray(b"".join(client_a.writes)))
+
+    assert channel_b.read_authenticated_bytes_frame() == b"some file content"
+
+
+def test_ble_stream_enable_authentication_uses_the_given_authenticator_pair():
+    # enable_authentication must use the EXACT instances it's given, not
+    # construct fresh ones - proven by pre-advancing send_auth's counter
+    # before calling enable_authentication, then checking the wrapped
+    # write's counter matches (i.e. picks up where it left off).
+    client = _FakeBleakClient()
+    stream = BleStream(client, _running_loop(), _WRITE_CHAR)
+    key = b"shared-session-key"
+    send_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    recv_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    send_auth.wrap(b"already sent one frame via the control channel")  # counter -> 1
+
+    stream.enable_authentication(send_auth, recv_auth)
+    stream.write(b"first run-mode frame")
+
+    envelope = b"".join(client.writes)
+    verify_auth = FrameAuthenticator(key, BLE_TAG_LENGTH)
+    verify_auth.wrap(b"placeholder")  # advance verify_auth's own counter to 1 too
+    # unwrap() checks the counter matches its OWN internal expectation, so
+    # rebuild one at counter=1 to confirm the envelope really is counter 1,
+    # not counter 0 (which would mean enable_authentication started fresh).
+    assert verify_auth.unwrap(envelope[4:]) == b"first run-mode frame"
 
 
 def test_stream_read_with_a_timeout_raises_oserror_not_queue_empty():
